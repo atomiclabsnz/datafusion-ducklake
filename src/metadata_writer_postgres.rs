@@ -1901,6 +1901,10 @@ async fn recompute_table_column_stats(
     column_ids: &[i64],
 ) -> Result<()> {
     use crate::stats_encode::{FileColumnStat, aggregate_global_column_stats};
+    if crate::metadata_writer_postgres_allocators::bounds_must_be_unknown(tx, table_id).await? {
+        return crate::metadata_writer_postgres_allocators::forget_column_bounds(tx, table_id)
+            .await;
+    }
     let catalog_columns = catalog_column_defs(columns)?;
     let column_ids = top_level_column_ids(&catalog_columns, column_ids)?;
 
@@ -2526,14 +2530,7 @@ pub(crate) async fn commit_files_at_snapshot(
     for file in files {
         crate::metadata_writer::enforce_partition_fence(write.table_id, live_partition_id, file)?;
     }
-    sqlx::query(
-        "INSERT INTO ducklake_table_stats
-             (table_id, record_count, next_row_id, file_size_bytes)
-         VALUES ($1, 0, 0, 0) ON CONFLICT DO NOTHING",
-    )
-    .bind(write.table_id)
-    .execute(&mut **tx)
-    .await?;
+    crate::metadata_writer_postgres_allocators::seed_table_stats(tx, write.table_id).await?;
     let mut next_row_id: i64 =
         sqlx::query_scalar("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
             .bind(write.table_id)
@@ -2544,9 +2541,11 @@ pub(crate) async fn commit_files_at_snapshot(
     for file in files {
         let data_file_id: i64 = sqlx::query_scalar(
             "INSERT INTO ducklake_data_file
-                 (table_id, path, path_is_relative, file_size_bytes, footer_size,
+                 (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size,
                   record_count, row_id_start, begin_snapshot)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             OVERRIDING SYSTEM VALUE
+             VALUES (COALESCE($9::BIGINT, nextval(pg_get_serial_sequence('ducklake_data_file', 'data_file_id'))),
+                     $1, $2, $3, $4, $5, $6, $7, $8)
              RETURNING data_file_id",
         )
         .bind(write.table_id)
@@ -2557,6 +2556,7 @@ pub(crate) async fn commit_files_at_snapshot(
         .bind(file.record_count)
         .bind(next_row_id)
         .bind(snapshot_id)
+        .bind(crate::metadata_writer_postgres_allocators::next_file_id(tx).await?)
         .fetch_one(&mut **tx)
         .await?;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
@@ -2641,14 +2641,7 @@ pub(crate) async fn commit_inlined_at_snapshot(
     .bind(schema_version)
     .execute(&mut **tx)
     .await?;
-    sqlx::query(
-        "INSERT INTO ducklake_table_stats
-             (table_id, record_count, next_row_id, file_size_bytes)
-         VALUES ($1, 0, 0, 0) ON CONFLICT DO NOTHING",
-    )
-    .bind(write.table_id)
-    .execute(&mut **tx)
-    .await?;
+    crate::metadata_writer_postgres_allocators::seed_table_stats(tx, write.table_id).await?;
     let mut row_id: i64 =
         sqlx::query_scalar("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
             .bind(write.table_id)
@@ -2752,9 +2745,11 @@ pub(crate) async fn apply_positional_deletes_at_snapshot(
         }
         sqlx::query(
             "INSERT INTO ducklake_delete_file
-                 (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                  footer_size, delete_count, begin_snapshot)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                 (delete_file_id, data_file_id, table_id, path, path_is_relative,
+                  file_size_bytes, footer_size, delete_count, begin_snapshot)
+             OVERRIDING SYSTEM VALUE
+             VALUES (COALESCE($9::BIGINT, nextval(pg_get_serial_sequence('ducklake_delete_file', 'delete_file_id'))),
+                     $1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(entry.data_file_id)
         .bind(table_id)
@@ -2764,6 +2759,7 @@ pub(crate) async fn apply_positional_deletes_at_snapshot(
         .bind(entry.delete.footer_size)
         .bind(entry.delete.delete_count)
         .bind(snapshot_id)
+        .bind(crate::metadata_writer_postgres_allocators::next_file_id(tx).await?)
         .execute(&mut **tx)
         .await?;
     }

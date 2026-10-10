@@ -40,6 +40,7 @@ use crate::metadata_writer_postgres::{
 use crate::partition::PartitionTransform;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Row};
+use std::sync::Arc;
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
@@ -273,7 +274,13 @@ const SQL_CREATE_TABLES: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct PostgresSingleCatalogMetadataWriter {
     pool: PgPool,
+    /// The snapshot this writer's latest table write committed; see
+    /// [`PostgresSingleCatalogMetadataWriter::last_committed_snapshot`].
+    last_committed: Arc<std::sync::atomic::AtomicI64>,
 }
+
+/// [`PostgresSingleCatalogMetadataWriter::last_committed_snapshot`] before any commit.
+const NO_COMMIT: i64 = i64::MIN;
 
 impl PostgresSingleCatalogMetadataWriter {
     /// Open a writer against an existing single-catalog Postgres DuckLake
@@ -299,6 +306,7 @@ impl PostgresSingleCatalogMetadataWriter {
         .await?;
         Ok(Self {
             pool,
+            last_committed: Arc::new(std::sync::atomic::AtomicI64::new(NO_COMMIT)),
         })
     }
 
@@ -307,7 +315,20 @@ impl PostgresSingleCatalogMetadataWriter {
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
             pool,
+            last_committed: Arc::new(std::sync::atomic::AtomicI64::new(NO_COMMIT)),
         }
+    }
+
+    /// The snapshot this writer's latest table write committed — its data files or a
+    /// multi-table commit — or `None` before any. A write through DataFusion (`INSERT`)
+    /// reports only a row count; a caller that owns this writer reads its snapshot here,
+    /// where reading the catalog's head afterwards could name a snapshot another client
+    /// committed in between.
+    pub fn last_committed_snapshot(&self) -> Option<i64> {
+        let snapshot = self
+            .last_committed
+            .load(std::sync::atomic::Ordering::SeqCst);
+        (snapshot != NO_COMMIT).then_some(snapshot)
     }
 
     /// Open a writer and create/upgrade the DuckLake catalog tables.
@@ -316,6 +337,21 @@ impl PostgresSingleCatalogMetadataWriter {
         writer.initialize_schema()?;
         Ok(writer)
     }
+}
+
+/// Commit `tx`, first leaving DuckDB's id allocators current where the catalog carries
+/// them (crate::metadata_writer_postgres_allocators::stamp_allocator_watermarks). Every transaction this writer opens
+/// commits through here or [`commit_networked`].
+async fn commit(mut tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<()> {
+    crate::metadata_writer_postgres_allocators::stamp_allocator_watermarks(&mut tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// [`crate::metadata_writer::commit_networked`], after [`commit`]'s stamp.
+async fn commit_networked(mut tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<()> {
+    crate::metadata_writer_postgres_allocators::stamp_allocator_watermarks(&mut tx).await?;
+    crate::metadata_writer::commit_networked(tx).await
 }
 
 /// Reserve `n` consecutive ids from a counter in `ducklake_metadata`, returning the
@@ -437,21 +473,13 @@ async fn retire_prior_generation(
     Ok(())
 }
 
-/// Seed the per-table stats row if absent. `ON CONFLICT DO NOTHING` on the
-/// `table_id` PK is the Postgres spelling of MySQL's `INSERT IGNORE`.
+/// Seed the per-table stats row if absent (see the allocators module for the two
+/// catalog shapes).
 async fn seed_table_stats(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table_id: i64,
 ) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
-         VALUES ($1, 0, 0, 0)
-         ON CONFLICT (table_id) DO NOTHING",
-    )
-    .bind(table_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    crate::metadata_writer_postgres_allocators::seed_table_stats(tx, table_id).await
 }
 
 /// Insert the next `ducklake_snapshot` row, carrying `schema_version` forward.
@@ -461,7 +489,19 @@ async fn seed_table_stats(
 /// `> base_snapshot` conflict test depends on. A DDL commit follows with
 /// [`bump_schema_version`].
 async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(i64, i64)> {
-    let snapshot_id = reserve_ids(tx, "next_snapshot_id", 1).await?;
+    let counted = reserve_ids(tx, "next_snapshot_id", 1).await?;
+    // In a catalog the DuckDB extension also writes, the counter never saw its snapshots.
+    let snapshot_id =
+        crate::metadata_writer_postgres_allocators::next_snapshot_id(tx, counted).await?;
+    if snapshot_id != counted {
+        sqlx::query(
+            "UPDATE ducklake_metadata SET value = CAST($1 AS VARCHAR)
+             WHERE key = 'next_snapshot_id' AND scope IS NULL",
+        )
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+    }
     // Carry the current per-catalog schema_version forward; a DDL commit corrects
     // this to a bump via `bump_schema_version` below. Read before the INSERT so
     // the MAX is over the pre-existing rows only (matches the other writers).
@@ -730,6 +770,10 @@ async fn recompute_table_column_stats(
     column_ids: &[i64],
 ) -> Result<()> {
     use crate::stats_encode::{FileColumnStat, aggregate_global_column_stats};
+    if crate::metadata_writer_postgres_allocators::bounds_must_be_unknown(tx, table_id).await? {
+        return crate::metadata_writer_postgres_allocators::forget_column_bounds(tx, table_id)
+            .await;
+    }
 
     let live_file_count: i64 = sqlx::query(
         "SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL",
@@ -873,12 +917,16 @@ async fn finalize_table_snapshot(
         {
             Some(id) => id,
             None => sqlx::query_scalar(
-                "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                 VALUES ($1, $2, TRUE, $3) RETURNING schema_id",
+                "INSERT INTO ducklake_schema (schema_id, schema_name, path, path_is_relative, begin_snapshot)
+                 OVERRIDING SYSTEM VALUE
+                 VALUES (COALESCE($4::BIGINT, nextval(pg_get_serial_sequence('ducklake_schema', 'schema_id'))),
+                         $1, $2, TRUE, $3)
+                 RETURNING schema_id",
             )
             .bind(schema_name)
             .bind(directory_path(schema_name))
             .bind(snapshot_id)
+            .bind(crate::metadata_writer_postgres_allocators::next_catalog_id(tx).await?)
             .fetch_one(&mut **tx)
             .await?,
         };
@@ -897,6 +945,13 @@ async fn finalize_table_snapshot(
     {
         Some(id) => id,
         None => {
+            // In a catalog the DuckDB extension created there is no sequence to have
+            // reserved from: the id is allocated here, under the snapshot's lock.
+            let table_id_hint =
+                match crate::metadata_writer_postgres_allocators::next_catalog_id(tx).await? {
+                    Some(id) => id,
+                    None => table_id_hint,
+                };
             sqlx::query(
                 "INSERT INTO ducklake_table
                      (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
@@ -1214,7 +1269,9 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 )
                 .await?;
             }
-            crate::metadata_writer::commit_networked(tx).await?;
+            commit_networked(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(MultiTableCommit {
                 snapshot_id,
                 tables,
@@ -1240,7 +1297,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // A bare snapshot carries no schema change of its own → carry
             // schema_version forward (no DDL bump, no ledger row).
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(snapshot_id)
         })
     }
@@ -1260,7 +1317,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .bind(value)
             .execute(&mut *transaction)
             .await?;
-            transaction.commit().await?;
+            commit(transaction).await?;
             Ok(())
         })
     }
@@ -1284,7 +1341,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?;
 
             if let Some(row) = existing {
-                tx.commit().await?;
+                commit(tx).await?;
                 return Ok((row.try_get(0)?, false));
             }
 
@@ -1294,12 +1351,16 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // `cat_{id}/{schema}` instead).
             let schema_path = directory_path(path.unwrap_or(name));
             let schema_id: i64 = sqlx::query(
-                "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                 VALUES ($1, $2, TRUE, $3) RETURNING schema_id",
+                "INSERT INTO ducklake_schema (schema_id, schema_name, path, path_is_relative, begin_snapshot)
+                 OVERRIDING SYSTEM VALUE
+                 VALUES (COALESCE($4::BIGINT, nextval(pg_get_serial_sequence('ducklake_schema', 'schema_id'))),
+                         $1, $2, TRUE, $3)
+                 RETURNING schema_id",
             )
             .bind(name)
             .bind(&schema_path)
             .bind(snapshot_id)
+            .bind(crate::metadata_writer_postgres_allocators::next_catalog_id(&mut tx).await?)
             .fetch_one(&mut *tx)
             .await?
             .try_get(0)?;
@@ -1311,7 +1372,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok((schema_id, true))
         })
     }
@@ -1336,7 +1397,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?;
 
             if let Some(row) = existing {
-                tx.commit().await?;
+                commit(tx).await?;
                 return Ok((row.try_get(0)?, false));
             }
 
@@ -1349,13 +1410,17 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
 
             let table_path = directory_path(path.unwrap_or(name));
             let table_id: i64 = sqlx::query(
-                "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                 VALUES ($1, $2, $3, TRUE, $4) RETURNING table_id",
+                "INSERT INTO ducklake_table (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
+                 OVERRIDING SYSTEM VALUE
+                 VALUES (COALESCE($5::BIGINT, nextval(pg_get_serial_sequence('ducklake_table', 'table_id'))),
+                         $1, $2, $3, TRUE, $4)
+                 RETURNING table_id",
             )
             .bind(schema_id)
             .bind(name)
             .bind(&table_path)
             .bind(snapshot_id)
+            .bind(crate::metadata_writer_postgres_allocators::next_catalog_id(&mut tx).await?)
             .fetch_one(&mut *tx)
             .await?
             .try_get(0)?;
@@ -1367,7 +1432,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok((table_id, true))
         })
     }
@@ -1449,7 +1514,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 .await?;
             }
 
-            tx.commit().await?;
+            commit(tx).await?;
             top_level_column_ids(&catalog_columns, &field_ids)
         })
     }
@@ -1553,9 +1618,12 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
 
             let data_file_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_data_file
-                     (table_id, path, path_is_relative, file_size_bytes,
+                     (data_file_id, table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
+                 OVERRIDING SYSTEM VALUE
+                 VALUES (COALESCE($9::BIGINT, nextval(pg_get_serial_sequence('ducklake_data_file', 'data_file_id'))),
+                         $1, $2, $3, $4, $5, $6, $7, $8)
+                 RETURNING data_file_id",
             )
             .bind(table_id)
             .bind(&file.path)
@@ -1565,6 +1633,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .bind(file.record_count)
             .bind(row_ids.stored)
             .bind(snapshot_id)
+            .bind(crate::metadata_writer_postgres_allocators::next_file_id(&mut tx).await?)
             .fetch_one(&mut *tx)
             .await?
             .try_get(0)?;
@@ -1601,7 +1670,9 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             )
             .await?;
 
-            crate::metadata_writer::commit_networked(tx).await?;
+            commit_networked(tx).await?;
+            self.last_committed
+                .store(ids.snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(ids)
         })
     }
@@ -1704,9 +1775,12 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
                 let data_file_id: i64 = sqlx::query(
                     "INSERT INTO ducklake_data_file
-                         (table_id, path, path_is_relative, file_size_bytes,
+                         (data_file_id, table_id, path, path_is_relative, file_size_bytes,
                           footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
+                     OVERRIDING SYSTEM VALUE
+                     VALUES (COALESCE($9::BIGINT, nextval(pg_get_serial_sequence('ducklake_data_file', 'data_file_id'))),
+                             $1, $2, $3, $4, $5, $6, $7, $8)
+                     RETURNING data_file_id",
                 )
                 .bind(table_id)
                 .bind(&file.path)
@@ -1716,6 +1790,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 .bind(file.record_count)
                 .bind(row_ids.stored)
                 .bind(snapshot_id)
+                .bind(crate::metadata_writer_postgres_allocators::next_file_id(&mut tx).await?)
                 .fetch_one(&mut *tx)
                 .await?
                 .try_get(0)?;
@@ -1751,7 +1826,9 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 commit_metadata,
             )
             .await?;
-            crate::metadata_writer::commit_networked(tx).await?;
+            commit_networked(tx).await?;
+            self.last_committed
+                .store(ids.snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(ids)
         })
     }
@@ -1770,8 +1847,12 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         }
         block_on(async {
             let mut tx = self.pool.begin().await?;
-            let partition_id = reserve_ids(&mut tx, "next_partition_id", 1).await?;
             let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
+            let partition_id =
+                match crate::metadata_writer_postgres_allocators::next_catalog_id(&mut tx).await? {
+                    Some(id) => id,
+                    None => reserve_ids(&mut tx, "next_partition_id", 1).await?,
+                };
 
             let mut resolved_column_ids: Vec<i64> = Vec::with_capacity(columns.len());
             for (name, _transform) in columns {
@@ -1834,7 +1915,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(new_snapshot)
         })
     }
@@ -1904,7 +1985,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(new_snapshot)
         })
     }
@@ -2056,7 +2137,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(snapshot_id)
         })
     }
@@ -2070,8 +2151,12 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         }
         block_on(async {
             let mut tx = self.pool.begin().await?;
-            let sort_id = reserve_ids(&mut tx, "next_sort_id", 1).await?;
             let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
+            let sort_id =
+                match crate::metadata_writer_postgres_allocators::next_catalog_id(&mut tx).await? {
+                    Some(id) => id,
+                    None => reserve_ids(&mut tx, "next_sort_id", 1).await?,
+                };
 
             // Validate every sort key resolves to a live column (v1 supports bare
             // column keys only), so a bad SET fails here rather than silently
@@ -2144,7 +2229,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(new_snapshot)
         })
     }
@@ -2179,7 +2264,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(new_snapshot)
         })
     }
@@ -2224,7 +2309,9 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
+            self.last_committed
+                .store(ids.snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(ids)
         })
     }
@@ -2255,7 +2342,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(result.rows_affected())
         })
     }
@@ -2337,7 +2424,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(())
         })
     }
@@ -2465,7 +2552,14 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?
             {
                 Some(id) => id,
-                None => reserve_identity(&mut tx, "ducklake_schema", "schema_id").await?,
+                // A placeholder in a catalog the DuckDB extension created (no sequence):
+                // the real id is allocated at commit, under the snapshot's lock.
+                None => match crate::metadata_writer_postgres_allocators::next_catalog_id(&mut tx)
+                    .await?
+                {
+                    Some(id) => id,
+                    None => reserve_identity(&mut tx, "ducklake_schema", "schema_id").await?,
+                },
             };
 
             let table_id: i64 = match sqlx::query_scalar(
@@ -2480,7 +2574,12 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?
             {
                 Some(id) => id,
-                None => reserve_identity(&mut tx, "ducklake_table", "table_id").await?,
+                None => match crate::metadata_writer_postgres_allocators::next_catalog_id(&mut tx)
+                    .await?
+                {
+                    Some(id) => id,
+                    None => reserve_identity(&mut tx, "ducklake_table", "table_id").await?,
+                },
             };
 
             // Get existing columns to (a) check schema compatibility for appends
@@ -2559,7 +2658,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // Inserts nothing: this commit only persists the counter advance for the
             // column ids (and the sequence advances, which are non-transactional
             // anyway). Every metadata row is written by finalize_snapshot.
-            tx.commit().await?;
+            commit(tx).await?;
 
             Ok(WriteSetupResult {
                 snapshot_id,

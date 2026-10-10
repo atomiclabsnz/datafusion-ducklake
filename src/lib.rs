@@ -126,6 +126,8 @@ pub mod metadata_writer_mysql;
 #[cfg(feature = "write-postgres")]
 pub mod metadata_writer_postgres;
 #[cfg(feature = "write-postgres")]
+pub(crate) mod metadata_writer_postgres_allocators;
+#[cfg(feature = "write-postgres")]
 pub mod metadata_writer_postgres_single;
 #[cfg(feature = "write-sqlite")]
 pub mod metadata_writer_sqlite;
