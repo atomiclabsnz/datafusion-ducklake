@@ -660,7 +660,7 @@ async fn catalog_predating_tags_opens_with_new_and_takes_comments_and_drops() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_comment_copies_the_watermarks_of_the_preceding_snapshot() {
+async fn a_comment_keeps_the_watermarks_the_preceding_snapshot_left() {
     let env = setup().await;
     let writer = SqliteMetadataWriter::new_with_init(&env.conn_str)
         .await
@@ -698,8 +698,8 @@ async fn a_comment_copies_the_watermarks_of_the_preceding_snapshot() {
     assert_eq!(watermark(comment("c1")).await, base);
     assert_eq!(watermark(comment("c2")).await, base);
 
-    // The crate allocates a partition id from its own counter and leaves the watermarks NULL.
-    // A later comment must copy that NULL, not the stale value from before the allocation.
+    // The crate takes a partition id from the extension's `next_catalog_id` and leaves the
+    // watermark past it; later comments copy the advanced watermark, not the stale one.
     let partition = writer
         .set_partition_spec(
             env.table_id,
@@ -709,7 +709,17 @@ async fn a_comment_copies_the_watermarks_of_the_preceding_snapshot() {
             )],
         )
         .unwrap();
-    assert_eq!(watermark(partition).await, (None, None));
-    assert_eq!(watermark(comment("c3")).await, (None, None));
-    assert_eq!(watermark(comment("c4")).await, (None, None));
+    let partition_id: i64 = sqlx::query_scalar(
+        "SELECT partition_id FROM ducklake_partition_info
+         WHERE table_id = ? AND end_snapshot IS NULL",
+    )
+    .bind(env.table_id)
+    .fetch_one(&sqlite)
+    .await
+    .unwrap();
+    assert_eq!(Some(partition_id), base.0);
+    let advanced = (base.0.map(|id| id + 1), base.1);
+    assert_eq!(watermark(partition).await, advanced);
+    assert_eq!(watermark(comment("c3")).await, advanced);
+    assert_eq!(watermark(comment("c4")).await, advanced);
 }
