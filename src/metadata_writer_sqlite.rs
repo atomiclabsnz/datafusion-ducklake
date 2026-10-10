@@ -1158,6 +1158,23 @@ async fn schedule_files(
 /// the commit: rowid autoincrement can't be used there because inserting the
 /// `ducklake_snapshot` row would advance the head (`MAX(snapshot_id)`) before the
 /// data is committed.
+/// Raise the `next_column_id` counter past every column id the catalog holds, before
+/// reserving from it. The DuckDB extension numbers a table's columns from that table's own
+/// highest id, so a counter seeded once falls behind a column it added since, and a column
+/// this crate added next would take that column's id. A counter already ahead is left
+/// alone.
+async fn raise_column_counter(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
+    sqlx::query(
+        "UPDATE ducklake_metadata
+         SET value = CAST(MAX(CAST(value AS INTEGER),
+                     (SELECT COALESCE(MAX(column_id), 0) FROM ducklake_column)) AS TEXT)
+         WHERE key = 'next_column_id' AND scope IS NULL",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn reserve_ids(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     key: &str,
@@ -2010,8 +2027,10 @@ async fn commit(mut tx: sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
             && (head_catalog != Some(catalog) || head_file != Some(file))
         {
             sqlx::query(
-                "UPDATE ducklake_snapshot SET next_catalog_id = ?, next_file_id = ?
-                 WHERE snapshot_id = ?",
+                "UPDATE ducklake_snapshot
+                 SET next_catalog_id = MAX(COALESCE(next_catalog_id, 0), ?1),
+                     next_file_id = MAX(COALESCE(next_file_id, 0), ?2)
+                 WHERE snapshot_id = ?3",
             )
             .bind(catalog)
             .bind(file)
@@ -3794,6 +3813,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // write path's begin/commit reserve column ids from the same counter).
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
+            raise_column_counter(&mut tx).await?;
             let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
             let first_column_id = last_column_id - n + 1;
             let column_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
@@ -6152,6 +6172,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // begins. These ids match the staged parquet field ids.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
+            raise_column_counter(&mut tx).await?;
             let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
             // Freshly reserved ids. Only a genuinely-new column actually consumes
             // one below; an existing column keeps its current id, so some of these
