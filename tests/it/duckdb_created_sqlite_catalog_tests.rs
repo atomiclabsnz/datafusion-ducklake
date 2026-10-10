@@ -297,3 +297,57 @@ async fn the_writer_names_the_snapshot_it_committed() {
         );
     }
 }
+
+/// A column the crate adds after the extension added one takes an id of its own (see the
+/// Postgres counterpart).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_column_added_after_the_extension_added_one_has_its_own_id() {
+    let temp = TempDir::new().unwrap();
+    let catalog = temp.path().join("catalog.sqlite");
+    attach(&catalog)
+        .execute_batch("CREATE TABLE lake.main.t (a BIGINT, b BIGINT);")
+        .unwrap();
+    let connection = format!("sqlite:{}?mode=rwc", catalog.display());
+    let writer = SqliteMetadataWriter::new_with_init(&connection)
+        .await
+        .unwrap();
+    let tables =
+        DuckLakeTableWriter::new(Arc::new(writer), Arc::new(LocalFileSystem::new())).unwrap();
+    let wide = |names: &[&str], values: &[i64]| {
+        let schema = Arc::new(Schema::new(
+            names
+                .iter()
+                .map(|n| Field::new(*n, DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        ));
+        RecordBatch::try_new(
+            schema,
+            values
+                .iter()
+                .map(|v| Arc::new(Int64Array::from(vec![*v])) as arrow::array::ArrayRef)
+                .collect(),
+        )
+        .unwrap()
+    };
+    tables
+        .append_table("main", "t", &[wide(&["a", "b", "c"], &[1, 1, 1])])
+        .await
+        .unwrap();
+    attach(&catalog)
+        .execute_batch("ALTER TABLE lake.main.t ADD COLUMN d BIGINT; INSERT INTO lake.main.t VALUES (2, 2, 2, 2);")
+        .unwrap();
+    tables
+        .append_table(
+            "main",
+            "t",
+            &[wide(&["e", "a", "b", "c", "d"], &[99, 3, 3, 3, 3])],
+        )
+        .await
+        .unwrap();
+    let (d, e): (i64, i64) = attach(&catalog)
+        .query_row("SELECT d, e FROM lake.main.t WHERE a = 3", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((d, e), (3, 99));
+}

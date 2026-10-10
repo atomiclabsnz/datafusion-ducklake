@@ -18,7 +18,9 @@ use std::sync::Arc;
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use datafusion_ducklake::{DuckLakeTableWriter, PostgresSingleCatalogMetadataWriter};
+use datafusion_ducklake::{
+    DuckLakeTableWriter, MetadataWriter, PostgresSingleCatalogMetadataWriter, WriteMode,
+};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use testcontainers::ContainerAsync;
@@ -30,7 +32,32 @@ use testcontainers_modules::postgres::Postgres;
 struct Database {
     url: String,
     libpq: String,
+    admin: String,
+    name: String,
     _container: Option<ContainerAsync<Postgres>>,
+}
+
+/// Dropped with the test, so runs against a shared server do not accumulate databases.
+impl Drop for Database {
+    fn drop(&mut self) {
+        let (admin, name) = (self.admin.clone(), self.name.clone());
+        let _ = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                if let Ok(pool) = sqlx::PgPool::connect(&admin).await {
+                    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+                    )))
+                    .execute(&pool)
+                    .await;
+                }
+            });
+        })
+        .join();
+    }
 }
 
 async fn fresh_database() -> Database {
@@ -65,6 +92,8 @@ async fn fresh_database() -> Database {
     Database {
         url: url.to_string(),
         libpq,
+        admin: server.to_string(),
+        name,
         _container: container,
     }
 }
@@ -337,4 +366,203 @@ async fn the_postgres_writer_names_the_snapshot_it_committed() {
             .unwrap();
         assert_eq!(writer.last_committed_snapshot(), Some(written.snapshot_id));
     }
+}
+
+/// A DuckDB-created lake with `CREATE TABLE lake.main.<table> (...)` run first, and a
+/// writer on it.
+async fn lake_with(
+    ddl: &str,
+    inlining_row_limit: usize,
+) -> (Database, TempDir, Arc<PostgresSingleCatalogMetadataWriter>) {
+    let db = fresh_database().await;
+    let temp = TempDir::new().unwrap();
+    attach(&db, &temp.path().join("data"), inlining_row_limit)
+        .execute_batch(ddl)
+        .unwrap();
+    let writer = Arc::new(
+        PostgresSingleCatalogMetadataWriter::new_with_init(&db.url)
+            .await
+            .unwrap(),
+    );
+    (db, temp, writer)
+}
+
+/// One transaction creating two new tables: each gets an id of its own, though no id is
+/// reserved before commit in such a catalog.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_transaction_creates_two_tables() {
+    let (db, temp, writer) = lake_with(
+        "CREATE TABLE lake.main.orders (id BIGINT, amount DOUBLE);",
+        0,
+    )
+    .await;
+    let tables = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new())).unwrap();
+    let batch = orders(&[1, 2]);
+    let mut txn = tables.transaction();
+    for table in ["a", "b"] {
+        txn.stage_write(
+            "main",
+            table,
+            &batch.schema(),
+            WriteMode::Append,
+            std::slice::from_ref(&batch),
+        )
+        .await
+        .unwrap();
+    }
+    txn.commit().await.unwrap();
+    let lake = attach(&db, &temp.path().join("data"), 0);
+    for table in ["a", "b"] {
+        assert_eq!(
+            found(
+                &lake,
+                &format!("SELECT count(*), sum(id)::BIGINT FROM lake.main.{table}")
+            ),
+            (2, 3)
+        );
+    }
+}
+
+/// A replace whose base is older than rows the extension inlined since is a conflict, as
+/// it is over a file the extension wrote since — not a silent retirement of those rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replace_conflicts_with_rows_inlined_since_its_base() {
+    for inlining in [100, 0] {
+        let (db, temp, writer) = lake_with(
+            "CREATE TABLE lake.main.small (id BIGINT, amount DOUBLE);
+             INSERT INTO lake.main.small VALUES (1, 1), (2, 2);",
+            100,
+        )
+        .await;
+        let data = temp.path().join("data");
+        let tables = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new())).unwrap();
+        let batch = orders(&[50]);
+        let mut txn = tables.transaction();
+        txn.stage_write(
+            "main",
+            "small",
+            &batch.schema(),
+            WriteMode::Replace,
+            std::slice::from_ref(&batch),
+        )
+        .await
+        .unwrap();
+        attach(&db, &data, inlining)
+            .execute_batch("INSERT INTO lake.main.small VALUES (3, 3);")
+            .unwrap();
+        let committed = txn.commit().await;
+        assert!(
+            matches!(
+                committed,
+                Err(datafusion_ducklake::DuckLakeError::Conflict(_))
+            ),
+            "inlining {inlining}: {committed:?}"
+        );
+        assert_eq!(
+            found(
+                &attach(&db, &data, 100),
+                "SELECT count(*), sum(id)::BIGINT FROM lake.main.small"
+            ),
+            (3, 6),
+            "inlining {inlining}: the extension's rows survive"
+        );
+    }
+}
+
+/// A table id is allocated against committed state: a concurrent writer's uncommitted
+/// table is waited for, not handed out again — the extension's `ducklake_table` has no
+/// key that would stop the second.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_table_id_is_not_handed_out_twice() {
+    let (db, _temp, writer) = lake_with(
+        "CREATE TABLE lake.main.orders (id BIGINT, amount DOUBLE);",
+        0,
+    )
+    .await;
+    let snapshot = writer.create_snapshot().unwrap();
+    let (schema_id, _) = writer.get_or_create_schema("main", None, snapshot).unwrap();
+    // Another writer, mid-transaction, has taken the next free id for a table of its own.
+    let pool = sqlx::PgPool::connect(&db.url).await.unwrap();
+    let mut other = pool.begin().await.unwrap();
+    let next: i64 = sqlx::query_scalar("SELECT MAX(next_catalog_id) FROM ducklake_snapshot")
+        .fetch_one(&mut *other)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_table
+             (table_id, table_uuid, begin_snapshot, schema_id, table_name, path, path_is_relative)
+         VALUES ($1, gen_random_uuid(), $2, $3, 'other', 'other/', true)",
+    )
+    .bind(next)
+    .bind(snapshot)
+    .bind(schema_id)
+    .execute(&mut *other)
+    .await
+    .unwrap();
+    let w = writer.clone();
+    let mine = tokio::task::spawn_blocking(move || {
+        w.get_or_create_table(schema_id, "mine", None, snapshot)
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    other.commit().await.unwrap();
+    let (mine, created) = mine.await.unwrap().unwrap();
+    assert!(created);
+    assert_ne!(mine, next, "the id the other writer took");
+    let duplicates: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (SELECT table_id FROM ducklake_table
+         GROUP BY table_id HAVING count(*) > 1) d",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(duplicates, 0);
+}
+
+fn wide(names: &[&str], values: &[i64]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(
+        names
+            .iter()
+            .map(|n| Field::new(*n, DataType::Int64, true))
+            .collect::<Vec<_>>(),
+    ));
+    RecordBatch::try_new(
+        schema,
+        values
+            .iter()
+            .map(|v| Arc::new(Int64Array::from(vec![*v])) as arrow::array::ArrayRef)
+            .collect(),
+    )
+    .unwrap()
+}
+
+/// A column the crate adds after the extension added one takes an id of its own: the
+/// extension numbers a table's columns from that table's highest id, past the crate's
+/// counter, and a shared id would read one column's values under the other's name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_column_added_after_the_extension_added_one_has_its_own_id() {
+    let (db, temp, writer) = lake_with("CREATE TABLE lake.main.t (a BIGINT, b BIGINT);", 0).await;
+    let data = temp.path().join("data");
+    let tables = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new())).unwrap();
+    tables
+        .append_table("main", "t", &[wide(&["a", "b", "c"], &[1, 1, 1])])
+        .await
+        .unwrap();
+    attach(&db, &data, 0)
+        .execute_batch("ALTER TABLE lake.main.t ADD COLUMN d BIGINT; INSERT INTO lake.main.t VALUES (2, 2, 2, 2);")
+        .unwrap();
+    tables
+        .append_table(
+            "main",
+            "t",
+            &[wide(&["e", "a", "b", "c", "d"], &[99, 3, 3, 3, 3])],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        found(
+            &attach(&db, &data, 0),
+            "SELECT d, e FROM lake.main.t WHERE a = 3"
+        ),
+        (3, 99)
+    );
 }

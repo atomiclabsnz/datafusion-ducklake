@@ -22,7 +22,6 @@
 use crate::Result;
 use sqlx::AssertSqlSafe;
 use sqlx::PgConnection;
-use sqlx::Row;
 
 /// The ids the extension allocates from `next_catalog_id`.
 const CATALOG_ID_COLUMNS: [(&str, &str); 6] = [
@@ -79,12 +78,63 @@ async fn first_free_id(
     Ok(id)
 }
 
+/// Take `SHARE ROW EXCLUSIVE` on every table whose ids the extension's watermarks
+/// allocate, for the rest of the transaction, before reading a free id. The mode conflicts
+/// with the `ROW EXCLUSIVE` every `INSERT` takes, so a concurrent writer's uncommitted row
+/// — the extension's or another of this crate's — is waited for and then seen, and none
+/// can insert until this transaction ends: no two writers hand out one id, though the
+/// extension's tables declare no key that would stop them (`ducklake_table` has none).
+/// Always every such table, in one fixed order, so two allocating writers cannot lock in
+/// different orders.
+async fn lock_allocated_tables(conn: &mut PgConnection) -> Result<()> {
+    let mut tables: Vec<&str> = CATALOG_ID_COLUMNS
+        .iter()
+        .chain(FILE_ID_COLUMNS.iter())
+        .map(|(table, _)| *table)
+        .collect();
+    tables.sort_unstable();
+    let mut present = Vec::with_capacity(tables.len());
+    for table in tables {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(table)
+            .fetch_one(&mut *conn)
+            .await?;
+        if exists {
+            present.push(table);
+        }
+    }
+    // Every name in the statement is one of the constant table names above.
+    sqlx::query(AssertSqlSafe(format!(
+        "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
+        present.join(", ")
+    )))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// A stand-in for a schema or table id a write reserves before it commits, in a catalog
+/// the extension created: there is no sequence to reserve from, and the real id is
+/// allocated at commit, under [`lock_allocated_tables`]. Negative and distinct per call,
+/// so no stand-in is mistaken for another, or for an id the catalog holds. `None` in this
+/// crate's own catalogs, which reserve from their IDENTITY sequences.
+pub(crate) async fn placeholder_id(conn: &mut PgConnection) -> Result<Option<i64>> {
+    static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+    if !has_allocator_watermarks(conn).await? {
+        return Ok(None);
+    }
+    Ok(Some(
+        NEXT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed),
+    ))
+}
+
 /// The id for a new data or delete file: `None` in this crate's own catalogs, where the
 /// insert's `COALESCE($id, nextval(…))` takes the IDENTITY sequence as before.
 pub(crate) async fn next_file_id(conn: &mut PgConnection) -> Result<Option<i64>> {
     if !has_allocator_watermarks(conn).await? {
         return Ok(None);
     }
+    lock_allocated_tables(conn).await?;
     Ok(Some(
         first_free_id(conn, "next_file_id", &FILE_ID_COLUMNS).await?,
     ))
@@ -96,6 +146,7 @@ pub(crate) async fn next_catalog_id(conn: &mut PgConnection) -> Result<Option<i6
     if !has_allocator_watermarks(conn).await? {
         return Ok(None);
     }
+    lock_allocated_tables(conn).await?;
     Ok(Some(
         first_free_id(conn, "next_catalog_id", &CATALOG_ID_COLUMNS).await?,
     ))
@@ -117,35 +168,27 @@ pub(crate) async fn next_snapshot_id(conn: &mut PgConnection, counted: i64) -> R
 /// Leave the head snapshot's watermarks past every id in the catalog. Every commit of a
 /// writer that may meet such a catalog calls this just before `COMMIT`, so no snapshot it
 /// creates is left with NULL watermarks. The head is written only when its watermarks are
-/// behind, so a transaction that only read stays a read.
+/// behind, and only ever raised.
 pub(crate) async fn stamp_allocator_watermarks(conn: &mut PgConnection) -> Result<()> {
     if !has_allocator_watermarks(conn).await? {
         return Ok(());
     }
     let catalog = first_free_id(conn, "next_catalog_id", &CATALOG_ID_COLUMNS).await?;
     let file = first_free_id(conn, "next_file_id", &FILE_ID_COLUMNS).await?;
-    let head = sqlx::query(
-        "SELECT snapshot_id, next_catalog_id, next_file_id FROM ducklake_snapshot
-         ORDER BY snapshot_id DESC LIMIT 1",
+    // Only ever raised: a head another writer committed after the ids above were read
+    // keeps its own watermarks where they are higher.
+    sqlx::query(
+        "UPDATE ducklake_snapshot
+         SET next_catalog_id = GREATEST(COALESCE(next_catalog_id, 0), $1),
+             next_file_id = GREATEST(COALESCE(next_file_id, 0), $2)
+         WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM ducklake_snapshot)
+           AND (next_catalog_id IS NULL OR next_catalog_id < $1
+                OR next_file_id IS NULL OR next_file_id < $2)",
     )
-    .fetch_optional(&mut *conn)
+    .bind(catalog)
+    .bind(file)
+    .execute(&mut *conn)
     .await?;
-    if let Some(head) = head {
-        let snapshot_id: i64 = head.try_get(0)?;
-        let head_catalog: Option<i64> = head.try_get(1)?;
-        let head_file: Option<i64> = head.try_get(2)?;
-        if head_catalog != Some(catalog) || head_file != Some(file) {
-            sqlx::query(
-                "UPDATE ducklake_snapshot SET next_catalog_id = $1, next_file_id = $2
-                 WHERE snapshot_id = $3",
-            )
-            .bind(catalog)
-            .bind(file)
-            .bind(snapshot_id)
-            .execute(&mut *conn)
-            .await?;
-        }
-    }
     Ok(())
 }
 
@@ -220,5 +263,22 @@ pub(crate) async fn seed_table_stats(conn: &mut PgConnection, table_id: i64) -> 
          ON CONFLICT DO NOTHING"
     };
     sqlx::query(sql).bind(table_id).execute(&mut *conn).await?;
+    Ok(())
+}
+
+/// Raise the crate's `next_column_id` counter past every column id the catalog holds,
+/// before reserving from it. The extension numbers a table's columns from that table's own
+/// highest id, so a counter seeded once falls behind a column it added since, and a column
+/// this crate added next would take that column's id. Raised in every catalog — a counter
+/// already ahead is left alone.
+pub(crate) async fn raise_column_counter(conn: &mut PgConnection) -> Result<()> {
+    sqlx::query(
+        "UPDATE ducklake_metadata
+         SET value = CAST(GREATEST(CAST(value AS BIGINT),
+                     (SELECT COALESCE(MAX(column_id), 0) FROM ducklake_column)) AS VARCHAR)
+         WHERE key = 'next_column_id' AND scope IS NULL",
+    )
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }

@@ -480,6 +480,38 @@ async fn detect_replace_conflict(
              snapshot {base_snapshot}; aborting (retry the write against the new generation)"
         )));
     }
+    // Rows inlined since the base — this writer inlines none, but the DuckDB extension
+    // does — are a concurrent write too: a replace would retire them unseen. The
+    // registry is checked for first: a statement naming a missing table would abort the
+    // transaction.
+    let registry: bool =
+        sqlx::query_scalar("SELECT to_regclass('ducklake_inlined_data_tables') IS NOT NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    if registry {
+        let inlined: Vec<String> = sqlx::query_scalar(
+            "SELECT table_name FROM ducklake_inlined_data_tables
+             WHERE table_id = $1 AND to_regclass(quote_ident(table_name)) IS NOT NULL",
+        )
+        .bind(table_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        for table in inlined {
+            let changed = sqlx::query(AssertSqlSafe(format!(
+                "SELECT 1 FROM {} WHERE begin_snapshot > $1 OR end_snapshot > $1 LIMIT 1",
+                quote_ident(&table)
+            )))
+            .bind(base_snapshot)
+            .fetch_optional(&mut **tx)
+            .await?;
+            if changed.is_some() {
+                return Err(crate::DuckLakeError::Conflict(format!(
+                    "Replace on table {table_id} conflicts with inlined data committed since \
+                     snapshot {base_snapshot}; aborting"
+                )));
+            }
+        }
+    }
     detect_inlined_delete_since(table_id, base_snapshot, tx).await
 }
 
@@ -1637,6 +1669,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // insert with explicit ids, keeping the allocator authoritative.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
+            crate::metadata_writer_postgres_allocators::raise_column_counter(&mut tx).await?;
             let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
             let first_column_id = last_column_id - n + 1;
             let field_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
@@ -2684,6 +2717,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // lock up front. These ids match the staged parquet field ids.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
+            crate::metadata_writer_postgres_allocators::raise_column_counter(&mut tx).await?;
             let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
             // Freshly reserved ids. Only a genuinely-new column actually consumes
             // one below; an existing column keeps its current id, so some of these
@@ -2718,9 +2752,9 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?
             {
                 Some(id) => id,
-                // A placeholder in a catalog the DuckDB extension created (no sequence):
-                // the real id is allocated at commit, under the snapshot's lock.
-                None => match crate::metadata_writer_postgres_allocators::next_catalog_id(&mut tx)
+                // A stand-in in a catalog the DuckDB extension created (no sequence):
+                // the real id is allocated at commit.
+                None => match crate::metadata_writer_postgres_allocators::placeholder_id(&mut tx)
                     .await?
                 {
                     Some(id) => id,
@@ -2740,7 +2774,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?
             {
                 Some(id) => id,
-                None => match crate::metadata_writer_postgres_allocators::next_catalog_id(&mut tx)
+                None => match crate::metadata_writer_postgres_allocators::placeholder_id(&mut tx)
                     .await?
                 {
                     Some(id) => id,
