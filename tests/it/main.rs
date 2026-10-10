@@ -35,6 +35,7 @@ mod concurrent_write_tests;
 mod delete_conflict_tests;
 mod delete_filter_tests;
 mod duckdb_attach_reads_written_files_tests;
+mod duckdb_created_postgres_catalog_tests;
 mod duckdb_created_sqlite_catalog_tests;
 mod early_upload_tests;
 mod empty_data_file_tests;
