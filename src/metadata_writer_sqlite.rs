@@ -2172,6 +2172,62 @@ async fn live_columns_for_stats(
     Ok((columns, column_ids))
 }
 
+/// Whether any of the table's inlined rows is live. The DuckDB extension prunes a scan of
+/// the table, inlined rows included, by the table-wide `ducklake_table_column_stats`, so a
+/// roll-up computed from data files alone would hide a live inlined row outside the files'
+/// bounds.
+async fn has_live_inlined_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+) -> Result<bool> {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT i.table_name FROM ducklake_inlined_data_tables i
+         JOIN sqlite_master m ON m.type = 'table' AND m.name = i.table_name
+         WHERE i.table_id = ?",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for table in tables {
+        let live: bool = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE end_snapshot IS NULL)",
+            quote_ident(&table)
+        )))
+        .fetch_one(&mut **tx)
+        .await?;
+        if live {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Record every live column's table-wide bounds as unknown (NULL), which no reader prunes
+/// by and the DuckDB extension keeps unknown when it later writes. Used where this writer
+/// cannot compute a superset of the table's live values: while any of its rows is inlined.
+async fn forget_column_bounds(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+) -> Result<()> {
+    let (_, column_ids) = live_columns_for_stats(table_id, tx).await?;
+    sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = ?")
+        .bind(table_id)
+        .execute(&mut **tx)
+        .await?;
+    for column_id in column_ids {
+        sqlx::query(
+            "INSERT INTO ducklake_table_column_stats
+                 (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
+             VALUES (?, ?, NULL, NULL, NULL, NULL, NULL)",
+        )
+        .bind(table_id)
+        .bind(column_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Recompute the table-wide `ducklake_table_column_stats` roll-up (optimizer
 /// stats) from the table's currently-live files, and replace the stored rows.
 ///
@@ -2190,6 +2246,9 @@ async fn recompute_table_column_stats(
     column_ids: &[i64],
 ) -> Result<()> {
     use crate::stats_encode::{FileColumnStat, aggregate_global_column_stats};
+    if has_live_inlined_rows(tx, table_id).await? {
+        return forget_column_bounds(tx, table_id).await;
+    }
     let catalog_columns = catalog_column_defs(columns)?;
     let column_ids = top_level_column_ids(&catalog_columns, column_ids)?;
 
@@ -2490,9 +2549,10 @@ async fn finalize_table_snapshot(
         // Seed the stats row (first write to a brand-new table) so retire's
         // zero-update has a row, then retire the prior data generation.
         sqlx::query(
-            "INSERT OR IGNORE INTO ducklake_table_stats
+            "INSERT INTO ducklake_table_stats
                  (table_id, record_count, next_row_id, file_size_bytes)
-             VALUES (?, 0, 0, 0)",
+             SELECT ?1, 0, 0, 0
+             WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
         )
         .bind(table_id)
         .execute(&mut **tx)
@@ -2641,9 +2701,10 @@ async fn commit_files_at_snapshot(
         crate::metadata_writer::enforce_partition_fence(write.table_id, live_partition_id, file)?;
     }
     sqlx::query(
-        "INSERT OR IGNORE INTO ducklake_table_stats
+        "INSERT INTO ducklake_table_stats
              (table_id, record_count, next_row_id, file_size_bytes)
-         VALUES (?, 0, 0, 0)",
+         SELECT ?1, 0, 0, 0
+         WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
     )
     .bind(write.table_id)
     .execute(&mut **tx)
@@ -2764,9 +2825,10 @@ async fn commit_inlined_at_snapshot(
     .execute(&mut **tx)
     .await?;
     sqlx::query(
-        "INSERT OR IGNORE INTO ducklake_table_stats
+        "INSERT INTO ducklake_table_stats
              (table_id, record_count, next_row_id, file_size_bytes)
-         VALUES (?, 0, 0, 0)",
+         SELECT ?1, 0, 0, 0
+         WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
     )
     .bind(write.table_id)
     .execute(&mut **tx)
@@ -2823,6 +2885,7 @@ async fn commit_inlined_at_snapshot(
     .bind(write.table_id)
     .execute(&mut **tx)
     .await?;
+    forget_column_bounds(tx, write.table_id).await?;
     Ok(())
 }
 
@@ -3842,9 +3905,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Seed the stats row for the Append path (Replace already seeded it
             // in finalize_snapshot); INSERT OR IGNORE is a no-op if it exists.
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -4020,9 +4084,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
             }
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -4211,9 +4276,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
 
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -4265,6 +4331,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
+            forget_column_bounds(&mut tx, table_id).await?;
             // Append to the ledger row finalize_snapshot seeded (which may already
             // carry created_schema:/created_table: entries) instead of replacing
             // it, and record a Replace over prior data — Parquet or inlined — as
@@ -4635,9 +4702,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             // register_data_file. Deletes are accounted at read time
             // (delete_count), so record_count stays gross — no adjustment for them.
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -4892,9 +4960,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             // register_data_files. Deletes are accounted at read time
             // (delete_count), so record_count stays gross — no adjustment for them.
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -5477,9 +5546,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             // advanced: compaction mints no new logical rows (outputs re-embed
             // existing rowids), so the monotonic allocator must not move.
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
