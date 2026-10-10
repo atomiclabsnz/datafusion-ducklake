@@ -264,3 +264,36 @@ async fn the_extension_finds_every_row_beside_inlined_ones_after_the_crate_wrote
         "one ducklake_table_stats row per table: {stats_rows:?}"
     );
 }
+
+/// The writer names the snapshot its latest write committed, for a caller whose write went
+/// through DataFusion and so got back only a row count: a file write and an inlined one both.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_writer_names_the_snapshot_it_committed() {
+    let temp = TempDir::new().unwrap();
+    let catalog = temp.path().join("catalog.sqlite");
+    {
+        let lake = attach(&catalog);
+        lake.execute_batch("CREATE TABLE lake.main.orders (id BIGINT, amount DOUBLE);")
+            .unwrap();
+    }
+    let connection = format!("sqlite:{}?mode=rwc", catalog.display());
+    let writer = Arc::new(
+        SqliteMetadataWriter::new_with_init(&connection)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(writer.last_committed_snapshot(), None);
+    for inlining in [0, 100] {
+        let written = DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+            .unwrap()
+            .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(inlining))
+            .append_table("main", "orders", &[orders(&[1, 2])])
+            .await
+            .unwrap();
+        assert_eq!(
+            writer.last_committed_snapshot(),
+            Some(written.snapshot_id),
+            "inlining limit {inlining}"
+        );
+    }
+}
