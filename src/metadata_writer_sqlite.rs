@@ -597,12 +597,18 @@ const SQL_CREATE_INLINED_DATA_TABLES: &str =
     schema_version INTEGER
 );";
 
+/// [`SqliteMetadataWriter::last_committed_snapshot`] before any commit.
+const NO_COMMIT: i64 = i64::MIN;
+
 /// SQLite-based metadata writer for DuckLake catalogs.
 #[derive(Debug, Clone)]
 pub struct SqliteMetadataWriter {
     pool: SqlitePool,
     lock_path: Option<PathBuf>,
     commit_lock: Arc<Mutex<()>>,
+    /// The snapshot this writer's latest table write committed; see
+    /// [`SqliteMetadataWriter::last_committed_snapshot`].
+    last_committed: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl SqliteMetadataWriter {
@@ -642,7 +648,20 @@ impl SqliteMetadataWriter {
             pool,
             lock_path,
             commit_lock: Arc::new(Mutex::new(())),
+            last_committed: Arc::new(std::sync::atomic::AtomicI64::new(NO_COMMIT)),
         })
+    }
+
+    /// The snapshot this writer's latest table write committed — its data files, inlined
+    /// rows or deletes — or `None` before any. A write through DataFusion (`INSERT`, a
+    /// DataFrame's `write_table`) reports only a row count; a caller that owns this writer
+    /// reads its snapshot here, where reading the catalog's head afterwards could name a
+    /// snapshot another client committed in between.
+    pub fn last_committed_snapshot(&self) -> Option<i64> {
+        let snapshot = self
+            .last_committed
+            .load(std::sync::atomic::Ordering::SeqCst);
+        (snapshot != NO_COMMIT).then_some(snapshot)
     }
 
     pub async fn new_with_init(connection_string: &str) -> Result<Self> {
@@ -3424,13 +3443,14 @@ impl MetadataWriter for SqliteMetadataWriter {
         }
         block_on(async {
             let mut tx = self.pool.begin().await?;
-            // Write-lock-first: reserve the new partition id (a metadata-counter
-            // UPDATE) before any read, so a concurrent DDL blocks on the lock.
+            // Write-lock-first: the snapshot INSERT is a write, so it takes the lock
+            // before any read and a concurrent DDL blocks on it. Only then is the new
+            // partition id allocated (`next_catalog_id` reads the catalog's columns).
+            let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
             let partition_id = match next_catalog_id(&mut tx).await? {
                 Some(id) => id,
                 None => reserve_ids(&mut tx, "next_partition_id", 1).await?,
             };
-            let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
 
             // Resolve each partition-key column NAME to its live column_id.
             let mut column_ids: Vec<i64> = Vec::with_capacity(columns.len());
@@ -3614,13 +3634,14 @@ impl MetadataWriter for SqliteMetadataWriter {
         }
         block_on(async {
             let mut tx = self.pool.begin().await?;
-            // Reserve the sort_id first so the counter UPDATE takes the write lock
-            // before any read, so a concurrent DDL blocks on the lock.
+            // Write-lock-first: the snapshot INSERT is a write, so it takes the lock
+            // before any read and a concurrent DDL blocks on it. Only then is the
+            // sort_id allocated (`next_catalog_id` reads the catalog's columns).
+            let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
             let sort_id = match next_catalog_id(&mut tx).await? {
                 Some(id) => id,
                 None => reserve_ids(&mut tx, "next_sort_id", 1).await?,
             };
-            let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
 
             // Validate every sort key resolves to a live column (v1 supports bare
             // column keys only), so a bad SET fails here rather than silently
@@ -3984,6 +4005,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .try_get(0)?;
 
             commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -4159,6 +4182,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .await?
                     .try_get(0)?;
             commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -4352,6 +4377,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
             commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -4593,6 +4620,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .await?;
 
             commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -4843,6 +4872,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .await?;
 
             commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5109,6 +5140,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .await?;
 
             commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5236,6 +5269,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .await?;
 
             commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5275,6 +5310,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
             commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5332,6 +5369,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
             commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5583,6 +5622,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .await?;
 
             commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5891,6 +5932,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .await?
                     .try_get(0)?;
             commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
