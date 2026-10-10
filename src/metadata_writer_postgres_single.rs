@@ -464,6 +464,35 @@ async fn retire_prior_generation(
     .execute(&mut **tx)
     .await?;
 
+    // And its inlined rows — this writer inlines none, but the DuckDB extension inlines
+    // small inserts by default, and a replace that left them live would keep them. As the
+    // SQLite writer does. The registry table exists only where something inlined.
+    // Checked first: a statement naming a missing table would abort the transaction.
+    let registry: bool =
+        sqlx::query_scalar("SELECT to_regclass('ducklake_inlined_data_tables') IS NOT NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    let inlined_tables: Vec<String> = if registry {
+        sqlx::query_scalar(
+            "SELECT table_name FROM ducklake_inlined_data_tables
+             WHERE table_id = $1 AND to_regclass(quote_ident(table_name)) IS NOT NULL",
+        )
+        .bind(table_id)
+        .fetch_all(&mut **tx)
+        .await?
+    } else {
+        Vec::new()
+    };
+    for table in inlined_tables {
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE {} SET end_snapshot = $1 WHERE end_snapshot IS NULL AND begin_snapshot < $1",
+            quote_ident(&table)
+        )))
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+
     sqlx::query(
         "UPDATE ducklake_table_stats SET record_count = 0, file_size_bytes = 0 WHERE table_id = $1",
     )
