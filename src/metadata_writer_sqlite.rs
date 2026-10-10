@@ -3366,9 +3366,10 @@ async fn commit_files_at_snapshot(
         crate::metadata_writer::enforce_partition_fence(write.table_id, live_partition_id, file)?;
     }
     sqlx::query(
-        "INSERT OR IGNORE INTO ducklake_table_stats
+        "INSERT INTO ducklake_table_stats
              (table_id, record_count, next_row_id, file_size_bytes)
-         VALUES (?, 0, 0, 0)",
+         SELECT ?1, 0, 0, 0
+         WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
     )
     .bind(write.table_id)
     .execute(&mut **tx)
@@ -3688,9 +3689,10 @@ async fn commit_inlined_at_snapshot(
         .system;
     let stats_initialized = table_stats_initialized(tx, write.table_id).await?;
     sqlx::query(
-        "INSERT OR IGNORE INTO ducklake_table_stats
+        "INSERT INTO ducklake_table_stats
              (table_id, record_count, next_row_id, file_size_bytes)
-         VALUES (?, 0, 0, 0)",
+         SELECT ?1, 0, 0, 0
+         WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
     )
     .bind(write.table_id)
     .execute(&mut **tx)
@@ -4982,9 +4984,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Seed the stats row for the Append path (Replace already seeded it
             // in finalize_snapshot); INSERT OR IGNORE is a no-op if it exists.
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -5159,9 +5162,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
             }
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -5310,9 +5314,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 }
             }
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -5591,9 +5596,10 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             let stats_initialized = table_stats_initialized(&mut tx, table_id).await?;
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -6094,9 +6100,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             // register_data_file. Deletes are accounted at read time
             // (delete_count), so record_count stays gross — no adjustment for them.
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -6359,9 +6366,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             // register_data_files. Deletes are accounted at read time
             // (delete_count), so record_count stays gross — no adjustment for them.
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -7009,9 +7017,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                     return Err(inlined_flush_conflict(table.table_id, base_snapshot));
                 }
                 sqlx::query(
-                    "INSERT OR IGNORE INTO ducklake_table_stats
+                    "INSERT INTO ducklake_table_stats
                          (table_id, record_count, next_row_id, file_size_bytes)
-                     VALUES (?, 0, 0, 0)",
+                     SELECT ?1, 0, 0, 0
+                     WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
                 )
                 .bind(table.table_id)
                 .execute(&mut *tx)
