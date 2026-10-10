@@ -483,7 +483,7 @@ async fn detect_replace_conflict(
     detect_inlined_delete_since(table_id, base_snapshot, tx).await
 }
 
-/// Retire the prior generation's still-visible data files at `snapshot_id`. The `begin_snapshot < snapshot_id` guard spares files
+/// Retire the prior generation's still-visible data files and inlined rows at `snapshot_id`. The `begin_snapshot < snapshot_id` guard spares files
 /// registered for *this* snapshot, so a multi-file write does not retire its
 /// own siblings. `ducklake_table_stats` is left as it is, as official's `DELETE`
 /// leaves it: `record_count` counts every row ever inserted.
@@ -500,6 +500,21 @@ async fn retire_prior_generation(
     .bind(table_id)
     .execute(&mut **tx)
     .await?;
+
+    // And its inlined rows, as the SQLite writer retires them: a replace that left them
+    // live would keep them beside the new generation.
+    for (table_name, system) in crate::metadata_writer_postgres::inlined_tables(tx, table_id).await?
+    {
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE {} SET {end} = $1 WHERE {end} IS NULL AND {begin} < $1",
+            quote_ident(&table_name),
+            end = system.end_snapshot,
+            begin = system.begin_snapshot,
+        )))
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -2477,14 +2492,6 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            sqlx::query(
-                "UPDATE ducklake_table_stats
-                 SET record_count = 0, file_size_bytes = 0
-                 WHERE table_id = $1",
-            )
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
 
             self.commit(tx).await?;
             Ok(result.rows_affected())

@@ -7576,14 +7576,6 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            sqlx::query(
-                "UPDATE ducklake_table_stats
-                 SET record_count = 0, file_size_bytes = 0
-                 WHERE table_id = ?",
-            )
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
 
             commit(tx).await?;
             Ok(result.rows_affected())

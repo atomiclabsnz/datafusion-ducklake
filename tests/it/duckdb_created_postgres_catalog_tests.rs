@@ -253,6 +253,28 @@ async fn the_extension_reads_and_writes_a_postgres_catalog_after_the_crate_wrote
         );
     }
 
+    // A replace over the extension's inlined rows retires them as well as files.
+    let writer = Arc::new(
+        PostgresSingleCatalogMetadataWriter::new_with_init(&db.url)
+            .await
+            .unwrap(),
+    );
+    DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .write_table("main", "small", &[orders(&[50])])
+        .await
+        .unwrap();
+    {
+        let lake = attach(&db, &data, 100);
+        assert_eq!(
+            found(
+                &lake,
+                "SELECT count(*), sum(id)::BIGINT FROM lake.main.small"
+            ),
+            (1, 50)
+        );
+    }
+
     let pool = sqlx::PgPool::connect(&db.url).await.unwrap();
     for namespace in [
         &[
