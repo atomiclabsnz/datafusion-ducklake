@@ -16,7 +16,7 @@ documentation = "https://docs.rs/datafusion-ducklake"
 readme = "README.md"
 keywords = ["datafusion", "duckdb", "ducklake", "iceberg", "datalake"]
 categories = ["database", "filesystem"]
-exclude = ["datafusion-ducklake.iml", "target", "tests/test_data"]
+exclude = ["datafusion-ducklake.iml", "target", "tests/test_data", "ci"]
 # The integration tests are one binary (`tests/it/main.rs`) with a module per
 # former `tests/*.rs` file, declared explicitly below rather than auto-discovered.
 autotests = false
@@ -36,8 +36,15 @@ object_store = { version = "0.13", default-features = false }
 url = "2.5"
 percent-encoding = "2"
 async-trait = "0.1"
-tokio = { version = "1", features = ["full"] }
+# What the crate itself uses on every target. `wasm32` gets only these: a browser
+# has no threads, no filesystem and no reactor, and the browser host drives the
+# futures itself. Every other target keeps `full` (below), which the catalog
+# backends' sync-over-async bridge (`block_in_place`, `rt-multi-thread`) and the
+# temp-file staging (`fs`) need.
+tokio = { version = "1", features = ["rt", "sync", "macros", "io-util", "time"] }
 futures = "0.3"
+# The in-memory staging buffer (`staging::Staging::Memory`); already in the graph through object_store.
+bytes = "1"
 tracing = "0.1"
 thiserror = "2.0"
 
@@ -55,6 +62,9 @@ tempfile = { version = "3.14", optional = true }
 # Metadata providers (optional)
 duckdb = { version = "1.10505.0", optional = true }
 sqlx = { version = "0.9", features = ["runtime-tokio"], optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 datafusion = "55"

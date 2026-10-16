@@ -287,6 +287,10 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
 - One `data_inlining_row_limit` governs every write path: stored table > schema >
   catalog-wide setting > the writer's limit (`with_write_options` / `with_data_inlining_row_limit`)
   > `10`.
+- `wasm32-unknown-unknown` builds the write path with no catalog backend
+  (`ci/wasm-check`); the host supplies one. There, Parquet is staged in memory
+  (`Staging::Memory`), uploads run inline, deletes are not prefetched and a commit retry does
+  not wait: nothing may spawn a tokio task or touch the filesystem.
 - Catalog and schema lookups are dynamic. Only a table's scan-time reads can be kept, through the
   opt-in `CatalogReadMemo` wrapper, which is not DuckLake behavior (see `COMPATIBILITY.md`)
 

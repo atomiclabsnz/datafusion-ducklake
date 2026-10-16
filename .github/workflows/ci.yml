@@ -221,6 +221,18 @@ jobs:
         if: steps.changes.outputs.code == 'true' && runner.os == 'Linux'
         run: cargo check --locked --lib --no-default-features
 
+      # The write path on wasm32-unknown-unknown, as a browser host builds it:
+      # no catalog backend (sqlx and DuckDB are native), memory staging, no
+      # spawned tasks. `ci/wasm-check` exists only to choose getrandom's browser
+      # backend, which a final binary picks and a library cannot.
+      - name: Check the write path for wasm32
+        if: steps.changes.outputs.code == 'true' && runner.os == 'Linux'
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check --manifest-path ci/wasm-check/Cargo.toml --target wasm32-unknown-unknown
+
       # macOS only. This step used to run on Linux too, as
       # `cargo test --features write-sqlite` — but `--features` keeps the default
       # features on, so that feature set (metadata-duckdb + duckdb-bundled +
