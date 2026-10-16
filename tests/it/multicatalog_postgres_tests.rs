@@ -679,7 +679,8 @@ async fn postgres_partitioned_write_honors_expected_snapshot() {
     let writer = Arc::new(
         PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
             .await
-            .unwrap(),
+            .unwrap()
+            .with_data_inlining_row_limit(0),
     );
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
@@ -942,7 +943,8 @@ async fn postgres_sort_ddl_records_snapshot_changes() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(row.try_get::<String, _>("expression").unwrap(), "name");
+    // A keyword is quoted, as DuckDB writes the column reference.
+    assert_eq!(row.try_get::<String, _>("expression").unwrap(), "\"name\"");
     assert_eq!(row.try_get::<String, _>("dialect").unwrap(), "duckdb");
     assert_eq!(row.try_get::<String, _>("sort_direction").unwrap(), "DESC");
     assert_eq!(
@@ -4465,7 +4467,8 @@ async fn writes_segregate_data_files_by_catalog_directory() {
     for cid in [cat_a, cat_b] {
         let writer = PostgresMetadataWriter::with_pool(pool.clone(), cid)
             .await
-            .unwrap();
+            .unwrap()
+            .with_data_inlining_row_limit(0);
         writer.set_data_path(&data_path).unwrap();
         let table_writer =
             DuckLakeTableWriter::new(Arc::new(writer), Arc::clone(&object_store)).unwrap();
@@ -6343,10 +6346,17 @@ async fn register_existing_data_files_bumps_schema_version_for_a_late_layout() {
     .unwrap();
     assert_eq!(live, vec!["name=us/f1.parquet".to_string()]);
     // The table already existed, so the spec is a genuine alteration and must be
-    // reported as one — the mirror of the created-table case above.
+    // reported as one — the mirror of the created-table case above — and the
+    // Replace records the rows it retired, as every Replace does.
     assert_eq!(
         snapshot_changes(&pool, out.snapshot_id).await.as_deref(),
-        Some(format!("altered_table:{0},inserted_into_table:{0}", out.table_id).as_str()),
+        Some(
+            format!(
+                "altered_table:{0},inserted_into_table:{0},deleted_from_table:{0}",
+                out.table_id
+            )
+            .as_str()
+        ),
     );
 }
 
@@ -9544,7 +9554,8 @@ async fn session_fixture(pool: &PgPool, connections: u32) -> (i64, PgPool, tempf
         .unwrap();
     let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     let temp = tempfile::TempDir::new().unwrap();
     let data_path = temp.path().join("data");
     std::fs::create_dir_all(&data_path).unwrap();

@@ -10,9 +10,10 @@
 //!   physical row positions matching the predicate and record them as official
 //!   DuckLake's `DuckLakeDelete::FlushDelete` does: at most the scoped
 //!   `data_inlining_row_limit` go to
-//!   `ducklake_inlined_delete_<table_id>`; a file they empty is dropped; a file
-//!   with a live delete file gets a new one carrying each position's snapshot
-//!   in its place; any other gets a delete file of its new positions. Matching
+//!   `ducklake_inlined_delete_<table_id>`, even when they empty the file;
+//!   above it, a file they empty is dropped, a file with a live delete file
+//!   gets a new one carrying each position's snapshot in its place, and any
+//!   other gets a delete file of its new positions. Matching
 //!   inlined rows are ended. Everything commits in a SINGLE snapshot (atomic
 //!   multi-file delete). The read path is already delete-aware, so a subsequent
 //!   `SELECT` excludes the deleted rows automatically.
@@ -279,11 +280,6 @@ async fn run_delete(
     // official DuckLake's `DuckLakeDelete::FlushDelete` does (see
     // [`FileDeletions::record`]); any other writes cumulative delete files.
     let capable = writer.supports_inlined_row_mutations();
-    let inline_limit = if capable {
-        table.write_options().data_inlining_row_limit.unwrap_or(0)
-    } else {
-        0
-    };
 
     // Delete-all (no WHERE) on a writer without staged row mutations:
     // metadata-only truncate — end every live data file in one snapshot. Skip
@@ -305,6 +301,16 @@ async fn run_delete(
     let table_writer = DuckLakeTableWriter::new(Arc::clone(&writer), object_store)
         .map(|writer| writer.with_options(table.write_options()))
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    // The table's scoped limit (stored table > schema > catalog-wide > the
+    // writer's > `10`), as official's `DuckLakeDelete` reads it: a table
+    // opened without the catalog's options carries no resolved limit.
+    let inline_limit = if capable {
+        table_writer
+            .table_data_inlining_row_limit(schema_name, table_name)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+    } else {
+        0
+    };
     let inlined_deletes = table.inlined_deletes_by_file()?;
 
     let predicate = match predicate {
@@ -481,7 +487,7 @@ pub(crate) struct DeletionTarget<'a> {
 
 impl<'a> DeletionTarget<'a> {
     /// The target for `file`, whose live delete file deletes `existing`.
-    fn of_file(
+    pub(crate) fn of_file(
         file: &'a crate::metadata_provider::DuckLakeTableFile,
         existing: &'a HashMap<i64, Option<i64>>,
     ) -> Self {
@@ -511,6 +517,25 @@ pub(crate) struct FileDeletions {
 }
 
 impl FileDeletions {
+    /// Deletions whose rewritten delete files date the statement's deletions
+    /// to `commit_snapshot`, for callers that record files concurrently and
+    /// [`absorb`](Self::absorb) the results.
+    pub(crate) fn dated(commit_snapshot: i64) -> Self {
+        Self {
+            commit_snapshot: Some(commit_snapshot),
+            ..Self::default()
+        }
+    }
+
+    /// Add `other`'s deletions to these.
+    pub(crate) fn absorb(&mut self, other: FileDeletions) {
+        self.positional.extend(other.positional);
+        self.rewritten.extend(other.rewritten);
+        self.inlined.extend(other.inlined);
+        self.dropped.extend(other.dropped);
+        self.commit_snapshot = self.commit_snapshot.or(other.commit_snapshot);
+    }
+
     /// Whether the deletions need the staged commit: anything beyond new delete
     /// files for files that had none.
     pub(crate) fn needs_staged_commit(&self) -> bool {
@@ -785,7 +810,9 @@ async fn delete_all(
             continue;
         }
         total += live as u64;
-        if inlined.is_none() && (inline_limit == 0 || live > inline_limit as i64) {
+        // `live` is positive here; one that does not fit `usize` exceeds any limit.
+        let over_limit = usize::try_from(live).map_or(true, |live| live > inline_limit);
+        if inlined.is_none() && (inline_limit == 0 || over_limit) {
             // Every remaining row is deleted, so the file is dropped; its
             // positions need not be read.
             deletions.dropped.push(DroppedDataFile {

@@ -133,9 +133,13 @@ df.show().await?;
 
 ## Writing a catalog
 
-SQL writes of at most `data_inlining_row_limit` rows (default `10`, as in official
-DuckLake) are stored in the catalog rather than in Parquet; set the limit to `0` to
-write every insert to Parquet. See the
+Writes of at most `data_inlining_row_limit` rows (default `10`, as in official
+DuckLake) are stored in the catalog rather than in Parquet: SQL writes,
+`DuckLakeTableWriter` writes and streaming sessions (all but
+`begin_write_with_embedded_rowid` and `begin_write_to_path`), and keyed mutations. Set the
+limit to `0` to write every insert to Parquet. Deletes built by hand from data files
+(`files_matching`, `resolve_positions`) miss inlined rows; use
+`DuckLakeTable::keyed_mutation`, `delete_positions` or `delete_rowids`. See the
 [inlined storage limits](COMPATIBILITY.md#inlined-physical-storage).
 
 PostgreSQL has two writers, both behind the `write-postgres` feature:
@@ -267,10 +271,13 @@ execute_ducklake_sql(
 ```
 
 The spec is recorded in the catalog (`ducklake_sort_info` / `ducklake_sort_expression`) and
-applied on insert, to `UPDATE` rewrites, and to compaction output; rows are sorted before the
-partition split, so each per-partition file stays a sorted subsequence. Bare-column keys are
-produced; other expressions are tolerated on read but never produced. `RESET SORTED BY`
-turns it off.
+applied on insert, inlined rows included (with the table's stored `sort_on_insert` option off,
+only to rows written to Parquet while inlining is enabled, as official DuckLake does), to the
+inlined-data flush whatever `sort_on_insert` says, and to compaction output; rows are sorted
+before the partition split, so each per-partition file stays a sorted subsequence. `UPDATE`
+rewrites are not sorted, as in official DuckLake. `SET SORTED BY` records bare-column keys; a
+key DuckDB recorded as another expression orders inserts, flushes and compaction (evaluated with
+DataFusion). `RESET SORTED BY` turns it off.
 
 ---
 
@@ -351,10 +358,11 @@ A few highlights worth knowing up front:
   itself, so a selective scan no longer lists every file. A few type/backend combinations
   decline it and fall back to in-memory pruning — see COMPATIBILITY.md.
 - Data inlining: rows inlined by DuckDB's ducklake extension are read and counted by
-  `COUNT(*)` on every backend. SQL writes inline batches of at most `data_inlining_row_limit`
-  rows (default `10`, as in official DuckLake), and `UPDATE` and `DELETE` inline small changes
-  as official does. The single-catalog PostgreSQL writer does not inline: its SQL writes and
-  staged write transactions go to Parquet, and it supports neither `UPDATE` nor `DELETE`.
+  `COUNT(*)` on every backend. Writes inline batches of at most `data_inlining_row_limit`
+  rows (default `10`, as in official DuckLake), through SQL and `DuckLakeTableWriter` alike,
+  and `UPDATE` and `DELETE` inline small changes as official does. The single-catalog
+  PostgreSQL writer does not inline: its SQL writes and staged write transactions go to
+  Parquet, and it supports neither `UPDATE` nor `DELETE`.
   Row-lineage scans and change feeds include inlined rows — see COMPATIBILITY.md.
 - Schema evolution: recursive `list`/`struct`/`map` columns, literal column defaults, and
   per-file `map_by_name` name mappings are honoured across scans, writes, and change feeds.

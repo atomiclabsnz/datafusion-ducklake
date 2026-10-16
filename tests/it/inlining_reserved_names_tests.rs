@@ -339,8 +339,7 @@ async fn postgres_single_catalog_refuses_reserved_columns() {
 }
 
 impl Lake {
-    /// An append through a `DuckLakeTableWriter` built without options, whose own
-    /// inlining limit is `0`.
+    /// An append through a `DuckLakeTableWriter` built without options.
     async fn append_default(
         &self,
         table: &str,
@@ -409,28 +408,39 @@ impl Lake {
     }
 }
 
-/// A `DuckLakeTableWriter` whose own limit is the default `0` applies it where
-/// the catalog stores none, as official's `DATA_INLINING_ROW_LIMIT 0` attach
-/// option does: on a catalog storing no limit it writes Parquet, accepts a
-/// reserved name, and creates no inlined data table.
+/// A `DuckLakeTableWriter` built without options applies the default limit of
+/// `10` where neither the catalog nor the metadata writer sets one: it refuses
+/// a reserved name and inlines a small write. Its explicit limit of `0`, as
+/// official's `DATA_INLINING_ROW_LIMIT 0` attach option, writes Parquet,
+/// accepts a reserved name, and creates no inlined data table.
 #[tokio::test(flavor = "multi_thread")]
-async fn default_table_writer_does_not_inline_on_an_unconfigured_catalog() {
+async fn default_table_writer_inlines_on_an_unconfigured_catalog() {
     let lake = lake().await;
-    lake.append_default("t", &["id", "row_id"]).await.unwrap();
-    assert_eq!(lake.inlined_tables("t").await, 0);
-    assert_eq!(lake.data_files("t").await, 1);
-    lake.append_default("t", &["id", "row_id", "end_snapshot"])
+    let error = lake
+        .append_default("t", &["id", "row_id"])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(RESERVED), "{error}");
+    lake.append_default("t", &["id"]).await.unwrap();
+    assert_eq!(lake.inlined_tables("t").await, 1);
+    assert_eq!(lake.data_files("t").await, 0);
+
+    lake.append("u", &["id", "row_id"], 0).await.unwrap();
+    assert_eq!(lake.inlined_tables("u").await, 0);
+    assert_eq!(lake.data_files("u").await, 1);
+    lake.append("u", &["id", "row_id", "end_snapshot"], 0)
         .await
         .unwrap();
-    assert_eq!(lake.inlined_tables("t").await, 0);
-    assert_eq!(lake.data_files("t").await, 2);
+    assert_eq!(lake.inlined_tables("u").await, 0);
+    assert_eq!(lake.data_files("u").await, 2);
 }
 
 /// A positive limit the catalog stores, catalog-wide or at schema scope,
-/// outranks the writer's own `0`: a reserved name is refused and a new table
-/// gets its inlined data table.
+/// outranks a table writer's limit of `0`: a reserved name is refused, a new
+/// table gets its inlined data table, and a small write is inlined.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stored_limit_outranks_the_default_table_writer() {
+async fn a_stored_limit_outranks_a_table_writer_limit_of_zero() {
     for scope in ["catalog", "schema"] {
         let lake = lake().await;
         match scope {
@@ -441,36 +451,35 @@ async fn a_stored_limit_outranks_the_default_table_writer() {
             _ => lake.set_schema_limit("5").await,
         }
         let error = lake
-            .append_default("u", &["id", "row_id"])
+            .append("u", &["id", "row_id"], 0)
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains(RESERVED), "{scope}: {error}");
-        lake.append_default("t", &["id"]).await.unwrap();
+        lake.append("t", &["id"], 0).await.unwrap();
         assert_eq!(lake.inlined_tables("t").await, 1, "{scope}");
-        // The writer's own limit still decides whether its rows are inlined.
-        assert_eq!(lake.data_files("t").await, 1, "{scope}");
+        assert_eq!(lake.data_files("t").await, 0, "{scope}");
     }
 }
 
-/// A table-scoped positive limit applies to a later write by a default
-/// writer: it refuses a new reserved column and creates the inlined data
+/// A table-scoped positive limit outranks a table writer's limit of `0` on a
+/// later write: it refuses a new reserved column and creates the inlined data
 /// table of the new schema version.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_table_limit_outranks_the_default_table_writer() {
+async fn a_table_limit_outranks_a_table_writer_limit_of_zero() {
     let lake = lake().await;
-    lake.append_default("t", &["id"]).await.unwrap();
+    lake.append("t", &["id"], 0).await.unwrap();
     assert_eq!(lake.inlined_tables("t").await, 0);
     lake.writer
         .set_table_setting(lake.table_id("t"), "data_inlining_row_limit", "5")
         .unwrap();
     let error = lake
-        .append_default("t", &["id", "begin_snapshot"])
+        .append("t", &["id", "begin_snapshot"], 0)
         .await
         .unwrap_err()
         .to_string();
     assert!(error.contains(RESERVED), "{error}");
-    lake.append_default("t", &["id", "v"]).await.unwrap();
+    lake.append("t", &["id", "v"], 0).await.unwrap();
     assert!(lake.inlined_tables("t").await >= 1);
 }
 
@@ -498,4 +507,121 @@ async fn sql_create_table_keeps_the_default_limit() {
         .await
         .unwrap();
     assert_eq!(lake.data_files("t").await, 0);
+}
+
+/// Files under the catalog's data directory.
+fn data_objects(lake: &Lake) -> usize {
+    fn walk(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            walk(&path)
+                        } else {
+                            1
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+    walk(&lake._temp.path().join("data"))
+}
+
+/// A write refused for a reserved column name is refused before it creates
+/// the table or uploads anything, as official refuses at `CREATE TABLE`: no
+/// `ducklake_table` row (which a later commit's snapshot would reveal), no
+/// `information_schema` entry, no data object; a streaming session refuses at
+/// `begin_write`, not after its rows are streamed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_write_creates_and_uploads_nothing() {
+    use arrow::datatypes::SchemaRef;
+    use datafusion_ducklake::WriteMode;
+    let lake = lake().await;
+    let schema = |columns: &[&str]| -> SchemaRef {
+        Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|name| Field::new(*name, DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ))
+    };
+    let writer: Arc<dyn MetadataWriter> = lake.writer.clone();
+    let table_writer = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new())).unwrap();
+
+    // One-shot writes of a new table: append, and SQL CREATE TABLE.
+    let error = lake
+        .append_default("t", &["id", "row_id"])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(RESERVED), "{error}");
+    let error = lake
+        .sql("CREATE TABLE lake.main.c (id INT, end_snapshot INT)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(RESERVED), "{error}");
+    // Sessions refuse up front, for a new table and for a new column.
+    for (table, columns) in [("s", &["id", "begin_snapshot"][..]), ("e", &["id", "row_id"])] {
+        if table == "e" {
+            lake.append_default("e", &["id"]).await.unwrap();
+        }
+        for single_file in [false, true] {
+            let begun = if single_file {
+                table_writer.begin_write_single_file(
+                    "main",
+                    table,
+                    &schema(columns),
+                    WriteMode::Append,
+                )
+            } else {
+                table_writer.begin_write("main", table, &schema(columns), WriteMode::Append)
+            };
+            let Err(error) = begun else {
+                panic!("{table}: begin_write accepted a reserved column");
+            };
+            let error = error.to_string();
+            assert!(error.contains(RESERVED), "{table}: {error}");
+        }
+    }
+
+    // A later commit reveals no refused table, and `e` gained no column.
+    lake.append_default("e", &["id"]).await.unwrap();
+    let pool = sqlx::SqlitePool::connect(&lake.url).await.unwrap();
+    let tables: Vec<String> = sqlx::query_scalar("SELECT table_name FROM ducklake_table")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(tables, vec!["e".to_string()]);
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM ducklake_column WHERE end_snapshot IS NULL ORDER BY column_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(columns, vec!["id".to_string()]);
+    let ctx = SessionContext::new();
+    let writer: Arc<dyn MetadataWriter> = lake.writer.clone();
+    DuckLakeCatalog::register(
+        &ctx,
+        "lake",
+        DuckLakeCatalog::with_writer(Arc::clone(&lake.provider), writer).unwrap(),
+    );
+    let listed = ctx
+        .sql("SELECT table_name FROM lake.information_schema.tables")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum::<usize>();
+    assert_eq!(listed, 1);
+    // `e`'s rows are inlined; nothing else was uploaded.
+    assert_eq!(data_objects(&lake), 0);
 }
