@@ -2053,6 +2053,56 @@ impl PromotedFile {
     }
 }
 
+/// One file of a [`MetadataWriter::register_imported_files`] commit.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ImportedFile {
+    /// The data file, its path absolute (`path_is_relative == false`).
+    pub file: DataFileInfo,
+    /// The delete file written for it, registered in the same snapshot.
+    pub delete: Option<DeleteFileInfo>,
+    /// The `ducklake_name_mapping` rows binding a file without field ids,
+    /// `target_field_id` naming the table's column ids.
+    pub name_mapping: Option<Vec<crate::metadata_provider::DuckLakeNameMappingEntry>>,
+    /// Whether this catalog takes ownership of the object, so its expiry,
+    /// compaction and cleanup may delete it. When `false`, the commit records
+    /// the object as not owned and cleanup never deletes it.
+    pub owned: bool,
+}
+
+impl ImportedFile {
+    /// Import `file`, not owned, with no deletes and no name mapping.
+    pub fn new(file: DataFileInfo) -> Self {
+        Self {
+            file,
+            delete: None,
+            name_mapping: None,
+            owned: false,
+        }
+    }
+
+    /// Attach the delete file written for it.
+    pub fn with_delete(mut self, delete: DeleteFileInfo) -> Self {
+        self.delete = Some(delete);
+        self
+    }
+
+    /// Bind its columns by name.
+    pub fn with_name_mapping(
+        mut self,
+        entries: Vec<crate::metadata_provider::DuckLakeNameMappingEntry>,
+    ) -> Self {
+        self.name_mapping = Some(entries);
+        self
+    }
+
+    /// Set whether the catalog owns the object ([`Self::owned`]).
+    pub fn with_owned(mut self, owned: bool) -> Self {
+        self.owned = owned;
+        self
+    }
+}
+
 /// The table layout a [`MetadataWriter::register_existing_data_files`] batch
 /// establishes on its own snapshot, before its files are fenced against it.
 ///
@@ -4630,6 +4680,38 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
             layout,
             mode,
         )
+    }
+
+    /// Register existing Parquet files, each with the positional delete file
+    /// written for it, as ONE new snapshot of the table: the commit behind
+    /// [`DuckLakeTableWriter::import_manifest`](crate::DuckLakeTableWriter::import_manifest).
+    ///
+    /// In one transaction: allocate the snapshot and reconcile the column
+    /// generation to `columns` / `column_ids` as an append does (so the
+    /// columns keep the ids the files' field ids name), refuse with
+    /// [`crate::DuckLakeError::Conflict`] a drop, alteration or delete of the
+    /// table since `base_snapshot`, fence each file against the live partition
+    /// spec, and then insert each file with a fresh `data_file_id`, its
+    /// statistics, partition values and name mapping, its delete file hanging
+    /// off that id, and, unless [`ImportedFile::owned`], a record that this
+    /// catalog does not own the object. A path already live in the table is
+    /// refused ([`crate::manifest_import::ImportError::DuplicateFile`]).
+    ///
+    /// Default: unsupported. The SQLite writer implements it.
+    #[allow(clippy::too_many_arguments)]
+    fn register_imported_files(
+        &self,
+        _table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _files: &[ImportedFile],
+        _base_snapshot: i64,
+        _columns: &[ColumnDef],
+        _column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        Err(DuckLakeError::Unsupported(
+            "importing existing files is not supported by this metadata writer".to_string(),
+        ))
     }
 
     /// Publish a write's snapshot as the catalog head with no data file (CREATE

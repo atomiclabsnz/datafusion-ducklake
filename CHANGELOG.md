@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DuckLakeTableWriter::import_manifest` registers existing Parquet files and their deleted
+  positions as one snapshot, checking field ids and leaving the files unowned (SQLite) (#2).
 - `DuckLakeTable::export_manifest` exports a snapshot as a file manifest — files, field ids,
   stats, partition values and resolved deleted positions — for other table formats (#1).
 - `CatalogReadMemo` keeps a table's scan-time catalog reads across queries, bound once per query.

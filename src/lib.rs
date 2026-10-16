@@ -141,6 +141,8 @@ pub mod keyed_mutation;
 #[cfg(feature = "write")]
 pub mod maintenance;
 #[cfg(feature = "write")]
+pub mod manifest_import;
+#[cfg(feature = "write")]
 pub mod metadata_writer;
 #[cfg(feature = "write-duckdb")]
 pub mod metadata_writer_duckdb;
@@ -217,9 +219,11 @@ pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use keyed_mutation::{KeyedMutation, KeyedMutationResult};
 #[cfg(feature = "write")]
+pub use manifest_import::{ImportError, ImportOptions, ImportResult};
+#[cfg(feature = "write")]
 pub use metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, InlinedFlushDeleteFile, InlinedFlushFile,
+    DeleteFileEntry, DeleteFileInfo, ImportedFile, InlinedFlushDeleteFile, InlinedFlushFile,
     InlinedFlushFileDelete, InlinedFlushTable, InlinedRowRef, MetadataWriter, MultiTableCommit,
     PromoteLayout, PromotedFile, RowIdStart, SnapshotCommitMetadata, SourceRetirement,
     StagedTableData, StagedTableWrite, WriteMode, WriteResult, WriteSetupResult,

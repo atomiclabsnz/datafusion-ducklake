@@ -84,6 +84,9 @@ The codebase follows a layered architecture with clear separation of concerns:
    - `manifest.rs`: `DuckLakeTable::export_manifest` — one snapshot as a format-neutral file manifest
      (files, field ids / name mapping, stats, partition values, resolved deleted positions) for
      conversion to other table formats; refuses inlined rows and encrypted files
+   - `manifest_import.rs`: `DuckLakeTableWriter::import_manifest` — register a manifest's existing
+     Parquet files plus deleted positions as one snapshot (field ids checked, no copy, files left
+     unowned in `ducklake_unowned_file` unless the caller takes ownership); SQLite writer only
    - `rowid_lookup.rs`: find rows by `rowid` (inlined, positional, or embedded row ids)
    - `change_detection.rs`: whether a table's rows changed between snapshots (the `changes_made`
      ledger, falling back to the change feed for flush and compaction snapshots)

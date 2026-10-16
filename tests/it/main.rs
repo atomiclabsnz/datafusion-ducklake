@@ -66,6 +66,7 @@ mod keyed_mutation_after_compaction_tests;
 mod list_column_pushdown_tests;
 mod maintenance_sqlite_tests;
 mod manifest_export_tests;
+mod manifest_import_tests;
 mod metadata_contract_tests;
 mod metadata_provider_blocking_tests;
 mod missing_delete_file_tests;

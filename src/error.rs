@@ -145,6 +145,11 @@ pub enum DuckLakeError {
     #[error("Write conflict: {0}")]
     Conflict(String),
 
+    /// A file manifest, or one of its files, cannot be imported.
+    #[cfg(feature = "write")]
+    #[error("Manifest import refused: {0}")]
+    Import(#[from] crate::manifest_import::ImportError),
+
     /// A table snapshot cannot be exported as a file manifest.
     #[error("Manifest export refused: {0}")]
     Manifest(#[from] crate::manifest::ManifestError),

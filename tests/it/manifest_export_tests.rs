@@ -23,10 +23,10 @@ use tempfile::TempDir;
 
 use crate::common::ensure_ducklake_installed;
 
-type Rows = Vec<Vec<Option<String>>>;
+pub(crate) type Rows = Vec<Vec<Option<String>>>;
 
 /// A DuckDB connection with `lake` attached to the DuckDB catalog `catalog`.
-fn attach(catalog: &Path, data: &Path, inlining_rows: usize) -> duckdb::Connection {
+pub(crate) fn attach(catalog: &Path, data: &Path, inlining_rows: usize) -> duckdb::Connection {
     ensure_ducklake_installed();
     let conn = duckdb::Connection::open_in_memory().unwrap();
     conn.execute_batch(&format!(
@@ -38,7 +38,7 @@ fn attach(catalog: &Path, data: &Path, inlining_rows: usize) -> duckdb::Connecti
     conn
 }
 
-fn snapshot_ids(conn: &duckdb::Connection) -> Vec<i64> {
+pub(crate) fn snapshot_ids(conn: &duckdb::Connection) -> Vec<i64> {
     let mut statement = conn
         .prepare("SELECT snapshot_id FROM lake.snapshots() ORDER BY snapshot_id")
         .unwrap();
@@ -51,7 +51,7 @@ fn snapshot_ids(conn: &duckdb::Connection) -> Vec<i64> {
 
 /// DuckDB's rows of `table` at `snapshot`, every value as text, or `None`
 /// when the table does not exist there.
-fn oracle_rows(conn: &duckdb::Connection, table: &str, snapshot: i64) -> Option<Rows> {
+pub(crate) fn oracle_rows(conn: &duckdb::Connection, table: &str, snapshot: i64) -> Option<Rows> {
     let sql =
         format!("SELECT COLUMNS(*)::VARCHAR FROM lake.main.{table} AT (VERSION => {snapshot})");
     let mut statement = conn.prepare(&sql).ok()?;
@@ -86,7 +86,7 @@ async fn table_at(
         .unwrap()
 }
 
-async fn export(
+pub(crate) async fn export(
     provider: &Arc<dyn MetadataProvider>,
     table: &str,
     snapshot: i64,
@@ -101,7 +101,7 @@ async fn export(
 /// The rows a manifest describes: each listed file read directly, its columns
 /// bound to the table's by field id or name mapping, its deleted positions
 /// dropped.
-fn manifest_rows(manifest: &TableManifest) -> Rows {
+pub(crate) fn manifest_rows(manifest: &TableManifest) -> Rows {
     let columns: Vec<(i64, &str)> = manifest
         .fields
         .iter()

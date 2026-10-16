@@ -19,9 +19,9 @@ use crate::metadata_provider::{InlinedSystemColumns, TagObjectType, TagTarget};
 use crate::metadata_provider_sqlite::{catalog_inlined_system_columns, inlined_table_layout};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
-    ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
-    MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite, WriteMode,
-    WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
+    ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, ImportedFile, InlinedRowRef,
+    MetadataWriter, MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite,
+    WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
     catalog_column_type_requires_migration, catalog_columns_differ, encode_inlined_index_columns,
     inlined_delete_groups, live_inlined_index_columns, parse_inlined_index_columns,
     snapshot_has_change, staged_table_write_changes, table_storage_changes, table_write_changes,
@@ -582,6 +582,31 @@ CREATE TABLE IF NOT EXISTS ducklake_data_file (
     -- References ducklake_partition_info.partition_id: the partition spec this
     -- file was written under. NULL for files of an unpartitioned table.
     partition_id INTEGER
+);
+
+-- Name mappings (DuckLake spec): bind the columns of a data file that carries
+-- no field ids by name. `ducklake_data_file.mapping_id` names one.
+CREATE TABLE IF NOT EXISTS ducklake_column_mapping (
+    mapping_id BIGINT,
+    table_id BIGINT,
+    type VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_name_mapping (
+    mapping_id BIGINT,
+    column_id BIGINT,
+    source_name VARCHAR,
+    target_field_id BIGINT,
+    parent_column BIGINT,
+    is_partition BOOLEAN
+);
+
+-- Library-specific, not in the DuckLake spec: objects an import registered
+-- without taking ownership. Cleanup and the orphan sweep never delete them.
+CREATE TABLE IF NOT EXISTS ducklake_unowned_file (
+    path VARCHAR NOT NULL,
+    table_id BIGINT,
+    begin_snapshot BIGINT
 );
 
 -- Per-snapshot change ledger (DuckLake spec). One row per snapshot recording
@@ -1239,6 +1264,17 @@ impl SqliteMetadataWriter {
         })
     }
 
+    /// The absolute paths of the objects an import registered without taking
+    /// ownership ([`ImportedFile::owned`]): cleanup never deletes them.
+    pub(crate) fn unowned_paths(&self) -> Result<std::collections::HashSet<String>> {
+        self.block_on(async {
+            let paths: Vec<String> = sqlx::query_scalar("SELECT path FROM ducklake_unowned_file")
+                .fetch_all(&self.pool)
+                .await?;
+            Ok(paths.into_iter().collect())
+        })
+    }
+
     /// Remove scheduled-deletion bookkeeping rows after their objects are gone.
     pub(crate) fn remove_scheduled(&self, ids: &[i64]) -> Result<()> {
         if ids.is_empty() {
@@ -1278,7 +1314,9 @@ impl SqliteMetadataWriter {
                  JOIN ducklake_schema s ON s.schema_id = t.schema_id
                  UNION ALL
                  SELECT path AS p, CAST(path_is_relative AS INTEGER) AS rel
-                 FROM ducklake_files_scheduled_for_deletion"
+                 FROM ducklake_files_scheduled_for_deletion
+                 UNION ALL
+                 SELECT path AS p, 0 AS rel FROM ducklake_unowned_file"
             );
             let rows = sqlx::query(AssertSqlSafe(q.as_str()))
                 .fetch_all(&self.pool)
@@ -5107,6 +5145,231 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?
                     .try_get(0)?;
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
+    fn register_imported_files(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        files: &[ImportedFile],
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        self.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let snapshot_id = finalize_snapshot(
+                &mut tx,
+                table_id,
+                schema_name,
+                table_name,
+                columns,
+                column_ids,
+                WriteMode::Append,
+                base_snapshot,
+            )
+            .await?;
+            // The files' field ids name these columns; ids a later write reserves
+            // must come after them.
+            if let Some(highest) = column_ids.iter().copied().max() {
+                sqlx::query(
+                    "UPDATE ducklake_metadata
+                     SET value = CAST(MAX(CAST(value AS INTEGER), ?) AS TEXT)
+                     WHERE key = 'next_column_id' AND scope IS NULL",
+                )
+                .bind(highest)
+                .execute(&mut *tx)
+                .await?;
+            }
+            let live_partition_id: Option<i64> = sqlx::query_scalar(
+                "SELECT partition_id FROM ducklake_partition_info
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            for imported in files {
+                crate::metadata_writer::enforce_partition_fence(
+                    table_id,
+                    live_partition_id,
+                    &imported.file,
+                )?;
+                let duplicate: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM ducklake_data_file
+                         WHERE table_id = ? AND path = ? AND NOT path_is_relative
+                           AND end_snapshot IS NULL
+                     )",
+                )
+                .bind(table_id)
+                .bind(&imported.file.path)
+                .fetch_one(&mut *tx)
+                .await?;
+                if duplicate {
+                    return Err(crate::manifest_import::ImportError::DuplicateFile {
+                        path: imported.file.path.clone(),
+                    }
+                    .into());
+                }
+            }
+            sqlx::query(
+                "INSERT OR IGNORE INTO ducklake_table_stats
+                     (table_id, record_count, next_row_id, file_size_bytes)
+                 VALUES (?, 0, 0, 0)",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            let mut next_row_id: i64 = sqlx::query_scalar(
+                "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let mut next_mapping_id: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(mapping_id), 0) + 1 FROM ducklake_column_mapping",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let (mut total_advance, mut total_records, mut total_bytes) = (0i64, 0i64, 0i64);
+            let mut has_deletes = false;
+            for imported in files {
+                let file = &imported.file;
+                let mapping_id = match &imported.name_mapping {
+                    Some(entries) => {
+                        let mapping_id = next_mapping_id;
+                        next_mapping_id += 1;
+                        sqlx::query(
+                            "INSERT INTO ducklake_column_mapping (mapping_id, table_id, type)
+                             VALUES (?, ?, 'map_by_name')",
+                        )
+                        .bind(mapping_id)
+                        .bind(table_id)
+                        .execute(&mut *tx)
+                        .await?;
+                        for entry in entries {
+                            sqlx::query(
+                                "INSERT INTO ducklake_name_mapping
+                                     (mapping_id, column_id, source_name, target_field_id,
+                                      parent_column, is_partition)
+                                 VALUES (?, ?, ?, ?, ?, ?)",
+                            )
+                            .bind(mapping_id)
+                            .bind(entry.column_id)
+                            .bind(&entry.source_name)
+                            .bind(entry.target_field_id)
+                            .bind(entry.parent_column)
+                            .bind(entry.is_partition)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                        Some(mapping_id)
+                    },
+                    None => None,
+                };
+                let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
+                let data_file_id = next_file_id(&mut tx).await?;
+                sqlx::query(
+                    "INSERT INTO ducklake_data_file
+                         (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                          footer_size, record_count, row_id_start, mapping_id, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(data_file_id)
+                .bind(table_id)
+                .bind(&file.path)
+                .bind(file.path_is_relative)
+                .bind(file.file_size_bytes)
+                .bind(file.footer_size)
+                .bind(file.record_count)
+                .bind(row_ids.stored)
+                .bind(mapping_id)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
+                    .await?;
+                insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
+                if let Some(delete) = &imported.delete {
+                    has_deletes = true;
+                    let delete_file_id = next_file_id(&mut tx).await?;
+                    sqlx::query(
+                        "INSERT INTO ducklake_delete_file
+                             (delete_file_id, data_file_id, table_id, path, path_is_relative,
+                              file_size_bytes, footer_size, delete_count, begin_snapshot)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(delete_file_id)
+                    .bind(data_file_id)
+                    .bind(table_id)
+                    .bind(&delete.path)
+                    .bind(delete.path_is_relative)
+                    .bind(delete.file_size_bytes)
+                    .bind(delete.footer_size)
+                    .bind(delete.delete_count)
+                    .bind(snapshot_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                if !imported.owned {
+                    sqlx::query(
+                        "INSERT INTO ducklake_unowned_file (path, table_id, begin_snapshot)
+                         VALUES (?, ?, ?)",
+                    )
+                    .bind(&file.path)
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                next_row_id += row_ids.advance;
+                total_advance += row_ids.advance;
+                total_records += file.record_count;
+                total_bytes += file.file_size_bytes;
+            }
+            let infos: Vec<DataFileInfo> = files.iter().map(|f| f.file.clone()).collect();
+            merge_file_table_column_stats(
+                &mut tx,
+                table_id,
+                &crate::metadata_writer::catalog_fields(columns, column_ids)?,
+                &crate::metadata_writer::file_column_stats(&infos),
+            )
+            .await?;
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET next_row_id     = next_row_id + ?,
+                     record_count    = record_count + ?,
+                     file_size_bytes = file_size_bytes + ?
+                 WHERE table_id = ?",
+            )
+            .bind(total_advance)
+            .bind(total_records)
+            .bind(total_bytes)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            let changes_made =
+                table_write_changes(table_id, WriteMode::Append, has_deletes, (false, false));
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &changes_made,
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            let schema_id: i64 =
+                sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
             tx.commit().await?;
             Ok(CommitIds {
                 snapshot_id,
