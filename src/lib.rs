@@ -161,6 +161,8 @@ pub mod multicatalog_provider;
 #[cfg(feature = "write")]
 pub mod sql;
 #[cfg(feature = "write")]
+pub mod staging;
+#[cfg(feature = "write")]
 pub mod stats_collect;
 pub mod stats_encode;
 pub mod stats_filter;
@@ -244,6 +246,8 @@ pub use multicatalog::{FileOwners, MulticatalogManager, initialize_multicatalog_
 pub use multicatalog_provider::{MetadataReadSession, MulticatalogProvider};
 #[cfg(feature = "write")]
 pub use sql::execute_ducklake_sql;
+#[cfg(feature = "write")]
+pub use staging::Staging;
 #[cfg(feature = "write")]
 pub use table_writer::{
     DuckLakeTableWriter, DuckLakeWriteOptions, DuckLakeWriteTransaction, InlinedFlushPolicy,
