@@ -1,0 +1,24 @@
+# The wasm32 build of the write path, as a browser host would build it.
+#
+# Not a workspace member: it exists to pick, as a final binary must, the
+# randomness backend `getrandom` uses on `wasm32-unknown-unknown` (`uuid` names
+# every data file with a v4 UUID). A library cannot pick that for its
+# consumers, so the crate itself does not; this harness does, the way a host
+# such as ferrion-wasm does.
+#
+#   RUSTFLAGS='--cfg getrandom_backend="wasm_js"' \
+#     cargo check --manifest-path ci/wasm-check/Cargo.toml --target wasm32-unknown-unknown
+[package]
+name = "ducklake-wasm-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+datafusion-ducklake = { path = "../..", default-features = false, features = ["write"] }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The write path builds for `wasm32-unknown-unknown` (`--no-default-features --features write`),
+  checked in CI; a browser host supplies the catalog backend.
+- `Staging` (`DuckLakeWriteOptions::staging`, `with_staging`): stage Parquet in memory, uploaded
+  with one `put`. The only staging on `wasm32`; temp files stay the default elsewhere.
 - `CatalogReadMemo` keeps a table's scan-time catalog reads across queries, bound once per query.
   It is opt-in and not DuckLake behavior, as `COMPATIBILITY.md` explains (#338).
 - `DuckLakeReadOptions` lets a table keep the delete-file positions its scans read (#338).
@@ -200,6 +204,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A streaming write with no tokio runtime on its thread uploads its rolled files itself instead
+  of failing at `finish` with "uploading data files requires a tokio runtime".
 - Inserts order rows by `SET SORTED BY` as official does: inlined rows too, and with
   `sort_on_insert` off, rows written to Parquet while inlining is enabled.
 - Expression sort keys order inserts, flushes and compaction, evaluated with DataFusion (layout
