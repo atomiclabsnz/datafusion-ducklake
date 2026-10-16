@@ -84,6 +84,7 @@ pub(crate) mod field_id_adapter;
 pub mod information_schema;
 pub mod inlined_filter;
 pub(crate) mod lazy_delete_filter;
+pub mod manifest;
 pub mod metadata_provider;
 pub(crate) mod nan_pruning_barrier;
 mod nested_inline;
@@ -176,6 +177,7 @@ pub use catalog::DuckLakeCatalog;
 pub use catalog_read_memo::{CatalogReadMemo, MemoizedMetadataProvider};
 pub use delete_memo::DuckLakeReadOptions;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
+pub use manifest::{ColumnBinding, ManifestDataFile, ManifestError, TableManifest};
 pub use metadata_provider::{
     ColumnTag, DuckLakeFileData, DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData,
     DuckLakeTableFile, DuckLakeTag, MetadataProvider, ObjectTag, SnapshotChangeMetadata,

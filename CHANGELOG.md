@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DuckLakeTable::export_manifest` exports a snapshot as a file manifest — files, field ids,
+  stats, partition values and resolved deleted positions — for other table formats (#1).
 - `CatalogReadMemo` keeps a table's scan-time catalog reads across queries, bound once per query.
   It is opt-in and not DuckLake behavior, as `COMPATIBILITY.md` explains (#338).
 - `DuckLakeReadOptions` lets a table keep the delete-file positions its scans read (#338).

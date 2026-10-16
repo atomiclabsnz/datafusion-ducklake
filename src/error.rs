@@ -145,6 +145,10 @@ pub enum DuckLakeError {
     #[error("Write conflict: {0}")]
     Conflict(String),
 
+    /// A table snapshot cannot be exported as a file manifest.
+    #[error("Manifest export refused: {0}")]
+    Manifest(#[from] crate::manifest::ManifestError),
+
     /// Generic error
     #[error("Internal error: {0}")]
     Internal(String),
