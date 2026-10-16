@@ -494,6 +494,7 @@ pub fn collect_written_column_stats(
 /// ids are the catalog column ids: a nested column also gets one
 /// [`ColumnStat`] per scalar field below it, keyed by that field's id, as
 /// official records them.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn collect_own_written_column_stats(
     path: &Path,
     column_ids: &[i64],
@@ -510,6 +511,29 @@ pub(crate) fn collect_own_written_column_stats(
     )
 }
 
+/// [`collect_own_written_column_stats`] for a file staged in memory rather than
+/// on disk (`crate::staging::Staging::Memory`). `label` names it in a warning.
+#[cfg(feature = "write")]
+pub(crate) fn collect_own_written_column_stats_from(
+    bytes: bytes::Bytes,
+    label: &str,
+    column_ids: &[i64],
+    row_count: i64,
+    leaves: &WrittenLeafStats,
+) -> Vec<ColumnStat> {
+    or_warn(
+        try_collect(
+            bytes,
+            column_ids,
+            row_count,
+            &leaves.nan_flags,
+            Some(&leaves.bounds),
+            NestedLeafIds::FileFieldIds,
+        ),
+        label,
+    )
+}
+
 fn collect(
     path: &Path,
     column_ids: &[i64],
@@ -518,19 +542,30 @@ fn collect(
     bounds: Option<&[Option<LeafBounds>]>,
     nested: NestedLeafIds<'_>,
 ) -> Vec<ColumnStat> {
-    match try_collect(
-        path,
-        column_ids,
-        row_count,
-        contains_nan_flags,
-        bounds,
-        nested,
-    ) {
+    let stats = std::fs::File::open(path)
+        .map_err(crate::error::DuckLakeError::from)
+        .and_then(|file| {
+            try_collect(
+                file,
+                column_ids,
+                row_count,
+                contains_nan_flags,
+                bounds,
+                nested,
+            )
+        });
+    or_warn(stats, &path.display().to_string())
+}
+
+/// Statistics are best-effort: a file whose footer cannot be read is registered
+/// without them, which is spec-safe.
+fn or_warn(stats: crate::Result<Vec<ColumnStat>>, path: &str) -> Vec<ColumnStat> {
+    match stats {
         Ok(stats) => stats,
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                path = %path.display(),
+                path = %path,
                 "failed to harvest parquet statistics; writing file without column stats"
             );
             Vec::new()
@@ -538,17 +573,16 @@ fn collect(
     }
 }
 
-fn try_collect(
-    path: &Path,
+fn try_collect<R: parquet::file::reader::ChunkReader + 'static>(
+    reader: R,
     column_ids: &[i64],
     row_count: i64,
     contains_nan_flags: &[Option<bool>],
     bounds: Option<&[Option<LeafBounds>]>,
     nested: NestedLeafIds<'_>,
 ) -> crate::Result<Vec<ColumnStat>> {
-    let file = std::fs::File::open(path)?;
     // Parses only the footer (no data pages are read).
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+    let builder = ParquetRecordBatchReaderBuilder::try_new(reader)
         .map_err(|e| crate::error::DuckLakeError::Internal(format!("parquet metadata: {e}")))?;
     // Use the reader's own reconstructed Arrow schema + parquet schema so
     // `StatisticsConverter`'s name/type match check always agrees (avoids the

@@ -1,7 +1,6 @@
 //! High-level table writer for DuckLake catalogs.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use arrow::array::Array;
@@ -11,14 +10,11 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{FutureExt, StreamExt};
-use object_store::buffered::BufWriter as ObjectBufWriter;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use parquet::file::properties::{WriterProperties, WriterVersion};
-use tempfile::NamedTempFile;
-use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::Result;
@@ -30,6 +26,7 @@ use crate::metadata_writer::{
 };
 use crate::path_resolver::join_paths;
 use crate::row_id::{embedded_rowid_field, embedded_snapshot_id_field};
+use crate::staging::{StageWriter, Staged, Staging};
 use crate::table::delete_file_schema;
 use crate::write_encoding::RowGroupSampledWriter;
 
@@ -198,6 +195,9 @@ pub struct DuckLakeWriteOptions {
     /// How many finished data files to upload concurrently; `None` leaves the
     /// writer default ([`DEFAULT_UPLOAD_CONCURRENCY`]). Clamped to at least 1.
     pub upload_concurrency: Option<usize>,
+    /// Where each Parquet file is staged before upload; `None` leaves the writer
+    /// default ([`Staging::default`]: a temporary file, or memory on `wasm32`).
+    pub staging: Option<Staging>,
     /// Whether inserts honor the table's active sort order where the catalog
     /// stores no `sort_on_insert` setting: a stored table, schema or
     /// catalog-wide setting outranks it, as official has no session override
@@ -248,6 +248,7 @@ impl DuckLakeWriteOptions {
             )?,
             max_open_partitions: None,
             upload_concurrency: None,
+            staging: None,
             // Official sorts only while the option reads exactly `true`.
             sort_on_insert: Some(
                 settings
@@ -343,6 +344,9 @@ impl DuckLakeWriteOptions {
         }
         if overrides.upload_concurrency.is_some() {
             self.upload_concurrency = overrides.upload_concurrency;
+        }
+        if overrides.staging.is_some() {
+            self.staging = overrides.staging;
         }
         if overrides.sort_on_insert.is_some() {
             self.sort_on_insert = overrides.sort_on_insert;
@@ -472,12 +476,14 @@ fn parse_size(key: &str, value: &str) -> Result<usize> {
             "Invalid ducklake_metadata {key} size '{value}'"
         )));
     }
-    let number = number.parse::<usize>().map_err(|e| {
+    // Multiplied in u64 and narrowed at the end: `usize` is 32 bits on wasm32, where
+    // a terabyte is not even a valid literal of it.
+    let number = number.parse::<u64>().map_err(|e| {
         crate::error::DuckLakeError::InvalidConfig(format!(
             "Invalid ducklake_metadata {key} size '{value}': {e}"
         ))
     })?;
-    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
+    let multiplier: u64 = match unit.trim().to_ascii_lowercase().as_str() {
         "" | "b" => 1,
         "kb" => 1_000,
         "mb" => 1_000_000,
@@ -486,18 +492,21 @@ fn parse_size(key: &str, value: &str) -> Result<usize> {
         "kib" => 1 << 10,
         "mib" => 1 << 20,
         "gib" => 1 << 30,
-        "tib" => 1usize << 40,
+        "tib" => 1 << 40,
         _ => {
             return Err(crate::error::DuckLakeError::InvalidConfig(format!(
                 "Invalid ducklake_metadata {key} size unit in '{value}'"
             )));
         },
     };
-    number.checked_mul(multiplier).ok_or_else(|| {
-        crate::error::DuckLakeError::InvalidConfig(format!(
-            "ducklake_metadata {key} size '{value}' exceeds usize"
-        ))
-    })
+    number
+        .checked_mul(multiplier)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| {
+            crate::error::DuckLakeError::InvalidConfig(format!(
+                "ducklake_metadata {key} size '{value}' exceeds usize"
+            ))
+        })
 }
 
 fn setting_compression(name: &str, level: Option<i32>) -> Result<Compression> {
@@ -684,6 +693,8 @@ pub struct DuckLakeTableWriter {
     /// [`DEFAULT_UPLOAD_CONCURRENCY`]; override via
     /// [`DuckLakeTableWriter::with_upload_concurrency`].
     upload_concurrency: usize,
+    /// Where each Parquet file is staged before upload. See [`crate::staging`].
+    staging: Staging,
     /// Target data file size in approximate encoded bytes. A write rolls over to a
     /// new file once the current file's estimated encoded size reaches this, so a
     /// large write produces several files instead of one. Paired with a sort order,
@@ -744,6 +755,7 @@ impl DuckLakeTableWriter {
             max_row_group_rows: None,
             max_row_group_bytes: None,
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
+            staging: Staging::default(),
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
             max_open_partitions: DEFAULT_MAX_OPEN_PARTITIONS,
             data_inlining_row_limit: None,
@@ -823,6 +835,16 @@ impl DuckLakeTableWriter {
         self
     }
 
+    /// Stage each Parquet file in a local temporary file ([`Staging::File`], the
+    /// default where there is a filesystem) or in memory ([`Staging::Memory`], the
+    /// only staging on `wasm32`). Memory staging holds up to `target_file_size`
+    /// bytes per file in flight; see [`crate::staging`].
+    #[must_use]
+    pub fn with_staging(mut self, staging: Staging) -> Self {
+        self.staging = staging;
+        self
+    }
+
     /// Apply a [`DuckLakeWriteOptions`] set (compression, row-group caps, rollover
     /// target, open-partition cap, upload concurrency). Each field overrides the
     /// corresponding setting only when present.
@@ -850,6 +872,9 @@ impl DuckLakeTableWriter {
         }
         if let Some(files) = options.upload_concurrency {
             self.upload_concurrency = files.max(1);
+        }
+        if let Some(staging) = options.staging {
+            self.staging = staging;
         }
         if let Some(sort_on_insert) = options.sort_on_insert {
             self.sort_on_insert = sort_on_insert;
@@ -1254,13 +1279,15 @@ impl DuckLakeTableWriter {
             props_builder = props_builder.set_max_row_group_bytes(Some(bytes));
         }
         let props = props_builder.build();
-        // Stream the parquet to a local staging file rather than an in-memory
+        // Stage the parquet in a local file by default rather than an in-memory
         // buffer: a multi-GB table would otherwise be held whole in RAM and,
         // worse, uploaded as a single PUT (object stores cap a single PUT at
         // 5 GiB). `finish()` streams this file out via a multipart upload.
-        let temp = NamedTempFile::new()?;
-        let staging = std::io::BufWriter::new(temp.reopen()?);
-        let writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
+        let writer = RowGroupSampledWriter::new(
+            StageWriter::new(self.staging)?,
+            schema_with_ids.clone(),
+            props,
+        );
 
         // A partitioned target routes rows through a per-partition sink. The
         // single-file writer above is still created: with zero rows the sink
@@ -1296,6 +1323,7 @@ impl DuckLakeTableWriter {
                             self.upload_concurrency,
                         ),
                         staged_values: Vec::new(),
+                        staging: self.staging,
                     }),
                 },
             };
@@ -1312,6 +1340,7 @@ impl DuckLakeTableWriter {
                 self.target_file_size,
                 // Keep `TableWriteSession::file_path` accurate for the first file.
                 Some(catalog_path.clone()),
+                self.staging,
             ))
         } else {
             None
@@ -1346,7 +1375,6 @@ impl DuckLakeTableWriter {
             schema_with_ids,
             validation_schema,
             writer: Some(writer),
-            temp: Some(temp),
             catalog_path,
             path_is_relative,
             mode,
@@ -1777,27 +1805,18 @@ impl DuckLakeTableWriter {
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
 
-        // Stream to a local staging file, then multipart-upload it — the same
-        // bounded-memory path `finish()` uses for data files.
+        // Stage, then upload — the same path `finish()` uses for data files.
         let props = WriterProperties::builder()
             .set_writer_version(self.writer_version)
             .set_compression(self.compression)
             .build();
-        let temp = NamedTempFile::new()?;
-        let staging = std::io::BufWriter::new(temp.reopen()?);
-        let mut writer = ArrowWriter::try_new(staging, schema, Some(props))?;
+        let mut writer =
+            ArrowWriter::try_new(StageWriter::new(self.staging)?, schema, Some(props))?;
         writer.write(&batch)?;
-        let staged = writer.into_inner()?;
-        let mut file = staged
-            .into_inner()
-            .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
-        let file_size = file.metadata()?.len() as i64;
-        let footer_size = read_footer_size(&mut file)?;
-
-        let local = tokio::fs::File::open(temp.path()).await?;
-        let mut reader = tokio::io::BufReader::new(local);
-        let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path);
-        stream_to_upload(&mut reader, &mut upload).await?;
+        let staged = writer.into_inner()?.finish()?;
+        let file_size = staged.len()? as i64;
+        let footer_size = staged.footer_size()?;
+        staged.upload(&self.object_store, &object_path).await?;
 
         // Registered relative to the table path (like data files); the reader
         // resolves it against the same table data dir.
@@ -1861,6 +1880,7 @@ impl DuckLakeTableWriter {
                 usize::MAX
             },
             None,
+            self.staging,
         );
         let mut files = Vec::new();
         for batch in batches {
@@ -2038,9 +2058,11 @@ impl DuckLakeTableWriter {
         }
         let props = props_builder.build();
 
-        let temp = NamedTempFile::new()?;
-        let staging = std::io::BufWriter::new(temp.reopen()?);
-        let mut writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
+        let mut writer = RowGroupSampledWriter::new(
+            StageWriter::new(self.staging)?,
+            schema_with_ids.clone(),
+            props,
+        );
         let mut row_count: i64 = 0;
         let mut leaf_stats = crate::stats_collect::WrittenLeafStats::default();
         while let Some(batch) = batches.next().await {
@@ -2057,27 +2079,15 @@ impl DuckLakeTableWriter {
             writer.write(&batch_with_ids)?;
             row_count += batch.num_rows() as i64;
         }
-        let staged = writer.into_inner()?;
-        let mut file = staged
-            .into_inner()
-            .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
-        let file_size = file.metadata()?.len() as i64;
-        let footer_size = read_footer_size(&mut file)?;
-
-        let local = tokio::fs::File::open(temp.path()).await?;
-        let mut reader = tokio::io::BufReader::new(local);
-        let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path);
-        stream_to_upload(&mut reader, &mut upload).await?;
+        let staged = writer.into_inner()?.finish()?;
+        let file_size = staged.len()? as i64;
+        let footer_size = staged.footer_size()?;
+        staged.upload(&self.object_store, &object_path).await?;
 
         // Collect stats for catalog columns only. NaN presence and string
         // bounds were tracked while consuming the stream: the footer records
         // neither as official does.
-        let column_stats = crate::stats_collect::collect_own_written_column_stats(
-            temp.path(),
-            stats_column_ids,
-            row_count,
-            &leaf_stats,
-        );
+        let column_stats = staged.own_column_stats(stats_column_ids, row_count, &leaf_stats);
 
         Ok(DataFileInfo::new(file_name, file_size, row_count)
             .with_footer_size(footer_size)
@@ -3202,6 +3212,7 @@ impl DuckLakeTableWriter {
             self.build_writer_props(),
             self.target_file_size,
             None,
+            self.staging,
         );
         let mut files: Vec<DataFileInfo> = Vec::new();
         for batch in batches {
@@ -3747,7 +3758,12 @@ impl DuckLakeWriteTransaction<'_> {
                         )))
                         .await);
                 }
-                tokio::time::sleep(retry_wait(attempt - 1)).await;
+                let wait = retry_wait(attempt - 1);
+                // No timer without a tokio runtime (a browser): retry at once.
+                #[cfg(not(target_arch = "wasm32"))]
+                tokio::time::sleep(wait).await;
+                #[cfg(target_arch = "wasm32")]
+                let _ = wait;
                 if let Err(redate) = self.redate(date).await {
                     return Err(self.fail_cleaned(redate).await);
                 }
@@ -4095,11 +4111,10 @@ pub(crate) fn reslice_to_lengths(batches: Vec<RecordBatch>, lengths: &[usize]) -
     out
 }
 
-/// One parquet file being written to local staging.
+/// One parquet file being written to its staging.
 #[derive(Debug)]
 struct OpenFile {
-    writer: RowGroupSampledWriter<std::io::BufWriter<std::fs::File>>,
-    temp: NamedTempFile,
+    writer: RowGroupSampledWriter<StageWriter>,
     /// Path relative to the table directory (includes any Hive subpath).
     catalog_path: String,
     object_path: ObjectPath,
@@ -4107,16 +4122,15 @@ struct OpenFile {
     leaf_stats: crate::stats_collect::WrittenLeafStats,
 }
 
-/// A finished parquet whose footer is written and whose staging file is complete on
-/// disk, awaiting upload.
+/// A finished parquet whose footer is written and whose staging is complete,
+/// awaiting upload.
 ///
-/// Holds a [`tempfile::TempPath`], not a `NamedTempFile`: nothing touches the file
+/// A file stage holds a path, not a descriptor ([`Staged`]): nothing touches the file
 /// again until upload, so keeping a descriptor open would make a writer's open-fd count
 /// grow with the TOTAL number of files it produced rather than staying bounded.
-/// `TempPath` keeps the file on disk (still deleted on drop) with no descriptor held.
 #[derive(Debug)]
 struct StagedFile {
-    temp: tempfile::TempPath,
+    staged: Staged,
     catalog_path: String,
     object_path: ObjectPath,
     row_count: i64,
@@ -4155,9 +4169,11 @@ struct RollingFileWriter {
     /// `target_file_size`, only) file, so rolling does not silently change what an
     /// existing caller observes. Taken on first use.
     first_catalog_path: Option<String>,
+    staging: Staging,
 }
 
 impl RollingFileWriter {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         table_key: String,
         rel_prefix: Option<String>,
@@ -4166,9 +4182,11 @@ impl RollingFileWriter {
         props: WriterProperties,
         target_file_size: usize,
         first_catalog_path: Option<String>,
+        staging: Staging,
     ) -> Self {
         Self {
             first_catalog_path,
+            staging,
             table_key,
             rel_prefix,
             schema_with_ids,
@@ -4242,13 +4260,13 @@ impl RollingFileWriter {
         };
         let object_path_str = join_paths(&self.table_key, &catalog_path)?;
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
-        let temp = NamedTempFile::new()?;
-        let staging = std::io::BufWriter::new(temp.reopen()?);
-        let writer =
-            RowGroupSampledWriter::new(staging, self.schema_with_ids.clone(), self.props.clone());
+        let writer = RowGroupSampledWriter::new(
+            StageWriter::new(self.staging)?,
+            self.schema_with_ids.clone(),
+            self.props.clone(),
+        );
         Ok(OpenFile {
             writer,
-            temp,
             catalog_path,
             object_path,
             row_count: 0,
@@ -4257,18 +4275,14 @@ impl RollingFileWriter {
     }
 }
 
-/// Write the parquet footer and flush the staging file to disk, releasing its
-/// descriptor. Synchronous, so a streaming write needs no await to roll a file.
+/// Write the parquet footer and complete its staging (a file's buffered bytes are
+/// flushed and its descriptor released). Synchronous, so a streaming write needs no
+/// await to roll a file.
 #[tracing::instrument(name = "ducklake.finalize_open_file", level = "info", skip_all)]
 fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
-    let staged = file.writer.into_inner()?;
-    // `into_inner` flushes the buffered footer bytes to the OS file; dropping the
-    // returned handle closes that descriptor.
-    staged
-        .into_inner()
-        .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
+    let staged = file.writer.into_inner()?.finish()?;
     Ok(StagedFile {
-        temp: file.temp.into_temp_path(),
+        staged,
         catalog_path: file.catalog_path,
         object_path: file.object_path,
         row_count: file.row_count,
@@ -4284,29 +4298,23 @@ fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
 /// On a FLUSH failure it deliberately is not — `BufWriter::abort` panics once the
 /// writer has been shut down — so a rejected or unacknowledged
 /// `CompleteMultipartUpload` can leave the upload dangling for a bucket lifecycle
-/// rule to reclaim. See [`stream_to_upload`].
+/// rule to reclaim. See [`Staged::upload`].
 #[tracing::instrument(name = "ducklake.upload_staged_file", level = "info", skip_all)]
 async fn upload_staged_file(
     staged: StagedFile,
     object_store: &Arc<dyn ObjectStore>,
     column_ids: &[i64],
 ) -> Result<DataFileInfo> {
-    // Reopen the staged file (its descriptor was released at finalize time).
-    let mut file = std::fs::File::open(&staged.temp)?;
-    let file_size = file.metadata()?.len() as i64;
-    let footer_size = read_footer_size(&mut file)?;
-
-    let local = tokio::fs::File::open(&staged.temp).await?;
-    let mut reader = tokio::io::BufReader::new(local);
-    let mut upload = ObjectBufWriter::new(Arc::clone(object_store), staged.object_path.clone());
-    stream_to_upload(&mut reader, &mut upload).await?;
-
-    let column_stats = crate::stats_collect::collect_own_written_column_stats(
-        &staged.temp,
-        column_ids,
-        staged.row_count,
-        &staged.leaf_stats,
-    );
+    let file_size = staged.staged.len()? as i64;
+    let footer_size = staged.staged.footer_size()?;
+    staged
+        .staged
+        .upload(object_store, &staged.object_path)
+        .await?;
+    let column_stats =
+        staged
+            .staged
+            .own_column_stats(column_ids, staged.row_count, &staged.leaf_stats);
     Ok(
         DataFileInfo::new(&staged.catalog_path, file_size, staged.row_count)
             .with_footer_size(footer_size)
@@ -4362,6 +4370,7 @@ struct PartitionSink {
     uploads: StagedUploads,
     /// The partition values of each file handed to `uploads`, in the same order.
     staged_values: Vec<Vec<Option<String>>>,
+    staging: Staging,
 }
 
 impl PartitionSink {
@@ -4418,6 +4427,7 @@ impl PartitionSink {
                         self.props.clone(),
                         self.target_file_size,
                         None,
+                        self.staging,
                     ),
                 ));
                 self.open.len() - 1
@@ -4618,6 +4628,22 @@ impl StagedUploads {
         }
     }
 
+    /// Upload every waiting file here, one at a time, in write order.
+    ///
+    /// For a writer with no tokio runtime to spawn on — a browser, where ferrion
+    /// drives the futures itself and a spawn would panic. Nothing is lost by
+    /// serialising: there is one thread either way.
+    async fn upload_inline(&mut self) {
+        while !self.failed {
+            let Some((position, staged)) = self.waiting.pop_front() else {
+                break;
+            };
+            self.started.push(staged.object_path.clone());
+            let outcome = upload_staged_file(staged, &self.object_store, &self.column_ids).await;
+            self.record(position, Ok(outcome));
+        }
+    }
+
     /// Record every upload that has already ended, without waiting.
     fn collect_finished(&mut self) {
         let mut index = 0;
@@ -4679,6 +4705,10 @@ impl StagedUploads {
     async fn wait_for_room(&mut self) -> Result<()> {
         self.advance();
         self.check()?;
+        if self.runtime.is_none() {
+            self.upload_inline().await;
+            return self.check();
+        }
         while !self.waiting.is_empty() && !self.running.is_empty() {
             self.collect_next().await;
             self.advance();
@@ -4711,11 +4741,9 @@ impl StagedUploads {
                 if self.waiting.is_empty() {
                     break;
                 }
-                self.failed = true;
-                self.failure = Some(crate::error::DuckLakeError::Internal(
-                    "uploading data files requires a tokio runtime".to_string(),
-                ));
-                break;
+                // No runtime to start them on: upload them here.
+                self.upload_inline().await;
+                continue;
             }
             self.collect_next().await;
         }
@@ -4888,14 +4916,13 @@ pub struct TableWriteSession {
     field_ids: Vec<i64>,
     schema_with_ids: SchemaRef,
     validation_schema: SchemaRef,
-    /// Parquet writer streaming to the local staging file (`temp`). Batches are
+    /// Parquet writer streaming to its staging (a local file by default). Batches are
     /// written to disk as they arrive rather than buffered in memory, so peak
     /// memory stays bounded by the parquet row-group size regardless of table
     /// size. The finished file is streamed to object storage in `finish()`.
-    writer: Option<RowGroupSampledWriter<std::io::BufWriter<std::fs::File>>>,
-    /// Local staging file backing `writer`. Kept alive for the session; the
-    /// finished parquet is uploaded from it and the file is removed on drop.
-    temp: Option<NamedTempFile>,
+    /// Its staging (see [`crate::staging`]) is owned by the writer; a staged file is
+    /// removed on drop.
+    writer: Option<RowGroupSampledWriter<StageWriter>>,
     /// Path to register in catalog (may be relative filename or absolute path)
     catalog_path: String,
     /// Whether the catalog_path is relative to table path
@@ -4909,7 +4936,7 @@ pub struct TableWriteSession {
     /// bounds. Fed into `collect_own_written_column_stats` at finish.
     leaf_stats: crate::stats_collect::WrittenLeafStats,
     /// Set when the target table is partitioned: batches are routed here, one file
-    /// per partition, and `writer`/`temp` above stay `None`. `finish` then commits
+    /// per partition, and `writer` above stays `None`. `finish` then commits
     /// every file the sink produced in a single snapshot.
     partition_sink: Option<PartitionSink>,
     /// Set unless the session is single-file (see
@@ -5647,31 +5674,17 @@ impl TableWriteSession {
         let writer = self.writer.take().ok_or_else(|| {
             crate::error::DuckLakeError::Internal("Writer already closed".to_string())
         })?;
-        let temp = self.temp.take().ok_or_else(|| {
-            crate::error::DuckLakeError::Internal("Writer already closed".to_string())
-        })?;
 
-        // Finalise the parquet footer, then unwrap the `BufWriter` (its
-        // `into_inner` flushes any buffered footer bytes to the OS file) so the
-        // staging file on disk is the complete parquet.
-        let staged = writer.into_inner()?;
-        let mut file = staged
-            .into_inner()
-            .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
+        // Finalise the parquet footer and complete its staging.
+        let staged = writer.into_inner()?.finish()?;
+        let file_size = staged.len()? as i64;
+        let footer_size = staged.footer_size()?;
 
-        let file_size = file.metadata()?.len() as i64;
-        let footer_size = read_footer_size(&mut file)?;
-
-        // Stream the staged file to object storage. `BufWriter` chunks the
-        // payload and switches to a multipart upload for large files, so there
-        // is no 5 GiB single-PUT ceiling and memory stays bounded. A failure at
-        // the final `CompleteMultipartUpload` can still have created the object,
-        // so it is removed.
-        let local = tokio::fs::File::open(temp.path()).await?;
-        let mut reader = tokio::io::BufReader::new(local);
-        let mut upload =
-            ObjectBufWriter::new(Arc::clone(&self.object_store), self.object_path.clone());
-        if let Err(error) = stream_to_upload(&mut reader, &mut upload).await {
+        // Upload the staged file. A file streams through a multipart upload, so
+        // there is no 5 GiB single-PUT ceiling and memory stays bounded. A
+        // failure at the final `CompleteMultipartUpload` can still have created
+        // the object, so it is removed.
+        if let Err(error) = staged.upload(&self.object_store, &self.object_path).await {
             for failure in remove_objects(&self.object_store, vec![self.object_path.clone()]).await
             {
                 tracing::warn!(error = %failure, "failed to remove a data file after a failed upload");
@@ -5683,12 +5696,8 @@ impl TableWriteSession {
         // (mirrors DuckLake reading its writer's WRITTEN_FILE_STATISTICS) and
         // attach them for the catalog commit. Best-effort: on failure the file
         // is registered without stats, which is spec-safe.
-        let column_stats = crate::stats_collect::collect_own_written_column_stats(
-            temp.path(),
-            &self.column_ids,
-            self.row_count,
-            &self.leaf_stats,
-        );
+        let column_stats =
+            staged.own_column_stats(&self.column_ids, self.row_count, &self.leaf_stats);
 
         let mut file_info = DataFileInfo::new(&self.catalog_path, file_size, self.row_count)
             .with_footer_size(footer_size)
@@ -5702,45 +5711,6 @@ impl TableWriteSession {
 
 // Drop deletes the staging files, and each `StagedUploads` removes the objects
 // it uploaded, so a session abandoned before `finish()` leaves nothing behind.
-
-/// Stream a finished local parquet file to object storage and finalise the
-/// upload. `BufWriter` switches to a multipart upload once the payload exceeds
-/// its buffer, so files larger than the object store's single-PUT limit (5 GiB
-/// on S3) upload fine and memory stays bounded.
-async fn stream_to_upload<R>(reader: &mut R, upload: &mut ObjectBufWriter) -> std::io::Result<()>
-where
-    R: tokio::io::AsyncRead + Unpin + ?Sized,
-{
-    // The abort decision lives here rather than at each call site, because only ONE
-    // of the two failure modes may be aborted and getting it wrong is a panic, not a
-    // wrong result: `BufWriter::abort` panics if the writer has already been shut
-    // down, and a failing `shutdown` leaves it in exactly that state. So aborting
-    // after a flush failure turns a recoverable upload error into a panicking task.
-    // Aborting after a copy failure is both safe and necessary — it releases the
-    // multipart upload instead of stranding it.
-    if let Err(e) = tokio::io::copy(reader, upload).await {
-        let _ = upload.abort().await;
-        return Err(e);
-    }
-    upload.shutdown().await
-}
-
-/// Read the Parquet Thrift metadata length from the tail of a finished file.
-/// The 8-byte length-and-magic trailer is excluded. Stored as the nullable
-/// `footer_size` hint in the catalog; readers fall back to a standard footer
-/// read when it is absent.
-fn read_footer_size(file: &mut std::fs::File) -> Result<i64> {
-    let len = file.metadata()?.len();
-    if len < 8 {
-        return Err(crate::error::DuckLakeError::Internal(
-            "Invalid Parquet file: too small".to_string(),
-        ));
-    }
-    file.seek(SeekFrom::End(-8))?;
-    let mut tail = [0u8; 8];
-    file.read_exact(&mut tail)?;
-    calculate_footer_size_from_bytes(&tail)
-}
 
 fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
     schema
@@ -5862,26 +5832,6 @@ fn apply_field_ids(batch: &RecordBatch, schema: SchemaRef) -> Result<RecordBatch
     Ok(crate::column_rename::record_batch_with_schema(
         schema, columns,
     )?)
-}
-
-fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
-    if buffer.len() < 8 {
-        return Err(crate::error::DuckLakeError::Internal(
-            "Invalid Parquet file: too small".to_string(),
-        ));
-    }
-
-    let footer_bytes = &buffer[buffer.len() - 8..];
-
-    if &footer_bytes[4..8] != b"PAR1" {
-        return Err(crate::error::DuckLakeError::Internal(
-            "Invalid Parquet file: missing PAR1 magic".to_string(),
-        ));
-    }
-
-    let metadata_len =
-        u32::from_le_bytes([footer_bytes[0], footer_bytes[1], footer_bytes[2], footer_bytes[3]]);
-    Ok(i64::from(metadata_len))
 }
 
 #[cfg(test)]
@@ -6325,7 +6275,7 @@ mod tests {
         let buffer = writer.into_inner().unwrap();
 
         let file_size = buffer.len() as i64;
-        let footer_size = calculate_footer_size_from_bytes(&buffer).unwrap();
+        let footer_size = crate::staging::footer_size_from_tail(&buffer).unwrap();
 
         assert!(file_size > 0);
         assert!(footer_size > 0);
@@ -6350,7 +6300,7 @@ mod tests {
         writer.write(&batch_with_ids).unwrap();
         let buffer = writer.into_inner().unwrap();
 
-        let footer_size = calculate_footer_size_from_bytes(&buffer).unwrap();
+        let footer_size = crate::staging::footer_size_from_tail(&buffer).unwrap();
         let tail = &buffer[buffer.len() - 8..];
         let metadata_len = i64::from(u32::from_le_bytes(tail[..4].try_into().unwrap()));
 

@@ -106,6 +106,7 @@ pub(crate) struct LazyDeleteFilterExec {
 
 /// How many data files ahead of the one being read have their delete sets
 /// read in the background.
+#[cfg(not(target_arch = "wasm32"))]
 const PREFETCH_FILES: usize = 2;
 
 impl LazyDeleteFilterExec {
@@ -404,12 +405,14 @@ struct BatchFilter {
     loaded: Arc<HashMap<i64, OnceCell<Arc<HashSet<i64>>>>>,
     object_store_url: ObjectStoreUrl,
     /// This partition's data files with deletes, in the scan's read order.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     read_order: Vec<i64>,
     position_memo: Option<Arc<DeletePositionMemo>>,
 }
 
 /// Delete-set reads a partition's stream has started ahead of the scan.
 #[derive(Default)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 struct PrefetchState {
     tasks: tokio::task::JoinSet<()>,
     /// Index in `read_order` up to which reads have been started.
@@ -420,6 +423,11 @@ impl BatchFilter {
     /// Start reading, in the background, the delete sets of the files that
     /// follow `file_id` in this partition's read order. A failed read is
     /// dropped here and repeated, with its error, when the file is reached.
+    ///
+    /// Not on `wasm32`: there is no tokio runtime to spawn the reads on (in a
+    /// browser the host drives the futures itself), so each file's delete set is
+    /// read when the scan reaches it.
+    #[cfg(not(target_arch = "wasm32"))]
     fn prefetch_after(
         self: &Arc<Self>,
         file_id: i64,
@@ -440,6 +448,15 @@ impl BatchFilter {
             });
         }
         state.started = state.started.max(end);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn prefetch_after(
+        self: &Arc<Self>,
+        _file_id: i64,
+        _context: &Arc<TaskContext>,
+        _prefetching: &std::sync::Mutex<PrefetchState>,
+    ) {
     }
 
     async fn apply(
