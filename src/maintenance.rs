@@ -652,6 +652,15 @@ pub async fn cleanup_old_files_sqlite(
 ) -> Result<Vec<String>> {
     let data_path = crate::metadata_writer::MetadataWriter::get_data_path(writer)?;
     let files = writer.list_scheduled_for_deletion(&criteria)?;
+    // An imported object this catalog does not own is only forgotten, never
+    // deleted: it belongs to the table it was imported from.
+    let unowned = writer.unowned_paths()?;
+    let (files, forgotten): (Vec<_>, Vec<_>) = files
+        .into_iter()
+        .partition(|file| file.path_is_relative || !unowned.contains(&file.path));
+    if !dry_run {
+        writer.remove_scheduled(&scheduled_ids(&forgotten))?;
+    }
     run_cleanup(
         &data_path,
         files,

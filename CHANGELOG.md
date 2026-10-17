@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DuckLakeTableWriter::import_manifest` registers existing Parquet files and their deleted
+  positions as one snapshot, checking field ids and leaving the files unowned (SQLite) (#2).
+- `DuckLakeTable::export_manifest` exports a snapshot as a file manifest — files, field ids,
+  stats, partition values and resolved deleted positions — for other table formats (#1).
 - The write path builds for `wasm32-unknown-unknown` (`--no-default-features --features write`),
   checked in CI; a browser host supplies the catalog backend.
 - `Staging` (`DuckLakeWriteOptions::staging`, `with_staging`): stage Parquet in memory, uploaded

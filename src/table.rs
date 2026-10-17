@@ -112,7 +112,7 @@ pub const DELETE_FILE_PATH_FIELD_ID: i32 = 2_147_483_646;
 /// 2`), NOT Iceberg's `2147483545`. See [`DELETE_FILE_PATH_FIELD_ID`].
 pub const DELETE_POS_FIELD_ID: i32 = 2_147_483_645;
 
-struct FileMetadataPages<'a> {
+pub(crate) struct FileMetadataPages<'a> {
     provider: &'a dyn MetadataProvider,
     table_id: i64,
     snapshot_id: i64,
@@ -1778,7 +1778,7 @@ impl DuckLakeTable {
     /// may ignore the filter entirely (the trait method defaults to doing so)
     /// and because the in-memory pass prunes on things the catalog cannot see —
     /// partition-derived bounds among them.
-    fn file_metadata_pages<'a>(
+    pub(crate) fn file_metadata_pages<'a>(
         &'a self,
         page_name: &'static str,
         filter: Option<&'a StatsFilter>,
@@ -1794,7 +1794,7 @@ impl DuckLakeTable {
         }
     }
     /// Resolve a file path (data or delete file) to its absolute path
-    fn resolve_file_path(&self, file: &DuckLakeFileData) -> DataFusionResult<String> {
+    pub(crate) fn resolve_file_path(&self, file: &DuckLakeFileData) -> DataFusionResult<String> {
         resolve_path(&self.table_path, &file.path, file.path_is_relative)
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
@@ -4814,6 +4814,17 @@ impl DuckLakeTable {
         self
     }
 
+    /// The table's field tree at its snapshot: every `ducklake_column` row,
+    /// nested ones included.
+    pub(crate) fn fields(&self) -> &[DuckLakeTableField] {
+        &self.fields
+    }
+
+    /// The partition spec live at this table's snapshot.
+    pub(crate) fn partition_spec(&self) -> Option<&PartitionSpec> {
+        self.partition_spec.as_ref()
+    }
+
     /// This table's catalog `table_id`. Used by the compaction commit and the snapshot
     /// consistency rule.
     pub(crate) fn table_id(&self) -> i64 {
@@ -4821,7 +4832,6 @@ impl DuckLakeTable {
     }
 
     /// The metadata provider this table reads through.
-    #[cfg(feature = "write")]
     pub(crate) fn provider(&self) -> &Arc<dyn MetadataProvider> {
         &self.provider
     }
@@ -4841,7 +4851,6 @@ impl DuckLakeTable {
     }
 
     /// The object store URL for resolving this table's file paths.
-    #[cfg(feature = "write")]
     pub(crate) fn object_store_url(&self) -> &Arc<ObjectStoreUrl> {
         &self.object_store_url
     }

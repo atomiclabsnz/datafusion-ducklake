@@ -117,10 +117,10 @@ fn assert_duckdb_extension_reads_depths(catalog_path: &std::path::Path) {
          CREATE TABLE IF NOT EXISTS raw.ducklake_inlined_data_tables( \
              table_id BIGINT, table_name VARCHAR, schema_version BIGINT \
          ); \
-         CREATE TABLE raw.ducklake_column_mapping( \
+         CREATE TABLE IF NOT EXISTS raw.ducklake_column_mapping( \
              mapping_id BIGINT, table_id BIGINT, type VARCHAR \
          ); \
-         CREATE TABLE raw.ducklake_name_mapping( \
+         CREATE TABLE IF NOT EXISTS raw.ducklake_name_mapping( \
              mapping_id BIGINT, column_id BIGINT, source_name VARCHAR, \
              target_field_id BIGINT, parent_column BIGINT, is_partition BOOLEAN \
          ); \

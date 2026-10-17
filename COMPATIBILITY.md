@@ -247,6 +247,8 @@ projection occurs in DataFusion. Index declarations remain optional.
 | Table partitioning — read + file pruning (all backends); `identity` + `year`/`month`/`day`/`hour` transforms (`bucket(N)` tolerated, not pruned)                                                                                                                                                                                 | ✅        |
 | Partitioned writes — split into per-partition files in one snapshot, on every writable backend, via `set_partition_spec`/`reset_partition_spec` or `execute_ducklake_sql` (`ALTER TABLE … SET/RESET PARTITIONED BY`). Honoured by SQL `INSERT`, the low-level write entry points, the streaming session, compaction, and promote | ✅        |
 | Partitioned `UPDATE` / upsert — the append+delete commit registers every appended file (one per output partition) together with the positional deletes, in one snapshot. A row whose partition-key value changed moves to its NEW partition and keeps its `rowid` lineage                                                        | ✅        |
+| Export a snapshot as a file manifest (`DuckLakeTable::export_manifest`: files, field ids or name mapping, statistics, partition values, resolved deleted positions; refuses inlined rows and encrypted files)                                                                                                                    | ✅        |
+| Import existing Parquet files plus deleted positions as one snapshot (`DuckLakeTableWriter::import_manifest`, `ducklake_add_data_files` with deletes; field ids checked, files not copied; SQLite writer)                                                                                                                        | 🟧       |
 | Multi-catalog (PostgreSQL, **experimental** — library-specific, not in the DuckLake spec)                                                                                                                                                                                                                                        | ✅        |
 
 Comments and tags are readable on every metadata backend and writable on SQLite and on both
@@ -1050,6 +1052,14 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
 
   `DuckLakeTable::scan` has no memo code, and the memo lives in its own provider wrapper
   (`src/catalog_read_memo.rs`).
+
+- **Imported files the catalog does not own are recorded outside the spec.**
+  `DuckLakeTableWriter::import_manifest` leaves the files it registers where they are, and by
+  default records them in `ducklake_unowned_file`, a library-specific table, so this crate's
+  cleanup and orphan sweep never delete them. Official DuckLake does not read that table: its
+  `ducklake_cleanup_old_files` deletes such a file once its snapshots expire, as it does after
+  `ducklake_add_data_files`. Only the SQLite writer implements the import. A new table is created
+  unpartitioned, and its columns take the manifest's types and nullability, not its defaults.
 
 - **Catalog-side filter pushdown declines a few type/backend combinations.** A
   pushed-down filter narrows the file-listing query using per-column statistics,

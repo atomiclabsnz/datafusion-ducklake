@@ -765,6 +765,16 @@ impl DuckLakeTableWriter {
         })
     }
 
+    /// The metadata writer this table writer commits through.
+    pub(crate) fn metadata_writer(&self) -> &Arc<dyn MetadataWriter> {
+        &self.metadata
+    }
+
+    /// The object store this table writer writes to.
+    pub(crate) fn object_store(&self) -> &Arc<dyn ObjectStore> {
+        &self.object_store
+    }
+
     /// Starts a write transaction that can stage changes for multiple tables.
     #[must_use]
     pub fn transaction(&self) -> DuckLakeWriteTransaction<'_> {
@@ -1703,6 +1713,24 @@ impl DuckLakeTableWriter {
             .await
     }
 
+    /// The object key of the delete file `file_name` that
+    /// [`Self::write_delete_file`] writes for `schema_name.table_name`.
+    pub(crate) fn delete_file_object_path(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        file_name: &str,
+    ) -> Result<ObjectPath> {
+        let scoped_base = match self.metadata.catalog_id() {
+            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+            None => self.base_key_path.clone(),
+        };
+        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let object_path_str = join_paths(&table_key, file_name)?;
+        // Strip leading slash for object_store Path (it expects relative keys).
+        Ok(ObjectPath::from(object_path_str.trim_start_matches('/')))
+    }
+
     /// Write the delete file a statement rewrites: `source`'s existing
     /// positions with their snapshots and its new positions dated `date`.
     /// Returns the file with its `begin_snapshot` (the earliest deletion) and
@@ -1778,15 +1806,8 @@ impl DuckLakeTableWriter {
         self.refuse_encrypted_parquet("write a delete file")?;
         use arrow::array::{Int64Array, StringArray};
 
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
-        let object_path_str = join_paths(&table_key, &file_name)?;
-        // Strip leading slash for object_store Path (it expects relative keys).
-        let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
+        let object_path = self.delete_file_object_path(schema_name, table_name, &file_name)?;
 
         let mut fields: Vec<Field> = delete_file_schema()
             .fields()

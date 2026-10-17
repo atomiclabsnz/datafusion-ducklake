@@ -84,6 +84,7 @@ pub(crate) mod field_id_adapter;
 pub mod information_schema;
 pub mod inlined_filter;
 pub(crate) mod lazy_delete_filter;
+pub mod manifest;
 pub mod metadata_provider;
 pub(crate) mod nan_pruning_barrier;
 mod nested_inline;
@@ -140,6 +141,8 @@ pub mod keyed_mutation;
 #[cfg(feature = "write")]
 pub mod maintenance;
 #[cfg(feature = "write")]
+pub mod manifest_import;
+#[cfg(feature = "write")]
 pub mod metadata_writer;
 #[cfg(feature = "write-duckdb")]
 pub mod metadata_writer_duckdb;
@@ -178,6 +181,7 @@ pub use catalog::DuckLakeCatalog;
 pub use catalog_read_memo::{CatalogReadMemo, MemoizedMetadataProvider};
 pub use delete_memo::DuckLakeReadOptions;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
+pub use manifest::{ColumnBinding, ManifestDataFile, ManifestError, TableManifest};
 pub use metadata_provider::{
     ColumnTag, DuckLakeFileData, DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData,
     DuckLakeTableFile, DuckLakeTag, MetadataProvider, ObjectTag, SnapshotChangeMetadata,
@@ -217,9 +221,11 @@ pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use keyed_mutation::{KeyedMutation, KeyedMutationResult};
 #[cfg(feature = "write")]
+pub use manifest_import::{ImportError, ImportOptions, ImportResult};
+#[cfg(feature = "write")]
 pub use metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, InlinedFlushDeleteFile, InlinedFlushFile,
+    DeleteFileEntry, DeleteFileInfo, ImportedFile, InlinedFlushDeleteFile, InlinedFlushFile,
     InlinedFlushFileDelete, InlinedFlushTable, InlinedRowRef, MetadataWriter, MultiTableCommit,
     PromoteLayout, PromotedFile, RowIdStart, SnapshotCommitMetadata, SourceRetirement,
     StagedTableData, StagedTableWrite, WriteMode, WriteResult, WriteSetupResult,
