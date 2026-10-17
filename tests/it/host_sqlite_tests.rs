@@ -113,14 +113,12 @@ fn duckdb_ids(connection: &duckdb::Connection) -> Vec<i32> {
 #[tokio::test(flavor = "multi_thread")]
 async fn duckdb_reads_a_lake_written_through_the_host() {
     let temp = TempDir::new().unwrap();
-    // DuckDB creates the empty catalog: one this crate initialises is not the schema DuckDB
-    // reads (it has no `schema_uuid`, no id watermarks). Everything after is the host's.
-    drop(duckdb(&temp));
+    // The host creates the catalog from nothing, as a tab does.
     let host = SqlxHost::open(&catalog_url(&temp)).unwrap();
     let writer = HostSqliteMetadataWriter::from_host(Arc::clone(&host))
         .unwrap()
         .with_data_inlining_row_limit(0);
-    writer.initialize_schema().unwrap();
+    writer.initialize_official_schema().unwrap();
     writer
         .set_data_path(data_dir(&temp).to_str().unwrap())
         .unwrap();
@@ -279,4 +277,60 @@ async fn a_write_while_another_connection_holds_the_catalog_is_refused_as_busy()
     // Once the other connection lets go, the same call goes through.
     other.query("ROLLBACK", &[]).unwrap();
     writer.create_snapshot().unwrap();
+}
+
+/// Every table's columns as `pragma_table_info` describes them, and the metadata keys.
+async fn shape(
+    path: &std::path::Path,
+) -> (Vec<(String, i64, String, String, i64, i64)>, Vec<String>) {
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .unwrap();
+    let columns = sqlx::query_as(
+        "SELECT m.name, p.cid, p.name, p.type, p.\"notnull\", p.pk
+         FROM sqlite_master m JOIN pragma_table_info(m.name) p
+         WHERE m.type = 'table' ORDER BY m.name, p.cid",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let keys = sqlx::query_scalar(
+        "SELECT key || '@' || COALESCE(scope, '') FROM ducklake_metadata
+         WHERE key NOT IN ('data_path', 'created_by') ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    (columns, keys)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_official_schema_is_the_catalog_duckdb_creates() {
+    // DuckDB creates one catalog, and this crate initialises it as it does any it opens.
+    let theirs = TempDir::new().unwrap();
+    drop(duckdb(&theirs));
+    HostSqliteMetadataWriter::from_host(SqlxHost::open(&catalog_url(&theirs)).unwrap())
+        .unwrap()
+        .initialize_schema()
+        .unwrap();
+    // This crate creates the other from nothing.
+    let ours = TempDir::new().unwrap();
+    let writer =
+        HostSqliteMetadataWriter::from_host(SqlxHost::open(&catalog_url(&ours)).unwrap()).unwrap();
+    writer.initialize_official_schema().unwrap();
+    // Opening it again changes nothing.
+    writer.initialize_official_schema().unwrap();
+
+    let theirs_shape = shape(&theirs.path().join("catalog.sqlite")).await;
+    let ours_shape = shape(&ours.path().join("catalog.sqlite")).await;
+    assert_eq!(ours_shape.0, theirs_shape.0, "tables and columns");
+    assert_eq!(ours_shape.1, theirs_shape.1, "metadata keys");
+
+    // And DuckDB attaches it, writes to it, and reads its own rows back.
+    let lake = duckdb(&ours);
+    lake.execute_batch(
+        "CREATE TABLE lake.main.t (id INTEGER); INSERT INTO lake.main.t VALUES (1), (2);",
+    )
+    .unwrap();
+    assert_eq!(duckdb_ids(&lake), vec![1, 2]);
 }

@@ -22,7 +22,9 @@
 //!
 //! [`HostSqliteMetadataProvider`] and [`HostSqliteMetadataWriter`] are the native
 //! `SqliteMetadataProvider` and `SqliteMetadataWriter`, instantiated over this module; build
-//! them with `from_host`.
+//! them with `from_host`. A host creating a catalog from nothing calls
+//! `initialize_official_schema`, which creates the catalog the DuckDB extension creates, so the
+//! lake stays one DuckDB attaches.
 
 use std::sync::Arc;
 
