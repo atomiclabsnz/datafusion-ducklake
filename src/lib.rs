@@ -114,7 +114,11 @@ pub mod metadata_provider_mysql;
 #[cfg(feature = "metadata-postgres")]
 pub mod metadata_provider_postgres;
 #[cfg(feature = "metadata-sqlite")]
-pub mod metadata_provider_sqlite;
+pub use sqlite_sqlx::metadata_provider_sqlite;
+#[cfg(feature = "host-sqlite")]
+pub mod host_sqlite;
+#[cfg(feature = "metadata-sqlite")]
+mod sqlite_sqlx;
 
 // Write support (feature-gated)
 #[cfg(feature = "write")]
@@ -131,7 +135,8 @@ pub mod inlined_flush;
     feature = "write-sqlite",
     feature = "write-duckdb",
     feature = "write-mysql",
-    feature = "write-postgres"
+    feature = "write-postgres",
+    feature = "host-sqlite"
 ))]
 pub(crate) mod inlined_reclaim;
 #[cfg(feature = "write")]
@@ -155,7 +160,7 @@ pub(crate) mod metadata_writer_postgres_allocators;
 #[cfg(feature = "write-postgres")]
 pub mod metadata_writer_postgres_single;
 #[cfg(feature = "write-sqlite")]
-pub mod metadata_writer_sqlite;
+pub use sqlite_sqlx::metadata_writer_sqlite;
 #[cfg(feature = "write-postgres")]
 pub mod multicatalog;
 #[cfg(feature = "multicatalog-postgres")]

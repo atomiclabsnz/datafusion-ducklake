@@ -87,7 +87,12 @@ pub const SQL_GET_TABLE_COLUMNS: &str =
        AND (? < end_snapshot OR end_snapshot IS NULL)
      ORDER BY column_order";
 
-#[cfg(any(feature = "metadata-duckdb", feature = "metadata-sqlite", feature = "metadata-mysql"))]
+#[cfg(any(
+    feature = "metadata-duckdb",
+    feature = "metadata-sqlite",
+    feature = "metadata-mysql",
+    feature = "host-sqlite"
+))]
 pub(crate) const SQL_FILE_SCHEMA_VERSION: &str = "(SELECT sv.schema_version
                   FROM ducklake_schema_versions sv
                   WHERE sv.table_id = data.table_id

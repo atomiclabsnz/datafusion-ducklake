@@ -1,5 +1,11 @@
 //! SQLite metadata provider for DuckLake catalogs.
 
+use self::sqlx::AssertSqlSafe;
+use self::sqlx::Row;
+use self::sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow};
+use self::sqlx::types::chrono::NaiveDateTime;
+use super::block_on;
+use super::sqlx;
 use crate::Result;
 use crate::inlined_filter::{
     InlinedDataScan, InlinedFilter, InlinedSqlBind, InlinedSqlDialect, render_inlined_filter,
@@ -17,10 +23,10 @@ use crate::metadata_provider::{
     SQL_GET_FILE_PARTITION_VALUES, SQL_GET_NAME_MAPPING, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC,
     SQL_GET_TABLE_COLUMNS, SchemaMetadata, SchemaVersionLedger, SnapshotChangeMetadata,
     SnapshotMetadata, TableMetadata, TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema,
-    block_on, inlined_delete_table_name, inlined_file_delete_change,
-    inlined_file_deletes_between_sql, inlined_file_deletes_for_flush_sql, inlined_missing_scalar,
-    inlined_version_columns_sql, inlined_version_snapshot_sql, is_inlined_data_table,
-    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
+    inlined_delete_table_name, inlined_file_delete_change, inlined_file_deletes_between_sql,
+    inlined_file_deletes_for_flush_sql, inlined_missing_scalar, inlined_version_columns_sql,
+    inlined_version_snapshot_sql, is_inlined_data_table, reconstruct_columns,
+    reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -33,10 +39,6 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::scalar::ScalarValue;
-use sqlx::AssertSqlSafe;
-use sqlx::Row;
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow};
-use sqlx::types::chrono::NaiveDateTime;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -921,7 +923,7 @@ impl SqliteMetadataProvider {
     /// Connection string format: `sqlite:///path/to/catalog.db` or `sqlite::memory:`
     pub async fn new(connection_string: &str) -> Result<Self> {
         let url = connection_string.to_string();
-        let pool = crate::metadata_provider::connect_on_catalog_runtime(async move {
+        let pool = super::connect_on_catalog_runtime(async move {
             SqlitePoolOptions::new()
                 .max_connections(5)
                 .connect(&url)

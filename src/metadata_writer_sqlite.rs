@@ -9,6 +9,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use self::sqlx::AssertSqlSafe;
+use self::sqlx::QueryBuilder;
+use self::sqlx::Row;
+use self::sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use super::metadata_provider_sqlite::{catalog_inlined_system_columns, inlined_table_layout};
+use super::sqlx;
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::{SUPERSEDED_INLINED_TABLES_SQL, dead_table_inlined_storage};
@@ -16,7 +22,6 @@ use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
 use crate::metadata_provider::{InlinedSystemColumns, TagObjectType, TagTarget};
-use crate::metadata_provider_sqlite::{catalog_inlined_system_columns, inlined_table_layout};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, ImportedFile, InlinedRowRef,
@@ -47,10 +52,6 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use sqlx::AssertSqlSafe;
-use sqlx::QueryBuilder;
-use sqlx::Row;
-use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
@@ -833,7 +834,7 @@ impl SqliteMetadataWriter {
             PathBuf::from(path)
         });
         let url = connection_string.to_string();
-        let pool = crate::metadata_provider::connect_on_catalog_runtime(async move {
+        let pool = super::connect_on_catalog_runtime(async move {
             SqlitePoolOptions::new()
                 .max_connections(max_connections)
                 .connect(&url)
@@ -841,6 +842,14 @@ impl SqliteMetadataWriter {
         })
         .await?;
 
+        Ok(Self {
+            lock_path,
+            ..Self::from_pool(pool).await?
+        })
+    }
+
+    /// A writer over an open pool, with no lock file; migrates an existing catalog.
+    pub(crate) async fn from_pool(pool: SqlitePool) -> Result<Self> {
         // Existing catalogs must migrate even when callers skip `initialize_schema`
         migrate_snapshot_changes_nullable(&pool).await?;
         sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
@@ -849,7 +858,7 @@ impl SqliteMetadataWriter {
         sqlx::query(SQL_CREATE_TAG_TABLES).execute(&pool).await?;
         Ok(Self {
             pool,
-            lock_path,
+            lock_path: None,
             commit_lock: Arc::new(Mutex::new(())),
             data_inlining_row_limit: None,
             last_committed: Arc::new(std::sync::atomic::AtomicI64::new(NO_COMMIT)),
@@ -889,7 +898,7 @@ impl SqliteMetadataWriter {
     /// `data_inlining_row_limit` in effect for the call.
     fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
         crate::metadata_writer::with_writer_inlining_limit(self.data_inlining_row_limit, || {
-            crate::metadata_provider::block_on(future)
+            super::block_on(future)
         })
     }
 
@@ -3864,7 +3873,7 @@ impl SqliteMetadataWriter {
 
 impl MetadataWriter for SqliteMetadataWriter {
     fn maintenance(&self) -> Option<&dyn crate::maintenance::CatalogMaintenance> {
-        Some(self)
+        super::maintenance(self)
     }
 
     /// SQLite implements the atomic append-with-deletes commit, so it supports
@@ -3931,7 +3940,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(table_id)
                     .fetch_all(&mut *transaction)
                     .await?;
-                let system = crate::metadata_provider_sqlite::catalog_inlined_system_columns(
+                let system = super::metadata_provider_sqlite::catalog_inlined_system_columns(
                     &mut *transaction,
                 )
                 .await?;
@@ -4139,7 +4148,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                         .bind(schema_id)
                         .fetch_all(&mut *transaction)
                         .await?;
-                let system = crate::metadata_provider_sqlite::catalog_inlined_system_columns(
+                let system = super::metadata_provider_sqlite::catalog_inlined_system_columns(
                     &mut *transaction,
                 )
                 .await?;
@@ -4179,7 +4188,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 let columns: Vec<(String, String)> = sqlx::query_as(SQL_GLOBAL_INLINING_COLUMNS)
                     .fetch_all(&mut *transaction)
                     .await?;
-                let system = crate::metadata_provider_sqlite::catalog_inlined_system_columns(
+                let system = super::metadata_provider_sqlite::catalog_inlined_system_columns(
                     &mut *transaction,
                 )
                 .await?;

@@ -222,8 +222,8 @@ jobs:
         run: cargo check --locked --lib --no-default-features
 
       # The write path on wasm32-unknown-unknown, as a browser host builds it:
-      # no catalog backend (sqlx and DuckDB are native), memory staging, no
-      # spawned tasks. `ci/wasm-check` exists only to choose getrandom's browser
+      # the SQLite catalog over the host's own SQLite (`host-sqlite`; sqlx and
+      # DuckDB are native), memory staging, no spawned tasks. `ci/wasm-check` exists only to choose getrandom's browser
       # backend, which a final binary picks and a library cannot.
       - name: Check the write path for wasm32
         if: steps.changes.outputs.code == 'true' && runner.os == 'Linux'
@@ -270,7 +270,7 @@ jobs:
       # of failing. It stopped being a default feature, so it has to be listed.
       - name: Run tests (macOS; Linux is covered by test-full)
         if: steps.changes.outputs.code == 'true' && runner.os == 'macOS'
-        run: cargo test --features "skip-tests-with-docker duckdb-bundled write-sqlite"
+        run: cargo test --features "skip-tests-with-docker duckdb-bundled write-sqlite host-sqlite"
 
       - name: Check documentation
         if: steps.changes.outputs.code == 'true'
@@ -579,7 +579,7 @@ jobs:
 
       - name: Run single-catalog test suite
         if: steps.changes.outputs.code == 'true'
-        run: cargo test --features "duckdb-bundled encryption write-duckdb write-mysql write-postgres write-sqlite"
+        run: cargo test --features "duckdb-bundled encryption write-duckdb write-mysql write-postgres write-sqlite host-sqlite"
 
       - name: Save target directory (main only)
         if: |
