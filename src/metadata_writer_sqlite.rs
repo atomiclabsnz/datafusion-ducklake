@@ -9,6 +9,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use self::sqlx::AssertSqlSafe;
+use self::sqlx::QueryBuilder;
+use self::sqlx::Row;
+use self::sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use super::metadata_provider_sqlite::{catalog_inlined_system_columns, inlined_table_layout};
+use super::sqlx;
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::{SUPERSEDED_INLINED_TABLES_SQL, dead_table_inlined_storage};
@@ -16,7 +22,6 @@ use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
 use crate::metadata_provider::{InlinedSystemColumns, TagObjectType, TagTarget};
-use crate::metadata_provider_sqlite::{catalog_inlined_system_columns, inlined_table_layout};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, ImportedFile, InlinedRowRef,
@@ -47,10 +52,6 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use sqlx::AssertSqlSafe;
-use sqlx::QueryBuilder;
-use sqlx::Row;
-use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
@@ -483,6 +484,8 @@ CREATE TABLE IF NOT EXISTS ducklake_metadata (
 -- `next_file_id` on this row as ITS id allocators; we deliberately omit them (as the
 -- Postgres writer does) because this library allocates ids from its own counters
 -- (the `next_column_id` metadata row + autoincrement PKs), never from the snapshot.
+-- In a catalog the DuckDB extension created, which carries them, the writer
+-- allocates from them and keeps them current (see `has_allocator_watermarks`).
 CREATE TABLE IF NOT EXISTS ducklake_snapshot (
     snapshot_id INTEGER PRIMARY KEY,
     snapshot_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -797,6 +800,46 @@ const SQL_CREATE_INLINED_DATA_TABLES: &str =
     schema_version INTEGER
 );";
 
+/// The catalog the DuckDB extension (1.5.5, DuckLake format 1.0) creates in an empty SQLite
+/// database, statement for statement as it leaves them in `sqlite_master`. A catalog this crate
+/// creates with [`SqliteMetadataWriter::initialize_official_schema`] is therefore one the
+/// extension attaches, reads and writes: it carries the id watermarks and object UUIDs the
+/// crate's own schema ([`SQL_CREATE_SCHEMA`]) leaves out. `host_sqlite_tests` compares it with
+/// what DuckDB creates.
+const SQL_CREATE_OFFICIAL_SCHEMA: &str = r#"
+CREATE TABLE ducklake_metadata("key" VARCHAR NOT NULL, "value" VARCHAR NOT NULL, "scope" VARCHAR, scope_id BIGINT);
+CREATE TABLE ducklake_snapshot(snapshot_id BIGINT PRIMARY KEY, snapshot_time VARCHAR, schema_version BIGINT, next_catalog_id BIGINT, next_file_id BIGINT);
+CREATE TABLE ducklake_snapshot_changes(snapshot_id BIGINT PRIMARY KEY, changes_made VARCHAR, author VARCHAR, commit_message VARCHAR, commit_extra_info VARCHAR);
+CREATE TABLE ducklake_schema(schema_id BIGINT PRIMARY KEY, schema_uuid VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT, schema_name VARCHAR, path VARCHAR, path_is_relative BIGINT);
+CREATE TABLE ducklake_table(table_id BIGINT, table_uuid VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT, schema_id BIGINT, table_name VARCHAR, path VARCHAR, path_is_relative BIGINT);
+CREATE TABLE ducklake_view(view_id BIGINT, view_uuid VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT, schema_id BIGINT, view_name VARCHAR, dialect VARCHAR, "sql" VARCHAR, column_aliases VARCHAR);
+CREATE TABLE ducklake_tag(object_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, "key" VARCHAR, "value" VARCHAR);
+CREATE TABLE ducklake_column_tag(table_id BIGINT, column_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, "key" VARCHAR, "value" VARCHAR);
+CREATE TABLE ducklake_data_file(data_file_id BIGINT PRIMARY KEY, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, file_order BIGINT, path VARCHAR, path_is_relative BIGINT, file_format VARCHAR, record_count BIGINT, file_size_bytes BIGINT, footer_size BIGINT, row_id_start BIGINT, partition_id BIGINT, encryption_key VARCHAR, mapping_id BIGINT, partial_max BIGINT);
+CREATE TABLE ducklake_file_column_stats(data_file_id BIGINT, table_id BIGINT, column_id BIGINT, column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT, min_value VARCHAR, max_value VARCHAR, contains_nan BIGINT, extra_stats VARCHAR);
+CREATE TABLE ducklake_file_variant_stats(data_file_id BIGINT, table_id BIGINT, column_id BIGINT, variant_path VARCHAR, shredded_type VARCHAR, column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT, min_value VARCHAR, max_value VARCHAR, contains_nan BIGINT, extra_stats VARCHAR);
+CREATE TABLE ducklake_delete_file(delete_file_id BIGINT PRIMARY KEY, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, data_file_id BIGINT, path VARCHAR, path_is_relative BIGINT, format VARCHAR, delete_count BIGINT, file_size_bytes BIGINT, footer_size BIGINT, encryption_key VARCHAR, partial_max BIGINT);
+CREATE TABLE ducklake_column(column_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, table_id BIGINT, column_order BIGINT, column_name VARCHAR, column_type VARCHAR, initial_default VARCHAR, default_value VARCHAR, nulls_allowed BIGINT, parent_column BIGINT, default_value_type VARCHAR, default_value_dialect VARCHAR);
+CREATE TABLE ducklake_table_stats(table_id BIGINT, record_count BIGINT, next_row_id BIGINT, file_size_bytes BIGINT);
+CREATE TABLE ducklake_table_column_stats(table_id BIGINT, column_id BIGINT, contains_null BIGINT, contains_nan BIGINT, min_value VARCHAR, max_value VARCHAR, extra_stats VARCHAR);
+CREATE TABLE ducklake_partition_info(partition_id BIGINT, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT);
+CREATE TABLE ducklake_partition_column(partition_id BIGINT, table_id BIGINT, partition_key_index BIGINT, column_id BIGINT, "transform" VARCHAR);
+CREATE TABLE ducklake_file_partition_value(data_file_id BIGINT, table_id BIGINT, partition_key_index BIGINT, partition_value VARCHAR);
+CREATE TABLE ducklake_files_scheduled_for_deletion(data_file_id BIGINT, path VARCHAR, path_is_relative BIGINT, schedule_start VARCHAR);
+CREATE TABLE ducklake_inlined_data_tables(table_id BIGINT, table_name VARCHAR, schema_version BIGINT);
+CREATE TABLE ducklake_column_mapping(mapping_id BIGINT, table_id BIGINT, "type" VARCHAR);
+CREATE TABLE ducklake_name_mapping(mapping_id BIGINT, column_id BIGINT, source_name VARCHAR, target_field_id BIGINT, parent_column BIGINT, is_partition BIGINT);
+CREATE TABLE ducklake_schema_versions(begin_snapshot BIGINT, schema_version BIGINT, table_id BIGINT);
+CREATE TABLE ducklake_macro(schema_id BIGINT, macro_id BIGINT, macro_name VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT);
+CREATE TABLE ducklake_macro_impl(macro_id BIGINT, impl_id BIGINT, dialect VARCHAR, "sql" VARCHAR, "type" VARCHAR);
+CREATE TABLE ducklake_macro_parameters(macro_id BIGINT, impl_id BIGINT, column_id BIGINT, parameter_name VARCHAR, parameter_type VARCHAR, default_value VARCHAR, default_value_type VARCHAR);
+CREATE TABLE ducklake_sort_info(sort_id BIGINT, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT);
+CREATE TABLE ducklake_sort_expression(sort_id BIGINT, table_id BIGINT, sort_key_index BIGINT, expression VARCHAR, dialect VARCHAR, sort_direction VARCHAR, null_order VARCHAR);
+"#;
+
+/// [`SqliteMetadataWriter::last_committed_snapshot`] before any commit.
+const NO_COMMIT: i64 = i64::MIN;
+
 /// SQLite-based metadata writer for DuckLake catalogs.
 #[derive(Debug, Clone)]
 pub struct SqliteMetadataWriter {
@@ -804,6 +847,9 @@ pub struct SqliteMetadataWriter {
     lock_path: Option<PathBuf>,
     commit_lock: Arc<Mutex<()>>,
     data_inlining_row_limit: Option<usize>,
+    /// The snapshot this writer's latest table write committed; see
+    /// [`SqliteMetadataWriter::last_committed_snapshot`].
+    last_committed: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl SqliteMetadataWriter {
@@ -825,7 +871,7 @@ impl SqliteMetadataWriter {
             PathBuf::from(path)
         });
         let url = connection_string.to_string();
-        let pool = crate::metadata_provider::connect_on_catalog_runtime(async move {
+        let pool = super::connect_on_catalog_runtime(async move {
             SqlitePoolOptions::new()
                 .max_connections(max_connections)
                 .connect(&url)
@@ -833,6 +879,14 @@ impl SqliteMetadataWriter {
         })
         .await?;
 
+        Ok(Self {
+            lock_path,
+            ..Self::from_pool(pool).await?
+        })
+    }
+
+    /// A writer over an open pool, with no lock file; migrates an existing catalog.
+    pub(crate) async fn from_pool(pool: SqlitePool) -> Result<Self> {
         // Existing catalogs must migrate even when callers skip `initialize_schema`
         migrate_snapshot_changes_nullable(&pool).await?;
         sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
@@ -841,10 +895,108 @@ impl SqliteMetadataWriter {
         sqlx::query(SQL_CREATE_TAG_TABLES).execute(&pool).await?;
         Ok(Self {
             pool,
-            lock_path,
+            lock_path: None,
             commit_lock: Arc::new(Mutex::new(())),
             data_inlining_row_limit: None,
+            last_committed: Arc::new(std::sync::atomic::AtomicI64::new(NO_COMMIT)),
         })
+    }
+
+    /// The snapshot this writer's latest table write committed — its data files, inlined
+    /// rows or deletes — or `None` before any. A write through DataFusion (`INSERT`, a
+    /// DataFrame's `write_table`) reports only a row count; a caller that owns this writer
+    /// reads its snapshot here, where reading the catalog's head afterwards could name a
+    /// snapshot another client committed in between.
+    pub fn last_committed_snapshot(&self) -> Option<i64> {
+        let snapshot = self
+            .last_committed
+            .load(std::sync::atomic::Ordering::SeqCst);
+        (snapshot != NO_COMMIT).then_some(snapshot)
+    }
+
+    /// Create, in an empty database, the catalog the DuckDB extension creates (see
+    /// `SQL_CREATE_OFFICIAL_SCHEMA`): its tables, its first snapshot and its `main` schema.
+    /// Then [`MetadataWriter::initialize_schema`] adds what this crate keeps beside them, as it
+    /// does in a catalog the extension created. A database that already holds a catalog is
+    /// left to `initialize_schema` alone, so this is safe to call on every open.
+    ///
+    /// Use it for a catalog the DuckDB extension must attach: one [`MetadataWriter::
+    /// initialize_schema`] creates from nothing is this crate's own schema, which the extension
+    /// cannot read.
+    pub fn initialize_official_schema(&self) -> Result<()> {
+        let schema_uuid = uuid::Uuid::new_v4().to_string();
+        self.block_on(async {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let existing: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ducklake_metadata'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if existing == 0 {
+                // Opening the writer created the inlined-data registry and the tag tables
+                // (`from_pool`) in this crate's shape. With no catalog here they hold nothing;
+                // they are replaced by the extension's.
+                for table in ["ducklake_inlined_data_tables", "ducklake_tag", "ducklake_column_tag"] {
+                    let rows: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+                        "SELECT CASE WHEN EXISTS (SELECT 1 FROM sqlite_master
+                                                  WHERE type = 'table' AND name = '{table}')
+                                THEN (SELECT COUNT(*) FROM {table}) ELSE 0 END"
+                    )))
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if rows > 0 {
+                        return Err(crate::DuckLakeError::InvalidConfig(format!(
+                            "initialize_official_schema: {table} holds rows but the database has \
+                             no ducklake_metadata, so it is not a DuckLake catalog"
+                        )));
+                    }
+                    sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                for statement in SQL_CREATE_OFFICIAL_SCHEMA
+                    .split_inclusive(';')
+                    .filter(|statement| !statement.trim().is_empty())
+                {
+                    sqlx::query(AssertSqlSafe(statement))
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                sqlx::query(
+                    "INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES
+                         ('version', '1.0', NULL, NULL),
+                         ('created_by', ?, NULL, NULL),
+                         ('encrypted', 'false', NULL, NULL)",
+                )
+                .bind(concat!("datafusion-ducklake ", env!("CARGO_PKG_VERSION")))
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO ducklake_snapshot
+                         (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
+                     VALUES (0, strftime('%Y-%m-%d %H:%M:%f+00', 'now'), 0, 1, 0)",
+                )
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                     VALUES (0, 'created_schema:\"main\"')",
+                )
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO ducklake_schema
+                         (schema_id, schema_uuid, begin_snapshot, end_snapshot, schema_name, path,
+                          path_is_relative)
+                     VALUES (0, ?, 0, NULL, 'main', 'main/', 1)",
+                )
+                .bind(schema_uuid)
+                .execute(&mut *tx)
+                .await?;
+            }
+            commit(tx).await
+        })?;
+        self.initialize_schema()
     }
 
     pub async fn new_with_init(connection_string: &str) -> Result<Self> {
@@ -868,7 +1020,7 @@ impl SqliteMetadataWriter {
     /// `data_inlining_row_limit` in effect for the call.
     fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
         crate::metadata_writer::with_writer_inlining_limit(self.data_inlining_row_limit, || {
-            crate::metadata_provider::block_on(future)
+            super::block_on(future)
         })
     }
 
@@ -958,7 +1110,7 @@ impl SqliteMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(true)
         })
     }
@@ -992,7 +1144,7 @@ impl SqliteMetadataWriter {
             let most_recent = match most_recent {
                 Some(id) => id,
                 None => {
-                    tx.commit().await?;
+                    commit(tx).await?;
                     return Ok(Vec::new());
                 },
             };
@@ -1006,7 +1158,7 @@ impl SqliteMetadataWriter {
                         .filter(|&v| v != most_recent)
                         .collect();
                     if ids.is_empty() {
-                        tx.commit().await?;
+                        commit(tx).await?;
                         return Ok(Vec::new());
                     }
                     let rows = sqlx::query(AssertSqlSafe(format!(
@@ -1031,7 +1183,7 @@ impl SqliteMetadataWriter {
                 },
             };
             if candidates.is_empty() {
-                tx.commit().await?;
+                commit(tx).await?;
                 return Ok(Vec::new());
             }
             let expire_ids: Vec<i64> = candidates.iter().map(|s| s.snapshot_id).collect();
@@ -1217,7 +1369,7 @@ impl SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(candidates)
         })
     }
@@ -1442,9 +1594,16 @@ async fn next_file_id(conn: &mut sqlx::SqliteConnection) -> Result<i64> {
         .execute(&mut *conn)
         .await?;
     }
+    // In a catalog the DuckDB extension created, its `next_file_id` watermark is a floor too:
+    // the extension advances it past ids it leaves in no table (an inlined insert takes one).
+    let watermark_floor = if has_allocator_watermarks(conn).await? {
+        first_free_id(conn, "next_file_id", &FILE_ID_COLUMNS).await? - 1
+    } else {
+        0
+    };
     let id: i64 = sqlx::query_scalar(
         "UPDATE ducklake_metadata
-         SET value = CAST(MAX(CAST(value AS INTEGER),
+         SET value = CAST(MAX(CAST(value AS INTEGER), ?,
                               COALESCE((SELECT MAX(data_file_id) FROM ducklake_data_file), 0),
                               COALESCE((SELECT MAX(delete_file_id) FROM ducklake_delete_file), 0),
                               COALESCE((SELECT MAX(data_file_id)
@@ -1453,9 +1612,27 @@ async fn next_file_id(conn: &mut sqlx::SqliteConnection) -> Result<i64> {
          WHERE key = 'next_file_id' AND scope IS NULL
          RETURNING CAST(value AS INTEGER)",
     )
+    .bind(watermark_floor)
     .fetch_one(&mut *conn)
     .await?;
     Ok(id)
+}
+
+/// Raise the `next_column_id` counter past every column id the catalog holds, before
+/// reserving from it. The DuckDB extension numbers a table's columns from that table's own
+/// highest id, so a counter seeded once falls behind a column it added since, and a column
+/// this crate added next would take that column's id. A counter already ahead is left
+/// alone.
+async fn raise_column_counter(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
+    sqlx::query(
+        "UPDATE ducklake_metadata
+         SET value = CAST(MAX(CAST(value AS INTEGER),
+                     (SELECT COALESCE(MAX(column_id), 0) FROM ducklake_column)) AS TEXT)
+         WHERE key = 'next_column_id' AND scope IS NULL",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 async fn reserve_ids(
@@ -1582,7 +1759,7 @@ async fn migrate_ducklake_column_drop_pk(pool: &SqlitePool) -> Result<()> {
     sqlx::query("ALTER TABLE ducklake_column__migrate RENAME TO ducklake_column")
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
+    commit(tx).await?;
     Ok(())
 }
 
@@ -1754,7 +1931,7 @@ async fn migrate_directory_paths(pool: &SqlitePool) -> Result<()> {
     )
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
+    commit(tx).await?;
     Ok(())
 }
 
@@ -1827,7 +2004,7 @@ async fn migrate_snapshot_changes_nullable(pool: &SqlitePool) -> Result<()> {
     )
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
+    commit(tx).await?;
     Ok(())
 }
 
@@ -2499,36 +2676,110 @@ async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result
     Ok((snapshot_id, schema_version))
 }
 
-/// Copy the allocator watermarks of the immediately preceding snapshot onto `snapshot_id`. A
-/// catalog created by the DuckDB extension carries `next_catalog_id` and `next_file_id` on every
-/// snapshot and reads them unconditionally at the head. This crate does not add those columns to
-/// its own catalogs, so this carries them forward only where they already exist. It is not part
-/// of `insert_snapshot`: the crate allocates partition and sort ids from its own counters and
-/// leaves the watermarks NULL, so a later comment must copy that NULL rather than an older value
-/// from before the crate allocated its id. A comment allocates no id, so copying is always right.
-async fn carry_allocator_watermarks(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    snapshot_id: i64,
-) -> Result<()> {
-    let allocator_columns: i64 = sqlx::query_scalar(
+/// The ids the DuckDB extension allocates from `next_catalog_id`: schemas, tables, views,
+/// partitions, sorts and macros share one counter.
+const CATALOG_ID_COLUMNS: [(&str, &str); 6] = [
+    ("ducklake_schema", "schema_id"),
+    ("ducklake_table", "table_id"),
+    ("ducklake_view", "view_id"),
+    ("ducklake_partition_info", "partition_id"),
+    ("ducklake_sort_info", "sort_id"),
+    ("ducklake_macro", "macro_id"),
+];
+
+/// The ids the DuckDB extension allocates from `next_file_id`: data and delete files share one
+/// counter.
+const FILE_ID_COLUMNS: [(&str, &str); 2] =
+    [("ducklake_data_file", "data_file_id"), ("ducklake_delete_file", "delete_file_id")];
+
+/// Whether this catalog carries the DuckDB extension's id allocators. The extension stores
+/// `next_catalog_id` and `next_file_id` on every snapshot row and reads both at the head before
+/// any access, so a head that leaves them NULL makes the whole catalog unreadable to it (#292).
+/// This crate's own catalogs carry neither column and allocate from rowids and its metadata
+/// counters, so everything keyed on this is a no-op for them. In a catalog the extension created
+/// this crate allocates from the watermarks instead, and leaves them past every id it used, so
+/// the extension can go on allocating after this crate wrote.
+async fn has_allocator_watermarks(conn: &mut sqlx::SqliteConnection) -> Result<bool> {
+    let columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('ducklake_snapshot')
          WHERE name IN ('next_catalog_id', 'next_file_id')",
     )
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut *conn)
     .await?;
-    if allocator_columns == 2 {
-        sqlx::query(
-            "UPDATE ducklake_snapshot
-             SET (next_catalog_id, next_file_id) = (
-                 SELECT next_catalog_id, next_file_id FROM ducklake_snapshot
-                 WHERE snapshot_id < ? ORDER BY snapshot_id DESC LIMIT 1)
-             WHERE snapshot_id = ?",
-        )
-        .bind(snapshot_id)
-        .bind(snapshot_id)
-        .execute(&mut **tx)
-        .await?;
+    Ok(columns == 2)
+}
+
+/// The first id free under the watermark `watermark`: past the largest watermark any snapshot
+/// records and past every id in `columns`, of the tables this catalog has. The extension can
+/// advance a watermark past the ids it leaves in the tables (an inlined insert advances
+/// `next_file_id`, and a cleanup removes file rows), so neither bound alone is enough.
+async fn first_free_id(
+    conn: &mut sqlx::SqliteConnection,
+    watermark: &str,
+    columns: &[(&str, &str)],
+) -> Result<i64> {
+    let tables: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .fetch_all(&mut *conn)
+            .await?;
+    let mut bounds = vec![format!("SELECT MAX({watermark}) AS id FROM ducklake_snapshot")];
+    for (table, column) in columns {
+        if tables.iter().any(|t| t == table) {
+            bounds.push(format!("SELECT MAX({column}) + 1 FROM {table}"));
+        }
     }
+    // Every name in the statement is one of the constant table and column names above.
+    let id: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT COALESCE(MAX(id), 0) FROM ({})",
+        bounds.join(" UNION ALL ")
+    )))
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(id)
+}
+
+/// The id for a new schema, table, partition or sort: `None` in this crate's own catalogs, which
+/// keep allocating from rowids and their metadata counters.
+async fn next_catalog_id(conn: &mut sqlx::SqliteConnection) -> Result<Option<i64>> {
+    if !has_allocator_watermarks(conn).await? {
+        return Ok(None);
+    }
+    Ok(Some(
+        first_free_id(conn, "next_catalog_id", &CATALOG_ID_COLUMNS).await?,
+    ))
+}
+
+/// Leave the head snapshot's watermarks past every id in the catalog, then commit. Every
+/// transaction this writer opens commits through here, so no snapshot it creates is left with
+/// NULL watermarks. The head is written only when its watermarks are behind, so a transaction
+/// that only read stays a read.
+async fn commit(mut tx: sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
+    if has_allocator_watermarks(&mut tx).await? {
+        let catalog = first_free_id(&mut tx, "next_catalog_id", &CATALOG_ID_COLUMNS).await?;
+        let file = first_free_id(&mut tx, "next_file_id", &FILE_ID_COLUMNS).await?;
+        let head: Option<(i64, Option<i64>, Option<i64>)> = sqlx::query_as(
+            "SELECT snapshot_id, next_catalog_id, next_file_id FROM ducklake_snapshot
+             ORDER BY snapshot_id DESC LIMIT 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((snapshot_id, head_catalog, head_file)) = head
+            && (head_catalog != Some(catalog) || head_file != Some(file))
+        {
+            sqlx::query(
+                "UPDATE ducklake_snapshot
+                 SET next_catalog_id = MAX(COALESCE(next_catalog_id, 0), ?1),
+                     next_file_id = MAX(COALESCE(next_file_id, 0), ?2)
+                 WHERE snapshot_id = ?3",
+            )
+            .bind(catalog)
+            .bind(file)
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3284,9 +3535,10 @@ async fn commit_files_at_snapshot(
         crate::metadata_writer::enforce_partition_fence(write.table_id, live_partition_id, file)?;
     }
     sqlx::query(
-        "INSERT OR IGNORE INTO ducklake_table_stats
+        "INSERT INTO ducklake_table_stats
              (table_id, record_count, next_row_id, file_size_bytes)
-         VALUES (?, 0, 0, 0)",
+         SELECT ?1, 0, 0, 0
+         WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
     )
     .bind(write.table_id)
     .execute(&mut **tx)
@@ -3606,9 +3858,10 @@ async fn commit_inlined_at_snapshot(
         .system;
     let stats_initialized = table_stats_initialized(tx, write.table_id).await?;
     sqlx::query(
-        "INSERT OR IGNORE INTO ducklake_table_stats
+        "INSERT INTO ducklake_table_stats
              (table_id, record_count, next_row_id, file_size_bytes)
-         VALUES (?, 0, 0, 0)",
+         SELECT ?1, 0, 0, 0
+         WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
     )
     .bind(write.table_id)
     .execute(&mut **tx)
@@ -3742,7 +3995,7 @@ impl SqliteMetadataWriter {
 
 impl MetadataWriter for SqliteMetadataWriter {
     fn maintenance(&self) -> Option<&dyn crate::maintenance::CatalogMaintenance> {
-        Some(self)
+        super::maintenance(self)
     }
 
     /// SQLite implements the atomic append-with-deletes commit, so it supports
@@ -3783,7 +4036,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .execute(&mut *tx)
                     .await?;
             }
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(())
         })
     }
@@ -3809,7 +4062,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(table_id)
                     .fetch_all(&mut *transaction)
                     .await?;
-                let system = crate::metadata_provider_sqlite::catalog_inlined_system_columns(
+                let system = super::metadata_provider_sqlite::catalog_inlined_system_columns(
                     &mut *transaction,
                 )
                 .await?;
@@ -3833,7 +4086,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .execute(&mut *transaction)
             .await?;
-            transaction.commit().await?;
+            commit(transaction).await?;
             Ok(())
         })
     }
@@ -3864,7 +4117,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .fetch_optional(&mut *transaction)
             .await?;
             if existing.as_deref() == Some(value.as_str()) {
-                transaction.commit().await?;
+                commit(transaction).await?;
                 return Ok(());
             }
             sqlx::query(
@@ -3884,7 +4137,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .execute(&mut *transaction)
             .await?;
-            transaction.commit().await?;
+            commit(transaction).await?;
             Ok(())
         })
     }
@@ -3902,7 +4155,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             for physical_table in physical_tables {
                 ensure_sqlite_physical_indexes(&mut transaction, table_id, &physical_table).await?;
             }
-            transaction.commit().await?;
+            commit(transaction).await?;
             Ok(())
         })
     }
@@ -3963,7 +4216,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // schema_version forward with the empty change summary inserted by
             // `insert_snapshot`.
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(snapshot_id)
         })
     }
@@ -4017,7 +4270,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                         .bind(schema_id)
                         .fetch_all(&mut *transaction)
                         .await?;
-                let system = crate::metadata_provider_sqlite::catalog_inlined_system_columns(
+                let system = super::metadata_provider_sqlite::catalog_inlined_system_columns(
                     &mut *transaction,
                 )
                 .await?;
@@ -4040,7 +4293,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(schema_id)
             .execute(&mut *transaction)
             .await?;
-            transaction.commit().await?;
+            commit(transaction).await?;
             Ok(())
         })
     }
@@ -4057,7 +4310,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 let columns: Vec<(String, String)> = sqlx::query_as(SQL_GLOBAL_INLINING_COLUMNS)
                     .fetch_all(&mut *transaction)
                     .await?;
-                let system = crate::metadata_provider_sqlite::catalog_inlined_system_columns(
+                let system = super::metadata_provider_sqlite::catalog_inlined_system_columns(
                     &mut *transaction,
                 )
                 .await?;
@@ -4074,7 +4327,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(value)
             .execute(&mut *transaction)
             .await?;
-            transaction.commit().await?;
+            commit(transaction).await?;
             Ok(())
         })
     }
@@ -4085,7 +4338,6 @@ impl MetadataWriter for SqliteMetadataWriter {
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
-            carry_allocator_watermarks(&mut tx, snapshot_id).await?;
             let live: Option<i64> =
                 match target {
                     TagTarget::Object {
@@ -4191,7 +4443,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(snapshot_id)
         })
     }
@@ -4215,15 +4467,16 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             if let Some(row) = existing {
                 let schema_id = row.try_get(0)?;
-                tx.commit().await?;
+                commit(tx).await?;
                 return Ok((schema_id, false));
             }
 
             let schema_path = directory_path(path.unwrap_or(name));
             let row = sqlx::query(
-                "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                 VALUES (?, ?, 1, ?) RETURNING schema_id",
+                "INSERT INTO ducklake_schema (schema_id, schema_name, path, path_is_relative, begin_snapshot)
+                 VALUES (?, ?, ?, 1, ?) RETURNING schema_id",
             )
+            .bind(next_catalog_id(&mut tx).await?)
             .bind(name)
             .bind(&schema_path)
             .bind(snapshot_id)
@@ -4240,7 +4493,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok((schema_id, true))
         })
     }
@@ -4266,7 +4519,7 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             if let Some(row) = existing {
                 let table_id = row.try_get(0)?;
-                tx.commit().await?;
+                commit(tx).await?;
                 return Ok((table_id, false));
             }
 
@@ -4278,9 +4531,10 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             let table_path = directory_path(path.unwrap_or(name));
             let row = sqlx::query(
-                "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                 VALUES (?, ?, ?, 1, ?) RETURNING table_id",
+                "INSERT INTO ducklake_table (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
+                 VALUES (?, ?, ?, ?, 1, ?) RETURNING table_id",
             )
+            .bind(next_catalog_id(&mut tx).await?)
             .bind(schema_id)
             .bind(name)
             .bind(&table_path)
@@ -4298,7 +4552,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok((table_id, true))
         })
     }
@@ -4424,7 +4678,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // so a promote and a data-write commit can't interleave — only their
             // begin-time staging can, which the §5 reject already guards.
 
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(new_snapshot)
         })
     }
@@ -4443,10 +4697,14 @@ impl MetadataWriter for SqliteMetadataWriter {
         }
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
-            // Write-lock-first: reserve the new partition id (a metadata-counter
-            // UPDATE) before any read, so a concurrent DDL blocks on the lock.
-            let partition_id = reserve_ids(&mut tx, "next_partition_id", 1).await?;
+            // Write-lock-first: the snapshot INSERT is a write, so it takes the lock
+            // before any read and a concurrent DDL blocks on it. Only then is the new
+            // partition id allocated (`next_catalog_id` reads the catalog's columns).
             let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
+            let partition_id = match next_catalog_id(&mut tx).await? {
+                Some(id) => id,
+                None => reserve_ids(&mut tx, "next_partition_id", 1).await?,
+            };
 
             // Resolve each partition-key column NAME to its live column_id.
             let mut column_ids: Vec<i64> = Vec::with_capacity(columns.len());
@@ -4515,7 +4773,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             )
             .await?;
 
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(new_snapshot)
         })
     }
@@ -4587,7 +4845,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(new_snapshot)
         })
     }
@@ -4632,10 +4890,14 @@ impl MetadataWriter for SqliteMetadataWriter {
         }
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
-            // Reserve the sort_id first so the counter UPDATE takes the write lock
-            // before any read, so a concurrent DDL blocks on the lock.
-            let sort_id = reserve_ids(&mut tx, "next_sort_id", 1).await?;
+            // Write-lock-first: the snapshot INSERT is a write, so it takes the lock
+            // before any read and a concurrent DDL blocks on it. Only then is the
+            // sort_id allocated (`next_catalog_id` reads the catalog's columns).
             let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
+            let sort_id = match next_catalog_id(&mut tx).await? {
+                Some(id) => id,
+                None => reserve_ids(&mut tx, "next_sort_id", 1).await?,
+            };
             // Official bumps the schema version on every sort-order change, with no
             // `ducklake_schema_versions` row (checked with the DuckDB CLI).
             bump_schema_version(&mut tx, new_snapshot).await?;
@@ -4697,7 +4959,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(new_snapshot)
         })
     }
@@ -4722,7 +4984,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(new_snapshot)
         })
     }
@@ -4762,6 +5024,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // write path's begin/commit reserve column ids from the same counter).
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
+            raise_column_counter(&mut tx).await?;
             let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
             let first_column_id = last_column_id - n + 1;
             let column_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
@@ -4800,7 +5063,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 )
                 .await?;
             }
-            tx.commit().await?;
+            commit(tx).await?;
             top_level_column_ids(&catalog_columns, &column_ids)
         })
     }
@@ -4893,9 +5156,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Seed the stats row for the Append path (Replace already seeded it
             // in finalize_snapshot); INSERT OR IGNORE is a no-op if it exists.
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -4969,7 +5233,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .await?
                     .try_get(0)?;
 
-            tx.commit().await?;
+            commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5070,9 +5336,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
             }
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -5145,7 +5412,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?
                     .try_get(0)?;
-            tx.commit().await?;
+            commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5221,9 +5490,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 }
             }
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -5370,7 +5640,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(table_id)
                     .fetch_one(&mut *tx)
                     .await?;
-            tx.commit().await?;
+            commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5502,9 +5774,10 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             let stats_initialized = table_stats_initialized(&mut tx, table_id).await?;
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -5589,7 +5862,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(table_id)
                     .fetch_one(&mut *tx)
                     .await?;
-            tx.commit().await?;
+            commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5763,7 +6038,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     table_id: write.table_id,
                 });
             }
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(MultiTableCommit {
                 snapshot_id,
                 tables,
@@ -5889,7 +6164,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
 
-            tx.commit().await?;
+            commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -6005,9 +6282,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             // register_data_file. Deletes are accounted at read time
             // (delete_count), so record_count stays gross — no adjustment for them.
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -6146,7 +6424,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
 
-            tx.commit().await?;
+            commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -6270,9 +6550,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             // register_data_files. Deletes are accounted at read time
             // (delete_count), so record_count stays gross — no adjustment for them.
             sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
+                "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
+                 SELECT ?1, 0, 0, 0
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
             )
             .bind(table_id)
             .execute(&mut *tx)
@@ -6418,7 +6699,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
 
-            tx.commit().await?;
+            commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -6548,7 +6831,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
 
-            tx.commit().await?;
+            commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -6592,7 +6877,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(table_id)
                     .fetch_one(&mut *tx)
                     .await?;
-            tx.commit().await?;
+            commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -6655,7 +6942,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(table_id)
                     .fetch_one(&mut *tx)
                     .await?;
-            tx.commit().await?;
+            commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -6877,7 +7166,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
 
-            tx.commit().await?;
+            commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -6920,9 +7211,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                     return Err(inlined_flush_conflict(table.table_id, base_snapshot));
                 }
                 sqlx::query(
-                    "INSERT OR IGNORE INTO ducklake_table_stats
+                    "INSERT INTO ducklake_table_stats
                          (table_id, record_count, next_row_id, file_size_bytes)
-                     VALUES (?, 0, 0, 0)",
+                     SELECT ?1, 0, 0, 0
+                     WHERE NOT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ?1)",
                 )
                 .bind(table.table_id)
                 .execute(&mut *tx)
@@ -7031,7 +7323,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(snapshot_id)
         })
     }
@@ -7222,7 +7516,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             )
             .await?;
 
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(Some(snapshot_id))
         })
     }
@@ -7353,7 +7647,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             )
             .await?;
 
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(live_rows)
         })
     }
@@ -7404,7 +7698,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?
                     .try_get(0)?;
-            tx.commit().await?;
+            commit(tx).await?;
+            self.last_committed
+                .store(snapshot_id, std::sync::atomic::Ordering::SeqCst);
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -7431,7 +7727,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            tx.commit().await?;
+            commit(tx).await?;
             Ok(result.rows_affected())
         })
     }
@@ -7617,6 +7913,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // begins. These ids match the staged parquet field ids.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
+            raise_column_counter(&mut tx).await?;
             let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
             // Freshly reserved ids. Only a genuinely-new column actually consumes
             // one below; an existing column keeps its current id, so some of these
@@ -7648,9 +7945,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                     row.try_get(0)?
                 } else {
                     let row = sqlx::query(
-                        "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                         VALUES (?, ?, 1, ?) RETURNING schema_id",
+                        "INSERT INTO ducklake_schema (schema_id, schema_name, path, path_is_relative, begin_snapshot)
+                         VALUES (?, ?, ?, 1, ?) RETURNING schema_id",
                     )
+                    .bind(next_catalog_id(&mut tx).await?)
                     .bind(schema_name)
                     .bind(directory_path(schema_name))
                     .bind(snapshot_id)
@@ -7674,9 +7972,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                     row.try_get(0)?
                 } else {
                     let row = sqlx::query(
-                        "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                         VALUES (?, ?, ?, 1, ?) RETURNING table_id",
+                        "INSERT INTO ducklake_table (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
+                         VALUES (?, ?, ?, ?, 1, ?) RETURNING table_id",
                     )
+                    .bind(next_catalog_id(&mut tx).await?)
                     .bind(schema_id)
                     .bind(table_name)
                     .bind(directory_path(table_name))
@@ -7779,7 +8078,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // idempotent get-or-create schema/table rows; they carry
             // begin_snapshot = the reserved id and stay invisible until the
             // snapshot publishes, since schema/table reads ARE snapshot-scoped.
-            tx.commit().await?;
+            commit(tx).await?;
 
             Ok(WriteSetupResult {
                 snapshot_id,
