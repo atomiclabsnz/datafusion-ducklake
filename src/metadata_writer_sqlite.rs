@@ -915,7 +915,7 @@ impl SqliteMetadataWriter {
     }
 
     /// Create, in an empty database, the catalog the DuckDB extension creates (see
-    /// [`SQL_CREATE_OFFICIAL_SCHEMA`]): its tables, its first snapshot and its `main` schema.
+    /// `SQL_CREATE_OFFICIAL_SCHEMA`): its tables, its first snapshot and its `main` schema.
     /// Then [`MetadataWriter::initialize_schema`] adds what this crate keeps beside them, as it
     /// does in a catalog the extension created. A database that already holds a catalog is
     /// left to `initialize_schema` alone, so this is safe to call on every open.
