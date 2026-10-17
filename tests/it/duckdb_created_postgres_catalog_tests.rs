@@ -469,6 +469,40 @@ async fn a_replace_conflicts_with_rows_inlined_since_its_base() {
     }
 }
 
+/// A replace over a catalog with no inlined-data registry retires its files and
+/// commits: the registry is looked for before it is read, so its absence is "no inlined
+/// rows", not an aborted transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replace_commits_over_a_catalog_with_no_inlined_registry() {
+    let (db, temp, writer) = lake_with(
+        "CREATE TABLE lake.main.small (id BIGINT, amount DOUBLE);
+         INSERT INTO lake.main.small VALUES (1, 1), (2, 2);",
+        0,
+    )
+    .await;
+    let pool = sqlx::PgPool::connect(&db.url).await.unwrap();
+    sqlx::query("DROP TABLE ducklake_inlined_data_tables")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let tables = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new())).unwrap();
+    // The one-file write, not a transaction: a multi-table commit creates the registry
+    // before it begins, so it would never see it missing.
+    tables
+        .write_table("main", "small", &[orders(&[50])])
+        .await
+        .unwrap();
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ducklake_data_file f JOIN ducklake_table t USING (table_id)
+         WHERE t.table_name = 'small' AND f.end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 1, "only the replacing file is live");
+    drop(temp);
+}
+
 /// A table id is allocated against committed state: a concurrent writer's uncommitted
 /// table is waited for, not handed out again — the extension's `ducklake_table` has no
 /// key that would stop the second.
@@ -491,9 +525,10 @@ async fn a_table_id_is_not_handed_out_twice() {
     sqlx::query(
         "INSERT INTO ducklake_table
              (table_id, table_uuid, begin_snapshot, schema_id, table_name, path, path_is_relative)
-         VALUES ($1, gen_random_uuid(), $2, $3, 'other', 'other/', true)",
+         VALUES ($1, $2::uuid, $3, $4, 'other', 'other/', true)",
     )
     .bind(next)
+    .bind(uuid::Uuid::new_v4().to_string())
     .bind(snapshot)
     .bind(schema_id)
     .execute(&mut *other)

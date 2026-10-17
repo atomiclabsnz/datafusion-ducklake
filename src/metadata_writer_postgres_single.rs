@@ -534,10 +534,19 @@ async fn retire_prior_generation(
     .await?;
 
     // And its inlined rows, as the SQLite writer retires them: a replace that left them
-    // live would keep them beside the new generation.
-    for (table_name, system) in
+    // live would keep them beside the new generation. A catalog that never inlined may
+    // have no registry, and a statement naming a missing table would abort the
+    // transaction, so it is checked for first (as `detect_replace_conflict` does).
+    let registry: bool =
+        sqlx::query_scalar("SELECT to_regclass('ducklake_inlined_data_tables') IS NOT NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    let inlined = if registry {
         crate::metadata_writer_postgres::inlined_tables(tx, table_id).await?
-    {
+    } else {
+        Vec::new()
+    };
+    for (table_name, system) in inlined {
         sqlx::query(AssertSqlSafe(format!(
             "UPDATE {} SET {end} = $1 WHERE {end} IS NULL AND {begin} < $1",
             quote_ident(&table_name),
