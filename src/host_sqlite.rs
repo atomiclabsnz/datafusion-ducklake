@@ -90,7 +90,7 @@ pub const SQLITE_LOCKED: i32 = 6;
 /// `query` runs `sql` with `params` bound to its `?` placeholders in order, and returns its rows
 /// before it returns. `sql` holds one statement when `params` is non-empty; without parameters
 /// it may hold several (a schema script), and the rows are the last statement's. The host must
-/// not run statements of its own on the connection between two calls of one catalog call:
+/// not run statements of its own on the connection between two queries within one catalog call:
 /// transactions DuckLake opens with `BEGIN` are on this connection.
 pub trait HostSqlite: Send + Sync {
     fn query(&self, sql: &str, params: &[Value]) -> std::result::Result<HostRows, HostError>;
