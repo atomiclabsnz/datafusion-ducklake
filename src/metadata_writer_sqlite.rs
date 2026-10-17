@@ -7596,7 +7596,6 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-
             commit(tx).await?;
             Ok(result.rows_affected())
         })

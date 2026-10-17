@@ -9,10 +9,7 @@
 //!   `next_file_id` (data and delete files), and reads both at the head before any
 //!   access, so a snapshot that leaves them NULL makes the catalog unreadable to it;
 //! - it declares no key on `ducklake_table_stats`, so an `ON CONFLICT` seed has nothing
-//!   to conflict on;
-//! - it prunes a scan, inlined rows included, by the table-wide bounds in
-//!   `ducklake_table_column_stats`, so bounds rebuilt from data files alone hide its
-//!   inlined rows.
+//!   to conflict on.
 //!
 //! Everything here is keyed on [`has_allocator_watermarks`]: this crate's own catalogs
 //! carry neither watermark column, and for them every function is a no-op or answers
@@ -189,62 +186,6 @@ pub(crate) async fn stamp_allocator_watermarks(conn: &mut PgConnection) -> Resul
     .bind(file)
     .execute(&mut *conn)
     .await?;
-    Ok(())
-}
-
-/// Whether the table-wide bounds must be recorded as unknown rather than rolled up from
-/// data files: in a catalog the extension created, while any of the table's inlined rows
-/// is live (see the module doc). Always `false` in this crate's own catalogs.
-pub(crate) async fn bounds_must_be_unknown(conn: &mut PgConnection, table_id: i64) -> Result<bool> {
-    if !has_allocator_watermarks(conn).await? {
-        return Ok(false);
-    }
-    let tables: Vec<String> = sqlx::query_scalar(
-        "SELECT i.table_name FROM ducklake_inlined_data_tables i
-         WHERE i.table_id = $1 AND to_regclass(quote_ident(i.table_name)) IS NOT NULL",
-    )
-    .bind(table_id)
-    .fetch_all(&mut *conn)
-    .await?;
-    for table in tables {
-        let live: bool = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT EXISTS(SELECT 1 FROM {} WHERE end_snapshot IS NULL)",
-            crate::metadata_writer_postgres::quote_ident(&table)
-        )))
-        .fetch_one(&mut *conn)
-        .await?;
-        if live {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Record every live top-level column's table-wide bounds as unknown (NULL), which no
-/// reader prunes by and the extension keeps unknown when it writes next.
-pub(crate) async fn forget_column_bounds(conn: &mut PgConnection, table_id: i64) -> Result<()> {
-    let column_ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT column_id FROM ducklake_column
-         WHERE table_id = $1 AND end_snapshot IS NULL AND parent_column IS NULL",
-    )
-    .bind(table_id)
-    .fetch_all(&mut *conn)
-    .await?;
-    sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = $1")
-        .bind(table_id)
-        .execute(&mut *conn)
-        .await?;
-    for column_id in column_ids {
-        sqlx::query(
-            "INSERT INTO ducklake_table_column_stats
-                 (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
-             VALUES ($1, $2, NULL, NULL, NULL, NULL, NULL)",
-        )
-        .bind(table_id)
-        .bind(column_id)
-        .execute(&mut *conn)
-        .await?;
-    }
     Ok(())
 }
 

@@ -535,7 +535,8 @@ async fn retire_prior_generation(
 
     // And its inlined rows, as the SQLite writer retires them: a replace that left them
     // live would keep them beside the new generation.
-    for (table_name, system) in crate::metadata_writer_postgres::inlined_tables(tx, table_id).await?
+    for (table_name, system) in
+        crate::metadata_writer_postgres::inlined_tables(tx, table_id).await?
     {
         sqlx::query(AssertSqlSafe(format!(
             "UPDATE {} SET {end} = $1 WHERE {end} IS NULL AND {begin} < $1",
@@ -2524,7 +2525,6 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
-
 
             self.commit(tx).await?;
             Ok(result.rows_affected())
