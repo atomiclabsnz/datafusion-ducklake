@@ -9,6 +9,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use self::sqlx::AssertSqlSafe;
+use self::sqlx::QueryBuilder;
+use self::sqlx::Row;
+use self::sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use super::metadata_provider_sqlite::{catalog_inlined_system_columns, inlined_table_layout};
+use super::sqlx;
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::{SUPERSEDED_INLINED_TABLES_SQL, dead_table_inlined_storage};
@@ -16,7 +22,6 @@ use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
 use crate::metadata_provider::{InlinedSystemColumns, TagObjectType, TagTarget};
-use crate::metadata_provider_sqlite::{catalog_inlined_system_columns, inlined_table_layout};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, ImportedFile, InlinedRowRef,
@@ -47,10 +52,6 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use sqlx::AssertSqlSafe;
-use sqlx::QueryBuilder;
-use sqlx::Row;
-use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
@@ -799,6 +800,43 @@ const SQL_CREATE_INLINED_DATA_TABLES: &str =
     schema_version INTEGER
 );";
 
+/// The catalog the DuckDB extension (1.5.5, DuckLake format 1.0) creates in an empty SQLite
+/// database, statement for statement as it leaves them in `sqlite_master`. A catalog this crate
+/// creates with [`SqliteMetadataWriter::initialize_official_schema`] is therefore one the
+/// extension attaches, reads and writes: it carries the id watermarks and object UUIDs the
+/// crate's own schema ([`SQL_CREATE_SCHEMA`]) leaves out. `host_sqlite_tests` compares it with
+/// what DuckDB creates.
+const SQL_CREATE_OFFICIAL_SCHEMA: &str = r#"
+CREATE TABLE ducklake_metadata("key" VARCHAR NOT NULL, "value" VARCHAR NOT NULL, "scope" VARCHAR, scope_id BIGINT);
+CREATE TABLE ducklake_snapshot(snapshot_id BIGINT PRIMARY KEY, snapshot_time VARCHAR, schema_version BIGINT, next_catalog_id BIGINT, next_file_id BIGINT);
+CREATE TABLE ducklake_snapshot_changes(snapshot_id BIGINT PRIMARY KEY, changes_made VARCHAR, author VARCHAR, commit_message VARCHAR, commit_extra_info VARCHAR);
+CREATE TABLE ducklake_schema(schema_id BIGINT PRIMARY KEY, schema_uuid VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT, schema_name VARCHAR, path VARCHAR, path_is_relative BIGINT);
+CREATE TABLE ducklake_table(table_id BIGINT, table_uuid VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT, schema_id BIGINT, table_name VARCHAR, path VARCHAR, path_is_relative BIGINT);
+CREATE TABLE ducklake_view(view_id BIGINT, view_uuid VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT, schema_id BIGINT, view_name VARCHAR, dialect VARCHAR, "sql" VARCHAR, column_aliases VARCHAR);
+CREATE TABLE ducklake_tag(object_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, "key" VARCHAR, "value" VARCHAR);
+CREATE TABLE ducklake_column_tag(table_id BIGINT, column_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, "key" VARCHAR, "value" VARCHAR);
+CREATE TABLE ducklake_data_file(data_file_id BIGINT PRIMARY KEY, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, file_order BIGINT, path VARCHAR, path_is_relative BIGINT, file_format VARCHAR, record_count BIGINT, file_size_bytes BIGINT, footer_size BIGINT, row_id_start BIGINT, partition_id BIGINT, encryption_key VARCHAR, mapping_id BIGINT, partial_max BIGINT);
+CREATE TABLE ducklake_file_column_stats(data_file_id BIGINT, table_id BIGINT, column_id BIGINT, column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT, min_value VARCHAR, max_value VARCHAR, contains_nan BIGINT, extra_stats VARCHAR);
+CREATE TABLE ducklake_file_variant_stats(data_file_id BIGINT, table_id BIGINT, column_id BIGINT, variant_path VARCHAR, shredded_type VARCHAR, column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT, min_value VARCHAR, max_value VARCHAR, contains_nan BIGINT, extra_stats VARCHAR);
+CREATE TABLE ducklake_delete_file(delete_file_id BIGINT PRIMARY KEY, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, data_file_id BIGINT, path VARCHAR, path_is_relative BIGINT, format VARCHAR, delete_count BIGINT, file_size_bytes BIGINT, footer_size BIGINT, encryption_key VARCHAR, partial_max BIGINT);
+CREATE TABLE ducklake_column(column_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, table_id BIGINT, column_order BIGINT, column_name VARCHAR, column_type VARCHAR, initial_default VARCHAR, default_value VARCHAR, nulls_allowed BIGINT, parent_column BIGINT, default_value_type VARCHAR, default_value_dialect VARCHAR);
+CREATE TABLE ducklake_table_stats(table_id BIGINT, record_count BIGINT, next_row_id BIGINT, file_size_bytes BIGINT);
+CREATE TABLE ducklake_table_column_stats(table_id BIGINT, column_id BIGINT, contains_null BIGINT, contains_nan BIGINT, min_value VARCHAR, max_value VARCHAR, extra_stats VARCHAR);
+CREATE TABLE ducklake_partition_info(partition_id BIGINT, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT);
+CREATE TABLE ducklake_partition_column(partition_id BIGINT, table_id BIGINT, partition_key_index BIGINT, column_id BIGINT, "transform" VARCHAR);
+CREATE TABLE ducklake_file_partition_value(data_file_id BIGINT, table_id BIGINT, partition_key_index BIGINT, partition_value VARCHAR);
+CREATE TABLE ducklake_files_scheduled_for_deletion(data_file_id BIGINT, path VARCHAR, path_is_relative BIGINT, schedule_start VARCHAR);
+CREATE TABLE ducklake_inlined_data_tables(table_id BIGINT, table_name VARCHAR, schema_version BIGINT);
+CREATE TABLE ducklake_column_mapping(mapping_id BIGINT, table_id BIGINT, "type" VARCHAR);
+CREATE TABLE ducklake_name_mapping(mapping_id BIGINT, column_id BIGINT, source_name VARCHAR, target_field_id BIGINT, parent_column BIGINT, is_partition BIGINT);
+CREATE TABLE ducklake_schema_versions(begin_snapshot BIGINT, schema_version BIGINT, table_id BIGINT);
+CREATE TABLE ducklake_macro(schema_id BIGINT, macro_id BIGINT, macro_name VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT);
+CREATE TABLE ducklake_macro_impl(macro_id BIGINT, impl_id BIGINT, dialect VARCHAR, "sql" VARCHAR, "type" VARCHAR);
+CREATE TABLE ducklake_macro_parameters(macro_id BIGINT, impl_id BIGINT, column_id BIGINT, parameter_name VARCHAR, parameter_type VARCHAR, default_value VARCHAR, default_value_type VARCHAR);
+CREATE TABLE ducklake_sort_info(sort_id BIGINT, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT);
+CREATE TABLE ducklake_sort_expression(sort_id BIGINT, table_id BIGINT, sort_key_index BIGINT, expression VARCHAR, dialect VARCHAR, sort_direction VARCHAR, null_order VARCHAR);
+"#;
+
 /// [`SqliteMetadataWriter::last_committed_snapshot`] before any commit.
 const NO_COMMIT: i64 = i64::MIN;
 
@@ -833,7 +871,7 @@ impl SqliteMetadataWriter {
             PathBuf::from(path)
         });
         let url = connection_string.to_string();
-        let pool = crate::metadata_provider::connect_on_catalog_runtime(async move {
+        let pool = super::connect_on_catalog_runtime(async move {
             SqlitePoolOptions::new()
                 .max_connections(max_connections)
                 .connect(&url)
@@ -841,6 +879,14 @@ impl SqliteMetadataWriter {
         })
         .await?;
 
+        Ok(Self {
+            lock_path,
+            ..Self::from_pool(pool).await?
+        })
+    }
+
+    /// A writer over an open pool, with no lock file; migrates an existing catalog.
+    pub(crate) async fn from_pool(pool: SqlitePool) -> Result<Self> {
         // Existing catalogs must migrate even when callers skip `initialize_schema`
         migrate_snapshot_changes_nullable(&pool).await?;
         sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
@@ -849,7 +895,7 @@ impl SqliteMetadataWriter {
         sqlx::query(SQL_CREATE_TAG_TABLES).execute(&pool).await?;
         Ok(Self {
             pool,
-            lock_path,
+            lock_path: None,
             commit_lock: Arc::new(Mutex::new(())),
             data_inlining_row_limit: None,
             last_committed: Arc::new(std::sync::atomic::AtomicI64::new(NO_COMMIT)),
@@ -866,6 +912,91 @@ impl SqliteMetadataWriter {
             .last_committed
             .load(std::sync::atomic::Ordering::SeqCst);
         (snapshot != NO_COMMIT).then_some(snapshot)
+    }
+
+    /// Create, in an empty database, the catalog the DuckDB extension creates (see
+    /// [`SQL_CREATE_OFFICIAL_SCHEMA`]): its tables, its first snapshot and its `main` schema.
+    /// Then [`MetadataWriter::initialize_schema`] adds what this crate keeps beside them, as it
+    /// does in a catalog the extension created. A database that already holds a catalog is
+    /// left to `initialize_schema` alone, so this is safe to call on every open.
+    ///
+    /// Use it for a catalog the DuckDB extension must attach: one [`MetadataWriter::
+    /// initialize_schema`] creates from nothing is this crate's own schema, which the extension
+    /// cannot read.
+    pub fn initialize_official_schema(&self) -> Result<()> {
+        let schema_uuid = uuid::Uuid::new_v4().to_string();
+        self.block_on(async {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let existing: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ducklake_metadata'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if existing == 0 {
+                // Opening the writer created the inlined-data registry and the tag tables
+                // (`from_pool`) in this crate's shape. With no catalog here they hold nothing;
+                // they are replaced by the extension's.
+                for table in ["ducklake_inlined_data_tables", "ducklake_tag", "ducklake_column_tag"] {
+                    let rows: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+                        "SELECT CASE WHEN EXISTS (SELECT 1 FROM sqlite_master
+                                                  WHERE type = 'table' AND name = '{table}')
+                                THEN (SELECT COUNT(*) FROM {table}) ELSE 0 END"
+                    )))
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if rows > 0 {
+                        return Err(crate::DuckLakeError::InvalidConfig(format!(
+                            "initialize_official_schema: {table} holds rows but the database has \
+                             no ducklake_metadata, so it is not a DuckLake catalog"
+                        )));
+                    }
+                    sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                for statement in SQL_CREATE_OFFICIAL_SCHEMA
+                    .split_inclusive(';')
+                    .filter(|statement| !statement.trim().is_empty())
+                {
+                    sqlx::query(AssertSqlSafe(statement))
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                sqlx::query(
+                    "INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES
+                         ('version', '1.0', NULL, NULL),
+                         ('created_by', ?, NULL, NULL),
+                         ('encrypted', 'false', NULL, NULL)",
+                )
+                .bind(concat!("datafusion-ducklake ", env!("CARGO_PKG_VERSION")))
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO ducklake_snapshot
+                         (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
+                     VALUES (0, strftime('%Y-%m-%d %H:%M:%f+00', 'now'), 0, 1, 0)",
+                )
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+                     VALUES (0, 'created_schema:\"main\"')",
+                )
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO ducklake_schema
+                         (schema_id, schema_uuid, begin_snapshot, end_snapshot, schema_name, path,
+                          path_is_relative)
+                     VALUES (0, ?, 0, NULL, 'main', 'main/', 1)",
+                )
+                .bind(schema_uuid)
+                .execute(&mut *tx)
+                .await?;
+            }
+            commit(tx).await
+        })?;
+        self.initialize_schema()
     }
 
     pub async fn new_with_init(connection_string: &str) -> Result<Self> {
@@ -889,7 +1020,7 @@ impl SqliteMetadataWriter {
     /// `data_inlining_row_limit` in effect for the call.
     fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
         crate::metadata_writer::with_writer_inlining_limit(self.data_inlining_row_limit, || {
-            crate::metadata_provider::block_on(future)
+            super::block_on(future)
         })
     }
 
@@ -3864,7 +3995,7 @@ impl SqliteMetadataWriter {
 
 impl MetadataWriter for SqliteMetadataWriter {
     fn maintenance(&self) -> Option<&dyn crate::maintenance::CatalogMaintenance> {
-        Some(self)
+        super::maintenance(self)
     }
 
     /// SQLite implements the atomic append-with-deletes commit, so it supports
@@ -3931,7 +4062,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(table_id)
                     .fetch_all(&mut *transaction)
                     .await?;
-                let system = crate::metadata_provider_sqlite::catalog_inlined_system_columns(
+                let system = super::metadata_provider_sqlite::catalog_inlined_system_columns(
                     &mut *transaction,
                 )
                 .await?;
@@ -4139,7 +4270,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                         .bind(schema_id)
                         .fetch_all(&mut *transaction)
                         .await?;
-                let system = crate::metadata_provider_sqlite::catalog_inlined_system_columns(
+                let system = super::metadata_provider_sqlite::catalog_inlined_system_columns(
                     &mut *transaction,
                 )
                 .await?;
@@ -4179,7 +4310,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 let columns: Vec<(String, String)> = sqlx::query_as(SQL_GLOBAL_INLINING_COLUMNS)
                     .fetch_all(&mut *transaction)
                     .await?;
-                let system = crate::metadata_provider_sqlite::catalog_inlined_system_columns(
+                let system = super::metadata_provider_sqlite::catalog_inlined_system_columns(
                     &mut *transaction,
                 )
                 .await?;

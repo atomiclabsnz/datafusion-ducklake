@@ -117,6 +117,10 @@ encryption = ["parquet/encryption", "datafusion/parquet_encryption", "dep:base64
 # Write support
 write = ["dep:uuid", "dep:tempfile"]
 write-sqlite = ["write", "metadata-sqlite"]
+# DuckLake's SQLite catalog over a SQLite the host supplies (`host_sqlite`): the SQLite
+# backend's own source, compiled against a sqlx-shaped interface instead of sqlx. Needs no
+# sqlx and no runtime, so it builds for wasm32-unknown-unknown.
+host-sqlite = ["write"]
 write-postgres = ["write", "metadata-postgres", "multicatalog-postgres"]
 write-duckdb = ["write", "metadata-duckdb"]
 write-mysql = ["write", "metadata-mysql"]

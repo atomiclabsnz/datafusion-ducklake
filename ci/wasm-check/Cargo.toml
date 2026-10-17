@@ -17,7 +17,7 @@ publish = false
 [workspace]
 
 [dependencies]
-datafusion-ducklake = { path = "../..", default-features = false, features = ["write"] }
+datafusion-ducklake = { path = "../..", default-features = false, features = ["write", "host-sqlite"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }

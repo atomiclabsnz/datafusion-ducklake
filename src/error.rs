@@ -69,6 +69,17 @@ pub enum DuckLakeError {
     #[error("Database error: {0}")]
     Sqlx(#[from] sqlx::Error),
 
+    /// A statement a host's SQLite refused ([`crate::host_sqlite`]).
+    #[cfg(feature = "host-sqlite")]
+    #[error("Host SQLite error: {0}")]
+    HostSqlite(crate::host_sqlite::Error),
+
+    /// A host's SQLite answered `SQLITE_BUSY` (or `SQLITE_LOCKED`): another connection holds the
+    /// catalog. The refused statement's transaction was rolled back; retry the call.
+    #[cfg(feature = "host-sqlite")]
+    #[error("catalog busy, retry: {0}")]
+    CatalogBusy(String),
+
     /// The `COMMIT` of a metadata transaction failed on a PostgreSQL or MySQL
     /// catalog, so whether it took effect is unknown: the server may have
     /// committed it before the connection failed. Raised by the commits that
@@ -166,6 +177,17 @@ impl From<DuckLakeError> for datafusion::error::DataFusionError {
             DuckLakeError::DataFusion(e) => e,
             // For all other errors, wrap them as External
             other => datafusion::error::DataFusionError::External(Box::new(other)),
+        }
+    }
+}
+
+#[cfg(feature = "host-sqlite")]
+impl From<crate::host_sqlite::Error> for DuckLakeError {
+    fn from(error: crate::host_sqlite::Error) -> Self {
+        if error.is_busy() {
+            DuckLakeError::CatalogBusy(error.to_string())
+        } else {
+            DuckLakeError::HostSqlite(error)
         }
     }
 }
