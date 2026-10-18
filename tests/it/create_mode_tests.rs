@@ -114,7 +114,7 @@ async fn a_create_of_a_table_that_exists_is_refused_and_writes_nothing() {
                 .unwrap_err(),
         );
         assert_eq!(names(&temp).await, ["kept"], "inlining {inlining}");
-        // Refused at the write's start, before any Parquet is written for it.
+        // A refused create leaves no Parquet of its own behind.
         assert_eq!(files(&temp), files_before, "inlining {inlining}");
     }
 }
@@ -186,4 +186,138 @@ async fn register_table_never_replaces_a_table() {
         "{error}"
     );
     assert_eq!(names(&temp).await, ["kept"]);
+}
+
+/// The three Create cases on a backend's own writer: a table that exists, a table another
+/// writer creates while this one is writing, and a new table. The commit's check is each
+/// backend's own code, so each runs it.
+async fn create_refusals(metadata: Arc<dyn MetadataWriter>) {
+    let writer = DuckLakeTableWriter::new(metadata, Arc::new(LocalFileSystem::new())).unwrap();
+    writer
+        .write_table("main", "existing", &[batch(1, "kept")])
+        .await
+        .unwrap();
+    assert_exists(
+        writer
+            .create_table("main", "existing", &[batch(2, "created")])
+            .await
+            .unwrap_err(),
+    );
+
+    let mut late = writer
+        .begin_write("main", "raced", &schema(), WriteMode::Create)
+        .unwrap();
+    late.write_batch(&batch(9, "late")).unwrap();
+    writer
+        .create_table("main", "raced", &[batch(1, "first")])
+        .await
+        .unwrap();
+    assert_exists(late.finish().await.unwrap_err());
+
+    writer
+        .create_table("main", "fresh", &[batch(1, "a")])
+        .await
+        .unwrap();
+}
+
+/// Where a test container's mapped ports answer: `TESTCONTAINERS_HOST_OVERRIDE` when set (a
+/// devcontainer whose Docker is a sibling service; `get_host` names the API endpoint
+/// there, which takes no database connections), else what testcontainers says.
+#[cfg(any(feature = "write-mysql", feature = "write-postgres"))]
+async fn container_host<I: testcontainers::Image>(
+    container: &testcontainers::ContainerAsync<I>,
+) -> String {
+    match std::env::var("TESTCONTAINERS_HOST_OVERRIDE") {
+        Ok(host) if !host.is_empty() => host,
+        _ => container.get_host().await.unwrap().to_string(),
+    }
+}
+
+fn data_path(temp: &TempDir) -> String {
+    let path = temp.path().join("data");
+    std::fs::create_dir_all(&path).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+#[cfg(feature = "write-duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn create_is_refused_on_duckdb_as_on_sqlite() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("catalog.duckdb");
+    let writer =
+        datafusion_ducklake::DuckdbMetadataWriter::new_with_init(path.to_str().unwrap()).unwrap();
+    writer.set_data_path(&data_path(&temp)).unwrap();
+    create_refusals(Arc::new(writer)).await;
+}
+
+#[cfg(feature = "write-mysql")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+#[tokio::test(flavor = "multi_thread")]
+async fn create_is_refused_on_mysql_as_on_sqlite() {
+    use testcontainers::runners::AsyncRunner;
+    let container = testcontainers_modules::mysql::Mysql::default()
+        .start()
+        .await
+        .unwrap();
+    let host = container_host(&container).await;
+    let port = container.get_host_port_ipv4(3306).await.unwrap();
+    let writer = datafusion_ducklake::MySqlMetadataWriter::new_with_init(&format!(
+        "mysql://root@{host}:{port}/test"
+    ))
+    .await
+    .unwrap();
+    let temp = TempDir::new().unwrap();
+    writer.set_data_path(&data_path(&temp)).unwrap();
+    create_refusals(Arc::new(writer)).await;
+}
+
+#[cfg(feature = "write-postgres")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+#[tokio::test(flavor = "multi_thread")]
+async fn create_is_refused_on_both_postgres_writers_as_on_sqlite() {
+    use testcontainers::runners::AsyncRunner;
+    let container = testcontainers_modules::postgres::Postgres::default()
+        .start()
+        .await
+        .unwrap();
+    let host = container_host(&container).await;
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let base = format!("postgresql://postgres:postgres@{host}:{port}");
+
+    // Each writer in a database of its own.
+    let admin = sqlx::PgPool::connect(&format!("{base}/postgres"))
+        .await
+        .unwrap();
+    for database in ["single", "multi"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+
+    let temp = TempDir::new().unwrap();
+    let single = datafusion_ducklake::PostgresSingleCatalogMetadataWriter::new_with_init(&format!(
+        "{base}/single"
+    ))
+    .await
+    .unwrap();
+    single.set_data_path(&data_path(&temp)).unwrap();
+    create_refusals(Arc::new(single)).await;
+
+    let pool = sqlx::PgPool::connect(&format!("{base}/multi"))
+        .await
+        .unwrap();
+    datafusion_ducklake::initialize_multicatalog_schema(&pool)
+        .await
+        .unwrap();
+    let catalog_id = datafusion_ducklake::MulticatalogManager::new(pool.clone())
+        .create_catalog("lake")
+        .await
+        .unwrap();
+    let multi = datafusion_ducklake::PostgresMetadataWriter::with_pool(pool, catalog_id)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    multi.set_data_path(&data_path(&temp)).unwrap();
+    create_refusals(Arc::new(multi)).await;
 }

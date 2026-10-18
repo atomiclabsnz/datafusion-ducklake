@@ -2835,13 +2835,6 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // is canonical (`int64` ≡ `bigint`). Append also requires a new column
             // to be nullable.
             if !existing_catalog_columns.is_empty() {
-                // The table has live columns, so it exists: refused before any file is
-                // written. The commit checks again, for a table created since.
-                if mode == WriteMode::Create {
-                    return Err(crate::metadata_writer::table_exists_error(format!(
-                        "{schema_name}.{table_name}"
-                    )));
-                }
                 use std::collections::HashMap;
 
                 let existing_map: HashMap<i64, &ExistingCatalogColumn> = existing_catalog_columns
