@@ -60,6 +60,22 @@ pub enum WriteMode {
     Replace,
     /// Keep existing data and append new records
     Append,
+    /// Create the table with these records, as `CREATE TABLE` does: a write
+    /// into a table that already exists is refused, and so is one whose table
+    /// another writer created first. The commit decides, inside its own
+    /// transaction, so no table becomes visible between a caller's existence
+    /// check and its write. Otherwise it is [`WriteMode::Append`] into an empty
+    /// table. Refused with [`DuckLakeError::TableExists`].
+    Create,
+}
+
+/// [`WriteMode::Create`]'s refusal: `table` already exists, or another writer
+/// created it before this commit.
+pub(crate) fn table_exists_error(table: impl std::fmt::Display) -> DuckLakeError {
+    DuckLakeError::TableExists(format!(
+        "{table}: CREATE TABLE does not write into a table that exists, or that another \
+         writer created first"
+    ))
 }
 
 /// `value` as official's `ducklake_set_option` stores option `key`

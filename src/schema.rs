@@ -486,7 +486,7 @@ impl SchemaProvider for DuckLakeSchema {
         // Create table in metadata (creates snapshot, table, columns in a transaction)
         let inlining_limit = self.write_options.data_inlining_row_limit;
         let setup = crate::metadata_writer::with_inlining_limit(inlining_limit, || {
-            writer.begin_write_transaction(&self.schema_name, &name, &columns, WriteMode::Replace)
+            writer.begin_write_transaction(&self.schema_name, &name, &columns, WriteMode::Create)
         })
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
@@ -499,7 +499,7 @@ impl SchemaProvider for DuckLakeSchema {
                 &self.schema_name,
                 &name,
                 setup.snapshot_id,
-                WriteMode::Replace,
+                WriteMode::Create,
                 setup.base_snapshot_id,
                 &columns,
                 &setup.field_ids,
