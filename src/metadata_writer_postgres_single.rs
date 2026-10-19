@@ -1038,6 +1038,11 @@ async fn finalize_table_snapshot(
             )
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    crate::metadata_writer::refuse_create_into(
+        mode,
+        !current.is_empty(),
+        format!("{schema_name}.{table_name}"),
+    )?;
     let committed_ids = assign_column_ids(&proposed, &existing_catalog_columns, column_ids)?;
     if committed_ids != column_ids {
         return Err(crate::DuckLakeError::Conflict(
@@ -2826,6 +2831,8 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // is canonical (`int64` ≡ `bigint`). Append also requires a new column
             // to be nullable.
             if !existing_catalog_columns.is_empty() {
+                // Refused here too, ahead of the type check, and before any file is written.
+                crate::metadata_writer::refuse_create_into(mode, true, format!("{schema_name}.{table_name}"))?;
                 use std::collections::HashMap;
 
                 let existing_map: HashMap<i64, &ExistingCatalogColumn> = existing_catalog_columns
@@ -2842,7 +2849,9 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                                 operation: TypeChangeOperation::DataWrite {
                                     mode: match mode {
                                         WriteMode::Replace => TypeChangeWriteMode::Replace,
-                                        WriteMode::Append => TypeChangeWriteMode::Append,
+                                        WriteMode::Append | WriteMode::Create => {
+                                            TypeChangeWriteMode::Append
+                                        }
                                     },
                                 },
                                 column: new_column.name.clone(),

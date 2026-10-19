@@ -1427,6 +1427,20 @@ impl DuckLakeTableWriter {
             .await
     }
 
+    /// Create a table with these rows in one snapshot, as `CREATE TABLE … AS`
+    /// does ([`WriteMode::Create`]): refused with
+    /// [`DuckLakeError::TableExists`](crate::DuckLakeError::TableExists) when the
+    /// table exists, or when another writer creates it before this commit.
+    pub async fn create_table(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        batches: &[RecordBatch],
+    ) -> Result<WriteResult> {
+        self.write_all(schema_name, table_name, batches, WriteMode::Create)
+            .await
+    }
+
     /// Flush the catalog-inlined rows of one table to Parquet: the same flush as
     /// [`DuckLakeCatalog::flush_inlined_data`](crate::DuckLakeCatalog::flush_inlined_data)
     /// restricted to `schema_name.table_name`, writing through this writer's

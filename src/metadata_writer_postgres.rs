@@ -3380,6 +3380,13 @@ async fn finalize_table_snapshot(
         .iter()
         .map(|row| Ok::<_, sqlx::Error>(row.try_get::<Option<bool>, _>(2)?.unwrap_or(true)))
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    // `WriteMode::Create`: this backend writes the table row at the commit itself, so
+    // `table_was_created` is exact.
+    crate::metadata_writer::refuse_create_into(
+        mode,
+        !table_was_created,
+        format!("{schema_name}.{table_name}"),
+    )?;
     let committed_ids = assign_column_ids(&proposed, &existing_catalog_columns, column_ids)?;
     if committed_ids != column_ids {
         return Err(crate::DuckLakeError::Conflict(
@@ -9072,6 +9079,8 @@ impl MetadataWriter for PostgresMetadataWriter {
             // column to be nullable (a Replace overwrites every row, so a new
             // non-nullable column is fine there).
             if !existing_catalog_columns.is_empty() {
+                // Refused here too, ahead of the type check, and before any file is written.
+                crate::metadata_writer::refuse_create_into(mode, true, format!("{schema_name}.{table_name}"))?;
                 use std::collections::HashMap;
                 let existing_map: HashMap<i64, &ExistingCatalogColumn> = existing_catalog_columns
                     .iter()
@@ -9087,7 +9096,9 @@ impl MetadataWriter for PostgresMetadataWriter {
                                 operation: TypeChangeOperation::DataWrite {
                                     mode: match mode {
                                         WriteMode::Replace => TypeChangeWriteMode::Replace,
-                                        WriteMode::Append => TypeChangeWriteMode::Append,
+                                        WriteMode::Append | WriteMode::Create => {
+                                            TypeChangeWriteMode::Append
+                                        }
                                     },
                                 },
                                 column: new_column.name.clone(),

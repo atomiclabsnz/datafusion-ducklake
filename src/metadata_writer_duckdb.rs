@@ -2284,6 +2284,11 @@ fn finalize_table_snapshot(
         })
         .collect::<Vec<_>>();
     let existing_nullability = current.iter().map(|column| column.4).collect::<Vec<_>>();
+    crate::metadata_writer::refuse_create_into(
+        mode,
+        !current.is_empty(),
+        format!("table {table_id}"),
+    )?;
     let committed_ids = assign_column_ids(&proposed, &existing_catalog_columns, column_ids)?;
     if committed_ids != column_ids {
         return Err(crate::DuckLakeError::Conflict(
@@ -5728,6 +5733,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // alias-only restatement is a no-op. Append additionally requires a
         // genuinely new column to be nullable. Mirrors the SQLite writer.
         if !existing_catalog_columns.is_empty() {
+            // Refused here too, ahead of the type check, and before any file is written.
+            crate::metadata_writer::refuse_create_into(
+                mode,
+                true,
+                format!("{schema_name}.{table_name}"),
+            )?;
             use std::collections::HashMap;
             let existing_map: HashMap<i64, &ExistingCatalogColumn> = existing_catalog_columns
                 .iter()
@@ -5743,7 +5754,9 @@ impl MetadataWriter for DuckdbMetadataWriter {
                             operation: TypeChangeOperation::DataWrite {
                                 mode: match mode {
                                     WriteMode::Replace => TypeChangeWriteMode::Replace,
-                                    WriteMode::Append => TypeChangeWriteMode::Append,
+                                    WriteMode::Append | WriteMode::Create => {
+                                        TypeChangeWriteMode::Append
+                                    },
                                 },
                             },
                             column: new_column.name.clone(),
