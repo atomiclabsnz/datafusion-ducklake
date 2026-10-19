@@ -419,8 +419,9 @@ impl SchemaProvider for DuckLakeSchema {
             .map_err(|e| DataFusionError::External(Box::new(e)))?
             .is_some()
         {
-            return Err(DataFusionError::Plan(format!(
-                "Cannot create table '{name}': a view with that name already exists"
+            // The commit checks again, for a view created since.
+            return Err(DataFusionError::External(Box::new(
+                crate::metadata_writer::view_exists_error(format!("{}.{name}", self.schema_name)),
             )));
         }
 

@@ -110,7 +110,8 @@ pub enum DuckLakeError {
     TableNotFound(String),
 
     /// A [`WriteMode::Create`](crate::metadata_writer::WriteMode::Create) write met
-    /// a table that exists, or that another writer created before it committed.
+    /// a table that exists, or that another writer created before it committed, or
+    /// a live view with the table's name.
     #[error("Table already exists: {0}")]
     TableExists(String),
 
