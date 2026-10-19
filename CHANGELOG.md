@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `WriteMode::Create` and `DuckLakeTableWriter::create_table`: `CREATE TABLE … AS`'s write, refused
+  inside the commit (`DuckLakeError::TableExists`) when the table exists or another writer made it.
 - `DuckLakeTableWriter::import_manifest` registers existing Parquet files and their deleted
   positions as one snapshot, checking field ids and leaving the files unowned (SQLite) (#2).
 - `DuckLakeTable::export_manifest` exports a snapshot as a file manifest — files, field ids,
