@@ -2289,6 +2289,36 @@ fn finalize_table_snapshot(
         !current.is_empty(),
         format!("table {table_id}"),
     )?;
+    // `WriteMode::Create` also refuses a live view of the table's name, read here so one
+    // another writer created since this write began is refused too.
+    if mode == WriteMode::Create {
+        // A catalog from before views has no `ducklake_view`, and so no view.
+        let views: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'ducklake_view'",
+            [],
+            |row| row.get(0),
+        )?;
+        let live_view = if views == 0 {
+            None
+        } else {
+            tx.query_row(
+                "SELECT 1 FROM ducklake_view view_meta
+                 JOIN ducklake_table table_meta ON table_meta.schema_id = view_meta.schema_id
+                 WHERE table_meta.table_id = ? AND table_meta.end_snapshot IS NULL
+                   AND view_meta.view_name = table_meta.table_name
+                   AND view_meta.end_snapshot IS NULL
+                 LIMIT 1",
+                params![table_id],
+                |_| Ok(()),
+            )
+            .optional()?
+        };
+        if live_view.is_some() {
+            return Err(crate::metadata_writer::view_exists_error(format!(
+                "table {table_id}"
+            )));
+        }
+    }
     let committed_ids = assign_column_ids(&proposed, &existing_catalog_columns, column_ids)?;
     if committed_ids != column_ids {
         return Err(crate::DuckLakeError::Conflict(

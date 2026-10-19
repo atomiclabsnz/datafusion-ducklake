@@ -65,7 +65,8 @@ pub enum WriteMode {
     /// another writer created first. The commit decides, inside its own
     /// transaction, so no table becomes visible between a caller's existence
     /// check and its write. Otherwise it is [`WriteMode::Append`] into an empty
-    /// table. Refused with [`DuckLakeError::TableExists`].
+    /// table. A live view with the table's name is refused the same way.
+    /// Refused with [`DuckLakeError::TableExists`].
     Create,
 }
 
@@ -84,6 +85,14 @@ pub(crate) fn refuse_create_into(
         return Err(table_exists_error(table));
     }
     Ok(())
+}
+
+/// [`WriteMode::Create`]'s refusal when a live view has the table's name, checked inside
+/// the commit.
+pub(crate) fn view_exists_error(table: impl std::fmt::Display) -> DuckLakeError {
+    DuckLakeError::TableExists(format!(
+        "{table}: CREATE TABLE does not create a table where a view has that name"
+    ))
 }
 
 /// [`WriteMode::Create`]'s refusal: `table` already exists, or another writer

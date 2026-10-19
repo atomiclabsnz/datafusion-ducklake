@@ -1,8 +1,8 @@
 #![cfg(all(feature = "write-sqlite", feature = "write"))]
 //! `WriteMode::Create`, the write of `CREATE TABLE … AS`: a table that exists is refused, and
 //! so is one another writer creates after this write began, inside the commit's own
-//! transaction. Each case runs with the rows inlined in the catalog and with them in Parquet,
-//! the two ways a write commits.
+//! transaction. A live view with the table's name is refused the same way. Each case runs
+//! with the rows inlined in the catalog and with them in Parquet, the two ways a write commits.
 
 use std::sync::Arc;
 
@@ -97,6 +97,30 @@ fn assert_exists(error: DuckLakeError) {
     );
 }
 
+/// Adds a live view named `{name}` to the schema of table `existing`, as another writer
+/// (official DuckLake) would. The same statement on every backend, so its columns go by
+/// position (`view_id, view_uuid, begin_snapshot, end_snapshot, schema_id, view_name,
+/// dialect, sql, column_aliases`): MySQL reserves `sql` and quotes names its own way.
+const ADD_VIEW: &str = "INSERT INTO ducklake_view
+     SELECT 1000, '00000000-0000-0000-0000-000000000001', MAX(snapshot_id), NULL,
+            (SELECT schema_id FROM ducklake_table
+             WHERE table_name = 'existing' AND end_snapshot IS NULL),
+            '{name}', 'duckdb', 'SELECT 1 AS id', ''
+     FROM ducklake_snapshot";
+
+fn add_view_sql(name: &str) -> String {
+    ADD_VIEW.replace("{name}", name)
+}
+
+async fn add_sqlite_view(temp: &TempDir, name: &str) {
+    let conn = format!("sqlite:{}", temp.path().join("catalog.db").display());
+    let pool = sqlx::SqlitePool::connect(&conn).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(add_view_sql(name)))
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_create_of_a_table_that_exists_is_refused_and_writes_nothing() {
     for inlining in [10, 0] {
@@ -136,6 +160,70 @@ async fn a_table_another_writer_creates_first_refuses_the_create_at_commit() {
             .unwrap();
         assert_exists(late.finish().await.unwrap_err());
         assert_eq!(names(&temp).await, ["first"], "inlining {inlining}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_another_writer_creates_first_refuses_the_create_at_commit() {
+    // The same race, with a view of the table's name: the commit refuses it, and the name
+    // stays the view's.
+    for inlining in [10, 0] {
+        let temp = TempDir::new().unwrap();
+        let writer = table_writer(&temp, inlining).await;
+        writer
+            .write_table("main", "existing", &[batch(1, "kept")])
+            .await
+            .unwrap();
+        let mut late = writer
+            .begin_write("main", "t", &schema(), WriteMode::Create)
+            .unwrap();
+        late.write_batch(&batch(9, "late")).unwrap();
+        add_sqlite_view(&temp, "t").await;
+        assert_exists(late.finish().await.unwrap_err());
+
+        let conn = format!("sqlite:{}", temp.path().join("catalog.db").display());
+        let provider = SqliteMetadataProvider::new(&conn).await.unwrap();
+        let catalog = DuckLakeCatalog::new(provider).unwrap();
+        let main = datafusion::catalog::CatalogProvider::schema(&catalog, "main").unwrap();
+        assert_eq!(
+            main.table_type("t").await.unwrap(),
+            Some(datafusion::logical_expr::TableType::View),
+            "inlining {inlining}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn register_table_over_a_view_is_refused_as_a_typed_error() {
+    let temp = TempDir::new().unwrap();
+    let writer = table_writer(&temp, 10).await;
+    writer
+        .write_table("main", "existing", &[batch(1, "kept")])
+        .await
+        .unwrap();
+    add_sqlite_view(&temp, "t").await;
+
+    let conn = format!("sqlite:{}", temp.path().join("catalog.db").display());
+    let provider = SqliteMetadataProvider::new(&conn).await.unwrap();
+    let metadata = SqliteMetadataWriter::new(&format!("{conn}?mode=rw"))
+        .await
+        .unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(metadata)).unwrap();
+    let main = datafusion::catalog::CatalogProvider::schema(&catalog, "main").unwrap();
+    let empty =
+        datafusion::datasource::MemTable::try_new(Arc::new(schema()), vec![vec![]]).unwrap();
+    let error = main
+        .register_table("t".to_string(), Arc::new(empty))
+        .expect_err("a view's name is not registered over");
+    match error {
+        datafusion::error::DataFusionError::External(error) => assert!(
+            matches!(
+                error.downcast_ref::<DuckLakeError>(),
+                Some(DuckLakeError::TableExists(_))
+            ),
+            "{error}"
+        ),
+        error => panic!("a view's name is refused as TableExists: {error:?}"),
     }
 }
 
@@ -188,10 +276,14 @@ async fn register_table_never_replaces_a_table() {
     assert_eq!(names(&temp).await, ["kept"]);
 }
 
-/// The three Create cases on a backend's own writer: a table that exists, a table another
-/// writer creates while this one is writing, and a new table. The commit's check is each
-/// backend's own code, so each runs it.
-async fn create_refusals(metadata: Arc<dyn MetadataWriter>) {
+/// The Create cases on a backend's own writer: a table that exists, a table another writer
+/// creates while this one is writing, and a new table. The commit's check is each backend's
+/// own code, so each runs it. `add_view`, when given, adds a view `viewed` ([`ADD_VIEW`]) on
+/// the backend, as another writer would while this one is writing.
+async fn create_refusals(
+    metadata: Arc<dyn MetadataWriter>,
+    add_view: Option<impl std::future::Future<Output = ()>>,
+) {
     let writer = DuckLakeTableWriter::new(metadata, Arc::new(LocalFileSystem::new())).unwrap();
     writer
         .write_table("main", "existing", &[batch(1, "kept")])
@@ -229,6 +321,15 @@ async fn create_refusals(metadata: Arc<dyn MetadataWriter>) {
         .await
         .unwrap();
     during.finish().await.unwrap();
+
+    if let Some(add_view) = add_view {
+        let mut late = writer
+            .begin_write("main", "viewed", &schema(), WriteMode::Create)
+            .unwrap();
+        late.write_batch(&batch(9, "late")).unwrap();
+        add_view.await;
+        assert_exists(late.finish().await.unwrap_err());
+    }
 }
 
 /// Where a test container's mapped ports answer: `TESTCONTAINERS_HOST_OVERRIDE` when set (a
@@ -258,7 +359,22 @@ async fn create_is_refused_on_duckdb_as_on_sqlite() {
     let writer =
         datafusion_ducklake::DuckdbMetadataWriter::new_with_init(path.to_str().unwrap()).unwrap();
     writer.set_data_path(&data_path(&temp)).unwrap();
-    create_refusals(Arc::new(writer)).await;
+    create_refusals(Arc::new(writer), None::<std::future::Ready<()>>).await;
+
+    // DuckDB allows one client per catalog file, so the view is added with the writer
+    // closed. Nothing but the commit checks for a view, so this runs that check.
+    let connection = duckdb::Connection::open(&path).unwrap();
+    connection.execute(&add_view_sql("viewed"), []).unwrap();
+    drop(connection);
+    let writer = datafusion_ducklake::DuckdbMetadataWriter::new(path.to_str().unwrap()).unwrap();
+    let writer =
+        DuckLakeTableWriter::new(Arc::new(writer), Arc::new(LocalFileSystem::new())).unwrap();
+    assert_exists(
+        writer
+            .create_table("main", "viewed", &[batch(1, "a")])
+            .await
+            .unwrap_err(),
+    );
 }
 
 #[cfg(feature = "write-mysql")]
@@ -279,7 +395,16 @@ async fn create_is_refused_on_mysql_as_on_sqlite() {
     .unwrap();
     let temp = TempDir::new().unwrap();
     writer.set_data_path(&data_path(&temp)).unwrap();
-    create_refusals(Arc::new(writer)).await;
+    let pool = sqlx::MySqlPool::connect(&format!("mysql://root@{host}:{port}/test"))
+        .await
+        .unwrap();
+    let add_view = async {
+        sqlx::query(sqlx::AssertSqlSafe(add_view_sql("viewed")))
+            .execute(&pool)
+            .await
+            .unwrap();
+    };
+    create_refusals(Arc::new(writer), Some(add_view)).await;
 }
 
 #[cfg(feature = "write-postgres")]
@@ -313,7 +438,16 @@ async fn create_is_refused_on_both_postgres_writers_as_on_sqlite() {
     .await
     .unwrap();
     single.set_data_path(&data_path(&temp)).unwrap();
-    create_refusals(Arc::new(single)).await;
+    let single_pool = sqlx::PgPool::connect(&format!("{base}/single"))
+        .await
+        .unwrap();
+    let add_view = async {
+        sqlx::query(sqlx::AssertSqlSafe(add_view_sql("viewed")))
+            .execute(&single_pool)
+            .await
+            .unwrap();
+    };
+    create_refusals(Arc::new(single), Some(add_view)).await;
 
     let pool = sqlx::PgPool::connect(&format!("{base}/multi"))
         .await
@@ -325,12 +459,18 @@ async fn create_is_refused_on_both_postgres_writers_as_on_sqlite() {
         .create_catalog("lake")
         .await
         .unwrap();
-    let multi = datafusion_ducklake::PostgresMetadataWriter::with_pool(pool, catalog_id)
+    let multi = datafusion_ducklake::PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
         .await
         .unwrap();
     let temp = TempDir::new().unwrap();
     multi.set_data_path(&data_path(&temp)).unwrap();
-    create_refusals(Arc::new(multi)).await;
+    let add_view = async {
+        sqlx::query(sqlx::AssertSqlSafe(add_view_sql("viewed")))
+            .execute(&pool)
+            .await
+            .unwrap();
+    };
+    create_refusals(Arc::new(multi), Some(add_view)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
