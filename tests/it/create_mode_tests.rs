@@ -321,3 +321,47 @@ async fn create_is_refused_on_both_postgres_writers_as_on_sqlite() {
     multi.set_data_path(&data_path(&temp)).unwrap();
     create_refusals(Arc::new(multi)).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_survives_an_unrelated_commit_during_its_write() {
+    // Another table's commit lands while this create writes: the new table is still this
+    // commit's, and a retry after a refusal is not refused for a row a failed write left.
+    for inlining in [10, 0] {
+        let temp = TempDir::new().unwrap();
+        let writer = table_writer(&temp, inlining).await;
+        let mut a = writer
+            .begin_write("main", "a", &schema(), WriteMode::Create)
+            .unwrap();
+        a.write_batch(&batch(1, "a")).unwrap();
+        writer
+            .create_table("main", "b", &[batch(2, "b")])
+            .await
+            .unwrap();
+        a.finish()
+            .await
+            .unwrap_or_else(|e| panic!("inlining {inlining}: {e:?}"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_of_a_table_that_exists_says_so_whatever_its_columns() {
+    // Refused as the table existing, not as a type change into it: the write's start
+    // refuses a create into a table with live columns before it compares them.
+    let temp = TempDir::new().unwrap();
+    let writer = table_writer(&temp, 10).await;
+    writer
+        .write_table("main", "t", &[batch(1, "kept")])
+        .await
+        .unwrap();
+    let other = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)])),
+        vec![Arc::new(StringArray::from(vec!["x"]))],
+    )
+    .unwrap();
+    assert_exists(
+        writer
+            .create_table("main", "t", &[other])
+            .await
+            .unwrap_err(),
+    );
+}

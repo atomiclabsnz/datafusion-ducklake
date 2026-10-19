@@ -69,6 +69,23 @@ pub enum WriteMode {
     Create,
 }
 
+/// [`WriteMode::Create`]'s check, at a write's start and again inside its commit:
+/// refused unless the table has no live columns yet. That is read in the caller's own
+/// transaction, so at the commit it is the catalog as this commit leaves it — a table
+/// another writer created and committed since this write began has columns, and a row
+/// a failed write left behind has none. (A snapshot guessed at the start is no test:
+/// any other commit in between changes the id this one gets.)
+pub(crate) fn refuse_create_into(
+    mode: WriteMode,
+    has_live_columns: bool,
+    table: impl std::fmt::Display,
+) -> Result<()> {
+    if mode == WriteMode::Create && has_live_columns {
+        return Err(table_exists_error(table));
+    }
+    Ok(())
+}
+
 /// [`WriteMode::Create`]'s refusal: `table` already exists, or another writer
 /// created it before this commit.
 pub(crate) fn table_exists_error(table: impl std::fmt::Display) -> DuckLakeError {

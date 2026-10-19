@@ -3201,15 +3201,11 @@ async fn finalize_table_snapshot(
             )
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    // `WriteMode::Create` commits only a table this commit created: one that
-    // existed, or that another writer created since this write began, is refused
-    // here, before the field-id check (a refusal to retry would be wrong advice:
-    // the table exists), inside the commit's own transaction.
-    if mode == WriteMode::Create && table_begin_snapshot != snapshot_id {
-        return Err(crate::metadata_writer::table_exists_error(format!(
-            "{schema_name}.{table_name}"
-        )));
-    }
+    crate::metadata_writer::refuse_create_into(
+        mode,
+        !current.is_empty(),
+        format!("{schema_name}.{table_name}"),
+    )?;
     let committed_ids = assign_column_ids(&proposed, &existing_catalog_columns, column_ids)?;
     if committed_ids != column_ids {
         return Err(crate::DuckLakeError::Conflict(
@@ -8037,6 +8033,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             // genuinely new column to be nullable (a Replace overwrites every row,
             // so a new non-nullable column is fine there).
             if !existing_catalog_columns.is_empty() {
+                // Refused here too, ahead of the type check, and before any file is written.
+                crate::metadata_writer::refuse_create_into(mode, true, format!("{schema_name}.{table_name}"))?;
                 use std::collections::HashMap;
 
                 let existing_map: HashMap<i64, &ExistingCatalogColumn> = existing_catalog_columns
