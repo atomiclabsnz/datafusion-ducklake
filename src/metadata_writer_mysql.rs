@@ -3261,7 +3261,8 @@ impl MySqlMetadataWriter {
         self.block_on(async {
             let schema_id: Option<i64> = sqlx::query_scalar(
                 "SELECT schema_id FROM ducklake_schema
-                 WHERE schema_name = ? AND end_snapshot IS NULL",
+                 WHERE schema_name = ? AND end_snapshot IS NULL
+                   AND begin_snapshot <> 9223372036854775807",
             )
             .bind(schema_name)
             .fetch_optional(&self.pool)
@@ -3270,7 +3271,8 @@ impl MySqlMetadataWriter {
                 Some(schema_id) => {
                     sqlx::query_scalar(
                         "SELECT table_id FROM ducklake_table
-                         WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
+                         WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL
+                   AND begin_snapshot <> 9223372036854775807",
                     )
                     .bind(schema_id)
                     .bind(table_name)
@@ -3633,7 +3635,8 @@ impl MetadataWriter for MySqlMetadataWriter {
             let mut tx = self.pool.begin().await?;
             let existing = sqlx::query(
                 "SELECT schema_id FROM ducklake_schema
-                 WHERE schema_name = ? AND end_snapshot IS NULL",
+                 WHERE schema_name = ? AND end_snapshot IS NULL
+                   AND begin_snapshot <> 9223372036854775807",
             )
             .bind(name)
             .fetch_optional(&mut *tx)
@@ -3680,7 +3683,8 @@ impl MetadataWriter for MySqlMetadataWriter {
             let mut tx = self.pool.begin().await?;
             let existing = sqlx::query(
                 "SELECT table_id FROM ducklake_table
-                 WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
+                 WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL
+                   AND begin_snapshot <> 9223372036854775807",
             )
             .bind(schema_id)
             .bind(name)
@@ -6331,7 +6335,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             let schema_id: i64 = {
                 let existing = sqlx::query(
                     "SELECT schema_id FROM ducklake_schema
-                     WHERE schema_name = ? AND end_snapshot IS NULL",
+                     WHERE schema_name = ? AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1",
                 )
                 .bind(schema_name)
                 .fetch_optional(&mut *tx)
@@ -6346,7 +6350,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     )
                     .bind(schema_name)
                     .bind(directory_path(schema_name))
-                    .bind(snapshot_id)
+                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                     .execute(&mut *tx)
                     .await?;
                     result.last_insert_id() as i64
@@ -6356,7 +6360,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             let table_id: i64 = {
                 let existing = sqlx::query(
                     "SELECT table_id FROM ducklake_table
-                     WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
+                     WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1",
                 )
                 .bind(schema_id)
                 .bind(table_name)
@@ -6373,7 +6377,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .bind(schema_id)
                     .bind(table_name)
                     .bind(directory_path(table_name))
-                    .bind(snapshot_id)
+                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                     .execute(&mut *tx)
                     .await?;
                     result.last_insert_id() as i64

@@ -3174,7 +3174,8 @@ impl DuckdbMetadataWriter {
         let schema_id: Option<i64> = conn
             .query_row(
                 "SELECT schema_id FROM ducklake_schema
-                 WHERE schema_name = ? AND end_snapshot IS NULL",
+                 WHERE schema_name = ? AND end_snapshot IS NULL
+                   AND begin_snapshot <> 9223372036854775807",
                 params![schema_name],
                 |row| row.get(0),
             )
@@ -3183,7 +3184,8 @@ impl DuckdbMetadataWriter {
             Some(schema_id) => conn
                 .query_row(
                     "SELECT table_id FROM ducklake_table
-                     WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
+                     WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL
+                   AND begin_snapshot <> 9223372036854775807",
                     params![schema_id, table_name],
                     |row| row.get(0),
                 )
@@ -3507,7 +3509,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let existing: Option<i64> = tx
             .query_row(
                 "SELECT schema_id FROM ducklake_schema
-                 WHERE schema_name = ? AND end_snapshot IS NULL",
+                 WHERE schema_name = ? AND end_snapshot IS NULL
+                   AND begin_snapshot <> 9223372036854775807",
                 params![name],
                 |row| row.get(0),
             )
@@ -3549,7 +3552,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let existing: Option<i64> = tx
             .query_row(
                 "SELECT table_id FROM ducklake_table
-                 WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
+                 WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL
+                   AND begin_snapshot <> 9223372036854775807",
                 params![schema_id, name],
                 |row| row.get(0),
             )
@@ -5689,7 +5693,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             let existing: Option<i64> = tx
                 .query_row(
                     "SELECT schema_id FROM ducklake_schema
-                     WHERE schema_name = ? AND end_snapshot IS NULL",
+                     WHERE schema_name = ? AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1",
                     params![schema_name],
                     |row| row.get(0),
                 )
@@ -5699,7 +5703,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 None => tx.query_row(
                     "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
                      VALUES (?, ?, true, ?) RETURNING schema_id",
-                    params![schema_name, directory_path(schema_name), snapshot_id],
+                    params![schema_name, directory_path(schema_name), crate::metadata_writer::PENDING_SNAPSHOT],
                     |row| row.get(0),
                 )?,
             }
@@ -5709,7 +5713,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             let existing: Option<i64> = tx
                 .query_row(
                     "SELECT table_id FROM ducklake_table
-                     WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
+                     WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1",
                     params![schema_id, table_name],
                     |row| row.get(0),
                 )
@@ -5719,7 +5723,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 None => tx.query_row(
                     "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
                      VALUES (?, ?, ?, true, ?) RETURNING table_id",
-                    params![schema_id, table_name, directory_path(table_name), snapshot_id],
+                    params![schema_id, table_name, directory_path(table_name), crate::metadata_writer::PENDING_SNAPSHOT],
                     |row| row.get(0),
                 )?,
             }

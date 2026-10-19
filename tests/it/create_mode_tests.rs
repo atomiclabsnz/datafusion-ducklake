@@ -359,7 +359,15 @@ async fn create_is_refused_on_duckdb_as_on_sqlite() {
     let writer =
         datafusion_ducklake::DuckdbMetadataWriter::new_with_init(path.to_str().unwrap()).unwrap();
     writer.set_data_path(&data_path(&temp)).unwrap();
-    create_refusals(Arc::new(writer), None::<std::future::Ready<()>>).await;
+    let writer: Arc<dyn MetadataWriter> = Arc::new(writer);
+    create_refusals(Arc::clone(&writer), None::<std::future::Ready<()>>).await;
+    abandon_a_write_then_commit(writer).await;
+    let connection = duckdb::Connection::open(&path).unwrap();
+    let column_less: i64 = connection
+        .query_row(VISIBLE_COLUMN_LESS, [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(column_less, 0, "an abandoned write publishes no table");
+    drop(connection);
 
     // DuckDB allows one client per catalog file, so the view is added with the writer
     // closed. Nothing but the commit checks for a view, so this runs that check.
@@ -404,7 +412,14 @@ async fn create_is_refused_on_mysql_as_on_sqlite() {
             .await
             .unwrap();
     };
-    create_refusals(Arc::new(writer), Some(add_view)).await;
+    let writer: Arc<dyn MetadataWriter> = Arc::new(writer);
+    create_refusals(Arc::clone(&writer), Some(add_view)).await;
+    abandon_a_write_then_commit(writer).await;
+    let column_less: i64 = sqlx::query_scalar(VISIBLE_COLUMN_LESS)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(column_less, 0, "an abandoned write publishes no table");
 }
 
 #[cfg(feature = "write-postgres")]
@@ -447,7 +462,20 @@ async fn create_is_refused_on_both_postgres_writers_as_on_sqlite() {
             .await
             .unwrap();
     };
-    create_refusals(Arc::new(single), Some(add_view)).await;
+    let single: Arc<dyn MetadataWriter> = Arc::new(single);
+    create_refusals(Arc::clone(&single), Some(add_view)).await;
+    abandon_a_write_then_commit(single).await;
+    let single_pool = sqlx::PgPool::connect(&format!("{base}/single"))
+        .await
+        .unwrap();
+    let column_less: i64 = sqlx::query_scalar(VISIBLE_COLUMN_LESS)
+        .fetch_one(&single_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        column_less, 0,
+        "single-catalog: an abandoned write publishes no table"
+    );
 
     let pool = sqlx::PgPool::connect(&format!("{base}/multi"))
         .await
@@ -470,7 +498,17 @@ async fn create_is_refused_on_both_postgres_writers_as_on_sqlite() {
             .await
             .unwrap();
     };
-    create_refusals(Arc::new(multi), Some(add_view)).await;
+    let multi: Arc<dyn MetadataWriter> = Arc::new(multi);
+    create_refusals(Arc::clone(&multi), Some(add_view)).await;
+    abandon_a_write_then_commit(multi).await;
+    let column_less: i64 = sqlx::query_scalar(VISIBLE_COLUMN_LESS)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        column_less, 0,
+        "multi-catalog: an abandoned write publishes no table"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -530,21 +568,39 @@ async fn a_create_of_a_table_that_exists_says_so_whatever_its_columns() {
     );
 }
 
+/// [`column_less_tables`]'s count, in SQL every backend takes.
+const VISIBLE_COLUMN_LESS: &str = "SELECT count(*) FROM ducklake_table t \
+     WHERE t.end_snapshot IS NULL \
+     AND t.begin_snapshot <= (SELECT MAX(snapshot_id) FROM ducklake_snapshot) \
+     AND NOT EXISTS (SELECT 1 FROM ducklake_column c \
+                     WHERE c.table_id = t.table_id AND c.end_snapshot IS NULL)";
+
+/// A write that begins and never commits — a tab closed mid-write — and then another table's
+/// commit, which takes the snapshot the abandoned write's start expected to.
+async fn abandon_a_write_then_commit(metadata: Arc<dyn MetadataWriter>) {
+    let writer = DuckLakeTableWriter::new(metadata, Arc::new(LocalFileSystem::new())).unwrap();
+    {
+        let mut abandoned = writer
+            .begin_write("main", "abandoned", &schema(), WriteMode::Append)
+            .unwrap();
+        abandoned.write_batch(&batch(1, "lost")).unwrap();
+    }
+    writer
+        .create_table("main", "after", &[batch(2, "after")])
+        .await
+        .unwrap();
+}
+
 /// Tables a reader sees at the current snapshot that have no live columns: what DuckDB
 /// refuses to load a lake over ("Table entry ... does not have any columns"). A row no snapshot
 /// reaches yet is no reader's, so it is not counted.
 async fn column_less_tables(temp: &TempDir) -> i64 {
     let conn = format!("sqlite:{}", temp.path().join("catalog.db").display());
     let pool = sqlx::SqlitePool::connect(&conn).await.unwrap();
-    sqlx::query_scalar(
-        "SELECT count(*) FROM ducklake_table t WHERE t.end_snapshot IS NULL \
-         AND t.begin_snapshot <= (SELECT MAX(snapshot_id) FROM ducklake_snapshot) \
-         AND NOT EXISTS (SELECT 1 FROM ducklake_column c \
-                         WHERE c.table_id = t.table_id AND c.end_snapshot IS NULL)",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap()
+    sqlx::query_scalar(VISIBLE_COLUMN_LESS)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -571,4 +627,19 @@ async fn a_refused_create_leaves_no_table_for_the_next_commit_to_publish() {
             .unwrap();
         assert_eq!(column_less_tables(&temp).await, 0, "inlining {inlining}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_write_leaves_no_table_for_the_next_commit_to_publish() {
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let conn = format!(
+        "sqlite:{}?mode=rwc",
+        temp.path().join("catalog.db").display()
+    );
+    let writer = SqliteMetadataWriter::new_with_init(&conn).await.unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    abandon_a_write_then_commit(Arc::new(writer)).await;
+    assert_eq!(column_less_tables(&temp).await, 0);
 }
