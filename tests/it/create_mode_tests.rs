@@ -529,3 +529,46 @@ async fn a_create_of_a_table_that_exists_says_so_whatever_its_columns() {
             .unwrap_err(),
     );
 }
+
+/// Tables a reader sees at the current snapshot that have no live columns: what DuckDB
+/// refuses to load a lake over ("Table entry ... does not have any columns"). A row no snapshot
+/// reaches yet is no reader's, so it is not counted.
+async fn column_less_tables(temp: &TempDir) -> i64 {
+    let conn = format!("sqlite:{}", temp.path().join("catalog.db").display());
+    let pool = sqlx::SqlitePool::connect(&conn).await.unwrap();
+    sqlx::query_scalar(
+        "SELECT count(*) FROM ducklake_table t WHERE t.end_snapshot IS NULL \
+         AND t.begin_snapshot <= (SELECT MAX(snapshot_id) FROM ducklake_snapshot) \
+         AND NOT EXISTS (SELECT 1 FROM ducklake_column c \
+                         WHERE c.table_id = t.table_id AND c.end_snapshot IS NULL)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_create_leaves_no_table_for_the_next_commit_to_publish() {
+    // A write's start used to insert the table's row, stamped with a guessed snapshot; a
+    // refused commit left it, and the next commit, taking that snapshot, published a table
+    // with no columns, which DuckDB will not open a lake over. The row is the commit's now.
+    for inlining in [10, 0] {
+        let temp = TempDir::new().unwrap();
+        let writer = table_writer(&temp, inlining).await;
+        writer
+            .write_table("main", "existing", &[batch(1, "kept")])
+            .await
+            .unwrap();
+        let mut late = writer
+            .begin_write("main", "t", &schema(), WriteMode::Create)
+            .unwrap();
+        late.write_batch(&batch(9, "late")).unwrap();
+        add_sqlite_view(&temp, "t").await;
+        assert_exists(late.finish().await.unwrap_err());
+        writer
+            .create_table("main", "next", &[batch(2, "next")])
+            .await
+            .unwrap();
+        assert_eq!(column_less_tables(&temp).await, 0, "inlining {inlining}");
+    }
+}

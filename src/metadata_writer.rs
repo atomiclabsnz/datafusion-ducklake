@@ -70,6 +70,16 @@ pub enum WriteMode {
     Create,
 }
 
+/// The `begin_snapshot` of a schema or table row a write's start creates, until its commit
+/// stamps the snapshot it commits. No snapshot is at or past it, so a pending row is no
+/// reader's — DuckDB's included — and a write that never commits leaves a row no reader ever
+/// sees, which a retry of the write takes up again. (A start that stamped the snapshot it
+/// guessed it would commit left a table with no columns whenever it did not commit, and the
+/// next commit to take that snapshot published it: DuckDB will not open such a lake.)
+pub(crate) const PENDING_SNAPSHOT: i64 = i64::MAX;
+// Spelled as a literal in SQL that excludes pending rows (`begin_snapshot <> …`).
+const _: () = assert!(PENDING_SNAPSHOT == 9_223_372_036_854_775_807);
+
 /// [`WriteMode::Create`]'s check, at a write's start and again inside its commit:
 /// refused unless the table has no live columns yet. That is read in the caller's own
 /// transaction, so at the commit it is the catalog as this commit leaves it — a table
