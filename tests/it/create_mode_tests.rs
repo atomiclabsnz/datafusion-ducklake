@@ -218,6 +218,17 @@ async fn create_refusals(metadata: Arc<dyn MetadataWriter>) {
         .create_table("main", "fresh", &[batch(1, "a")])
         .await
         .unwrap();
+
+    // Another table's commit lands mid-write: the new table is still this commit's.
+    let mut during = writer
+        .begin_write("main", "during", &schema(), WriteMode::Create)
+        .unwrap();
+    during.write_batch(&batch(1, "a")).unwrap();
+    writer
+        .create_table("main", "between", &[batch(2, "b")])
+        .await
+        .unwrap();
+    during.finish().await.unwrap();
 }
 
 /// Where a test container's mapped ports answer: `TESTCONTAINERS_HOST_OVERRIDE` when set (a
