@@ -336,7 +336,7 @@ async fn create_is_refused_on_both_postgres_writers_as_on_sqlite() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_create_survives_an_unrelated_commit_during_its_write() {
     // Another table's commit lands while this create writes: the new table is still this
-    // commit's, and a retry after a refusal is not refused for a row a failed write left.
+    // commit's, with its row.
     for inlining in [10, 0] {
         let temp = TempDir::new().unwrap();
         let writer = table_writer(&temp, inlining).await;
@@ -351,6 +351,19 @@ async fn a_create_survives_an_unrelated_commit_during_its_write() {
         a.finish()
             .await
             .unwrap_or_else(|e| panic!("inlining {inlining}: {e:?}"));
+        let conn = format!("sqlite:{}", temp.path().join("catalog.db").display());
+        let provider = SqliteMetadataProvider::new(&conn).await.unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_catalog("lake", Arc::new(DuckLakeCatalog::new(provider).unwrap()));
+        let rows = ctx
+            .sql("SELECT name FROM lake.main.a")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let count: usize = rows.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(count, 1, "inlining {inlining}: table a reads back its row");
     }
 }
 
