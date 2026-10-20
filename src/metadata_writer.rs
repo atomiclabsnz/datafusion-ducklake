@@ -98,6 +98,15 @@ pub(crate) fn refuse_create_into(
     Ok(())
 }
 
+/// Whether a write commits the making of its table, and so is refused a live view of the
+/// table's name ([`view_exists_error`]): [`WriteMode::Create`], or any mode on a table with no
+/// live columns yet. A table row with none is no table to a reader (DuckDB will not load a
+/// lake over one), whether this write's start made it or an older write left it. A write
+/// into a table that has columns is not asked: a table never stands beside a view.
+pub(crate) fn makes_table(mode: WriteMode, has_live_columns: bool) -> bool {
+    mode == WriteMode::Create || !has_live_columns
+}
+
 /// The refusal of a write that would make a table where a live view has its name, checked
 /// inside the commit, in every mode.
 pub(crate) fn view_exists_error(table: impl std::fmt::Display) -> DuckLakeError {

@@ -3387,10 +3387,9 @@ async fn finalize_table_snapshot(
         !table_was_created,
         format!("{schema_name}.{table_name}"),
     )?;
-    // A write that makes the table (`WriteMode::Create`, or any mode on a table with no
-    // live columns yet) refuses a live view of its name, read here so one another writer
-    // created since this write began is refused too: a table never stands beside a view.
-    if mode == WriteMode::Create || table_was_created {
+    // A write that makes the table refuses a live view of its name, read here so one another
+    // writer created since this write began is refused too.
+    if crate::metadata_writer::makes_table(mode, !existing_column_rows.is_empty()) {
         // A catalog from before views has no `ducklake_view`, and so no view.
         let views: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_catalog.pg_class WHERE oid = to_regclass('ducklake_view')",

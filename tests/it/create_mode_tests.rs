@@ -98,11 +98,15 @@ fn assert_exists(error: DuckLakeError) {
     );
 }
 
-fn assert_view_exists(error: DuckLakeError) {
-    assert!(
-        matches!(error, DuckLakeError::ViewExists(_)),
-        "a table made where a view has its name is ViewExists: {error:?}"
-    );
+/// `error` is [`DuckLakeError::ViewExists`], naming the view `name` (`schema.view`).
+fn assert_view_exists(error: DuckLakeError, name: &str) {
+    match &error {
+        DuckLakeError::ViewExists(message) => assert!(
+            message.starts_with(&format!("{name}:")),
+            "the refusal names the view {name}: {message}"
+        ),
+        _ => panic!("a table made where a view has its name is ViewExists: {error:?}"),
+    }
 }
 
 /// Adds a live view named `{name}` to the schema of table `existing`, as another writer
@@ -187,7 +191,7 @@ async fn a_view_another_writer_creates_first_refuses_the_create_at_commit() {
             .unwrap();
         late.write_batch(&batch(9, "late")).unwrap();
         add_sqlite_view(&temp, "t").await;
-        assert_view_exists(late.finish().await.unwrap_err());
+        assert_view_exists(late.finish().await.unwrap_err(), "main.t");
 
         let conn = format!("sqlite:{}", temp.path().join("catalog.db").display());
         let provider = SqliteMetadataProvider::new(&conn).await.unwrap();
@@ -216,7 +220,7 @@ async fn a_replace_or_append_that_would_make_a_table_beside_a_view_is_refused_at
             let mut late = writer.begin_write("main", "t", &schema(), mode).unwrap();
             late.write_batch(&batch(9, "late")).unwrap();
             add_sqlite_view(&temp, "t").await;
-            assert_view_exists(late.finish().await.unwrap_err());
+            assert_view_exists(late.finish().await.unwrap_err(), "main.t");
             writer
                 .create_table("main", "next", &[batch(2, "next")])
                 .await
@@ -243,14 +247,20 @@ async fn a_replace_or_append_that_would_make_a_table_beside_a_view_is_refused_at
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replace_of_a_table_that_exists_is_not_refused_as_a_view() {
     // The view check is the write that makes the table's: replacing and appending into a
-    // table that exists are not asked it.
+    // table that exists are not asked it, even with a view of its name beside it (a catalog
+    // another writer left so).
     for inlining in [10, 0] {
         let temp = TempDir::new().unwrap();
         let writer = table_writer(&temp, inlining).await;
         writer
+            .write_table("main", "existing", &[batch(0, "kept")])
+            .await
+            .unwrap();
+        writer
             .write_table("main", "t", &[batch(1, "a")])
             .await
             .unwrap();
+        add_sqlite_view(&temp, "t").await;
         writer
             .write_table("main", "t", &[batch(2, "b")])
             .await
@@ -404,7 +414,7 @@ async fn create_refusals(
         });
         add_view.await;
         for late in writes {
-            assert_view_exists(late.finish().await.unwrap_err());
+            assert_view_exists(late.finish().await.unwrap_err(), "main.viewed");
         }
     }
 }
@@ -459,18 +469,21 @@ async fn create_is_refused_on_duckdb_as_on_sqlite() {
             .create_table("main", "viewed", &[batch(1, "a")])
             .await
             .unwrap_err(),
+        "main.viewed",
     );
     assert_view_exists(
         writer
             .write_table("main", "viewed", &[batch(1, "a")])
             .await
             .unwrap_err(),
+        "main.viewed",
     );
     assert_view_exists(
         writer
             .append_table("main", "viewed", &[batch(1, "a")])
             .await
             .unwrap_err(),
+        "main.viewed",
     );
 }
 
@@ -712,7 +725,7 @@ async fn a_refused_create_leaves_no_table_for_the_next_commit_to_publish() {
             .unwrap();
         late.write_batch(&batch(9, "late")).unwrap();
         add_sqlite_view(&temp, "t").await;
-        assert_view_exists(late.finish().await.unwrap_err());
+        assert_view_exists(late.finish().await.unwrap_err(), "main.t");
         writer
             .create_table("main", "next", &[batch(2, "next")])
             .await

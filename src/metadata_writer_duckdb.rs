@@ -2289,10 +2289,9 @@ fn finalize_table_snapshot(
         !current.is_empty(),
         format!("table {table_id}"),
     )?;
-    // A write that makes the table (`WriteMode::Create`, or any mode on a table with no
-    // live columns yet) refuses a live view of its name, read here so one another writer
-    // created since this write began is refused too: a table never stands beside a view.
-    if mode == WriteMode::Create || current.is_empty() {
+    // A write that makes the table refuses a live view of its name, read here so one another
+    // writer created since this write began is refused too.
+    if crate::metadata_writer::makes_table(mode, !current.is_empty()) {
         // A catalog from before views has no `ducklake_view`, and so no view.
         let views: i64 = tx.query_row(
             "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'ducklake_view'",
@@ -2303,20 +2302,21 @@ fn finalize_table_snapshot(
             None
         } else {
             tx.query_row(
-                "SELECT 1 FROM ducklake_view view_meta
+                "SELECT schema_meta.schema_name, view_meta.view_name FROM ducklake_view view_meta
                  JOIN ducklake_table table_meta ON table_meta.schema_id = view_meta.schema_id
+                 JOIN ducklake_schema schema_meta ON schema_meta.schema_id = view_meta.schema_id
                  WHERE table_meta.table_id = ? AND table_meta.end_snapshot IS NULL
                    AND view_meta.view_name = table_meta.table_name
                    AND view_meta.end_snapshot IS NULL
                  LIMIT 1",
                 params![table_id],
-                |_| Ok(()),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
         };
-        if live_view.is_some() {
+        if let Some((schema_name, view_name)) = live_view {
             return Err(crate::metadata_writer::view_exists_error(format!(
-                "table {table_id}"
+                "{schema_name}.{view_name}"
             )));
         }
     }
