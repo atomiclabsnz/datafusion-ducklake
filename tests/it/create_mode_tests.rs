@@ -1,7 +1,8 @@
 #![cfg(all(feature = "write-sqlite", feature = "write"))]
 //! `WriteMode::Create`, the write of `CREATE TABLE … AS`: a table that exists is refused, and
 //! so is one another writer creates after this write began, inside the commit's own
-//! transaction. A live view with the table's name is refused the same way. Each case runs
+//! transaction. A live view with the table's name is refused (`ViewExists`), in every mode
+//! that would make the table. Each case runs
 //! with the rows inlined in the catalog and with them in Parquet, the two ways a write commits.
 
 use std::sync::Arc;
@@ -97,6 +98,13 @@ fn assert_exists(error: DuckLakeError) {
     );
 }
 
+fn assert_view_exists(error: DuckLakeError) {
+    assert!(
+        matches!(error, DuckLakeError::ViewExists(_)),
+        "a table made where a view has its name is ViewExists: {error:?}"
+    );
+}
+
 /// Adds a live view named `{name}` to the schema of table `existing`, as another writer
 /// (official DuckLake) would. The same statement on every backend, so its columns go by
 /// position (`view_id, view_uuid, begin_snapshot, end_snapshot, schema_id, view_name,
@@ -179,7 +187,7 @@ async fn a_view_another_writer_creates_first_refuses_the_create_at_commit() {
             .unwrap();
         late.write_batch(&batch(9, "late")).unwrap();
         add_sqlite_view(&temp, "t").await;
-        assert_exists(late.finish().await.unwrap_err());
+        assert_view_exists(late.finish().await.unwrap_err());
 
         let conn = format!("sqlite:{}", temp.path().join("catalog.db").display());
         let provider = SqliteMetadataProvider::new(&conn).await.unwrap();
@@ -190,6 +198,68 @@ async fn a_view_another_writer_creates_first_refuses_the_create_at_commit() {
             Some(datafusion::logical_expr::TableType::View),
             "inlining {inlining}"
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replace_or_append_that_would_make_a_table_beside_a_view_is_refused_at_commit() {
+    // `CREATE OR REPLACE TABLE` writes Replace, and an INSERT into a table it found absent
+    // Append: neither makes a table where a view created since has the name.
+    for mode in [WriteMode::Replace, WriteMode::Append] {
+        for inlining in [10, 0] {
+            let temp = TempDir::new().unwrap();
+            let writer = table_writer(&temp, inlining).await;
+            writer
+                .write_table("main", "existing", &[batch(1, "kept")])
+                .await
+                .unwrap();
+            let mut late = writer.begin_write("main", "t", &schema(), mode).unwrap();
+            late.write_batch(&batch(9, "late")).unwrap();
+            add_sqlite_view(&temp, "t").await;
+            assert_view_exists(late.finish().await.unwrap_err());
+            writer
+                .create_table("main", "next", &[batch(2, "next")])
+                .await
+                .unwrap();
+            assert_eq!(
+                column_less_tables(&temp).await,
+                0,
+                "{mode:?} inlining {inlining}"
+            );
+
+            let conn = format!("sqlite:{}", temp.path().join("catalog.db").display());
+            let provider = SqliteMetadataProvider::new(&conn).await.unwrap();
+            let catalog = DuckLakeCatalog::new(provider).unwrap();
+            let main = datafusion::catalog::CatalogProvider::schema(&catalog, "main").unwrap();
+            assert_eq!(
+                main.table_type("t").await.unwrap(),
+                Some(datafusion::logical_expr::TableType::View),
+                "{mode:?} inlining {inlining}: the name stays the view's"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replace_of_a_table_that_exists_is_not_refused_as_a_view() {
+    // The view check is the write that makes the table's: replacing and appending into a
+    // table that exists are not asked it.
+    for inlining in [10, 0] {
+        let temp = TempDir::new().unwrap();
+        let writer = table_writer(&temp, inlining).await;
+        writer
+            .write_table("main", "t", &[batch(1, "a")])
+            .await
+            .unwrap();
+        writer
+            .write_table("main", "t", &[batch(2, "b")])
+            .await
+            .unwrap();
+        writer
+            .append_table("main", "t", &[batch(3, "c")])
+            .await
+            .unwrap();
+        assert_eq!(names(&temp).await, ["b", "c"], "inlining {inlining}");
     }
 }
 
@@ -219,11 +289,11 @@ async fn register_table_over_a_view_is_refused_as_a_typed_error() {
         datafusion::error::DataFusionError::External(error) => assert!(
             matches!(
                 error.downcast_ref::<DuckLakeError>(),
-                Some(DuckLakeError::TableExists(_))
+                Some(DuckLakeError::ViewExists(_))
             ),
             "{error}"
         ),
-        error => panic!("a view's name is refused as TableExists: {error:?}"),
+        error => panic!("a view's name is refused as ViewExists: {error:?}"),
     }
 }
 
@@ -323,12 +393,19 @@ async fn create_refusals(
     during.finish().await.unwrap();
 
     if let Some(add_view) = add_view {
-        let mut late = writer
-            .begin_write("main", "viewed", &schema(), WriteMode::Create)
-            .unwrap();
-        late.write_batch(&batch(9, "late")).unwrap();
+        // A Create, and a Replace or Append that would make the table, all begun before
+        // the view: each commit refuses it.
+        let writes = [WriteMode::Create, WriteMode::Replace, WriteMode::Append].map(|mode| {
+            let mut late = writer
+                .begin_write("main", "viewed", &schema(), mode)
+                .unwrap();
+            late.write_batch(&batch(9, "late")).unwrap();
+            late
+        });
         add_view.await;
-        assert_exists(late.finish().await.unwrap_err());
+        for late in writes {
+            assert_view_exists(late.finish().await.unwrap_err());
+        }
     }
 }
 
@@ -377,9 +454,21 @@ async fn create_is_refused_on_duckdb_as_on_sqlite() {
     let writer = datafusion_ducklake::DuckdbMetadataWriter::new(path.to_str().unwrap()).unwrap();
     let writer =
         DuckLakeTableWriter::new(Arc::new(writer), Arc::new(LocalFileSystem::new())).unwrap();
-    assert_exists(
+    assert_view_exists(
         writer
             .create_table("main", "viewed", &[batch(1, "a")])
+            .await
+            .unwrap_err(),
+    );
+    assert_view_exists(
+        writer
+            .write_table("main", "viewed", &[batch(1, "a")])
+            .await
+            .unwrap_err(),
+    );
+    assert_view_exists(
+        writer
+            .append_table("main", "viewed", &[batch(1, "a")])
             .await
             .unwrap_err(),
     );
@@ -623,7 +712,7 @@ async fn a_refused_create_leaves_no_table_for_the_next_commit_to_publish() {
             .unwrap();
         late.write_batch(&batch(9, "late")).unwrap();
         add_sqlite_view(&temp, "t").await;
-        assert_exists(late.finish().await.unwrap_err());
+        assert_view_exists(late.finish().await.unwrap_err());
         writer
             .create_table("main", "next", &[batch(2, "next")])
             .await

@@ -2177,9 +2177,10 @@ async fn finalize_table_snapshot(
         !current.is_empty(),
         format!("table {table_id}"),
     )?;
-    // `WriteMode::Create` also refuses a live view of the table's name, read here so one
-    // another writer created since this write began is refused too.
-    if mode == WriteMode::Create {
+    // A write that makes the table (`WriteMode::Create`, or any mode on a table with no
+    // live columns yet) refuses a live view of its name, read here so one another writer
+    // created since this write began is refused too: a table never stands beside a view.
+    if mode == WriteMode::Create || current.is_empty() {
         // A catalog from before views has no `ducklake_view`, and so no view.
         let views: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM information_schema.tables

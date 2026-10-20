@@ -110,10 +110,16 @@ pub enum DuckLakeError {
     TableNotFound(String),
 
     /// A [`WriteMode::Create`](crate::metadata_writer::WriteMode::Create) write met
-    /// a table that exists, or that another writer created before it committed, or
-    /// a live view with the table's name.
+    /// a table that exists, or that another writer created before it committed.
     #[error("Table already exists: {0}")]
     TableExists(String),
+
+    /// A write that would make a table met a live view with the table's name, there
+    /// before it began or created by another writer before it committed. The view is
+    /// left as it is, whatever the write's mode: a table never stands beside a view of
+    /// its name.
+    #[error("A view has that name: {0}")]
+    ViewExists(String),
 
     /// Invalid snapshot
     #[error("Invalid snapshot: {0}")]
