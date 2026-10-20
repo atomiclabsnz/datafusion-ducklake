@@ -212,6 +212,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A write that never committed (refused, failed, or abandoned) no longer leaves a column-less table
+  for the next commit to publish, which DuckDB refuses to open a lake over (SQLite, DuckDB, MySQL).
 - A streaming write with no tokio runtime on its thread uploads its rolled files itself instead
   of failing at `finish` with "uploading data files requires a tokio runtime".
 - Inserts order rows by `SET SORTED BY` as official does: inlined rows too, and with
