@@ -1430,7 +1430,9 @@ impl DuckLakeTableWriter {
     /// Create a table with these rows in one snapshot, as `CREATE TABLE … AS`
     /// does ([`WriteMode::Create`]): refused with
     /// [`DuckLakeError::TableExists`](crate::DuckLakeError::TableExists) when the
-    /// table exists, or when another writer creates it before this commit.
+    /// table exists, or when another writer creates it before this commit, and with
+    /// [`DuckLakeError::ViewExists`](crate::DuckLakeError::ViewExists) when a view
+    /// has its name.
     pub async fn create_table(
         &self,
         schema_name: &str,

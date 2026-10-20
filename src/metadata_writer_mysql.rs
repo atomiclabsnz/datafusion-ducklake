@@ -2177,9 +2177,9 @@ async fn finalize_table_snapshot(
         !current.is_empty(),
         format!("table {table_id}"),
     )?;
-    // `WriteMode::Create` also refuses a live view of the table's name, read here so one
-    // another writer created since this write began is refused too.
-    if mode == WriteMode::Create {
+    // A write that makes the table refuses a live view of its name, read here so one another
+    // writer created since this write began is refused too.
+    if crate::metadata_writer::makes_table(mode, !current.is_empty()) {
         // A catalog from before views has no `ducklake_view`, and so no view.
         let views: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM information_schema.tables
@@ -2189,8 +2189,9 @@ async fn finalize_table_snapshot(
         .await?;
         let live_view = if views > 0 {
             sqlx::query(
-                "SELECT 1 FROM ducklake_view view_meta
+                "SELECT schema_meta.schema_name, view_meta.view_name FROM ducklake_view view_meta
                  JOIN ducklake_table table_meta ON table_meta.schema_id = view_meta.schema_id
+                 JOIN ducklake_schema schema_meta ON schema_meta.schema_id = view_meta.schema_id
                  WHERE table_meta.table_id = ? AND table_meta.end_snapshot IS NULL
                    AND view_meta.view_name = table_meta.table_name
                    AND view_meta.end_snapshot IS NULL
@@ -2202,9 +2203,11 @@ async fn finalize_table_snapshot(
         } else {
             None
         };
-        if live_view.is_some() {
+        if let Some(row) = live_view {
+            let schema_name: String = row.try_get(0)?;
+            let view_name: String = row.try_get(1)?;
             return Err(crate::metadata_writer::view_exists_error(format!(
-                "table {table_id}"
+                "{schema_name}.{view_name}"
             )));
         }
     }
