@@ -767,3 +767,35 @@ async fn dropping_a_table_that_is_only_pending_drops_nothing() {
         "a pending table is no table to drop"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_table_taken_up_gets_the_path_it_is_created_with() {
+    let temp = TempDir::new().unwrap();
+    let (metadata, writer) = sqlite_writers(&temp).await;
+    {
+        let mut abandoned = writer
+            .begin_write("main", "p", &schema(), WriteMode::Append)
+            .unwrap();
+        abandoned.write_batch(&batch(1, "lost")).unwrap();
+    }
+    let snapshot = metadata.create_snapshot().unwrap();
+    let (main, _) = metadata
+        .get_or_create_schema("main", None, snapshot)
+        .unwrap();
+    let (_, created) = metadata
+        .get_or_create_table(main, "p", Some("custom"), snapshot)
+        .unwrap();
+    assert!(created);
+    let conn = format!("sqlite:{}", temp.path().join("catalog.db").display());
+    let pool = sqlx::SqlitePool::connect(&conn).await.unwrap();
+    let path: String = sqlx::query_scalar(
+        "SELECT path FROM ducklake_table WHERE table_name = 'p' AND end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        path, "custom/",
+        "the take-up records the path it is created with"
+    );
+}

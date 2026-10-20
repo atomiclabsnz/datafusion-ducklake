@@ -2328,16 +2328,28 @@ fn finalize_table_snapshot(
     }
 
     // A row the write's start made is pending until here: it takes this commit's snapshot.
-    tx.execute(
-        "UPDATE ducklake_schema SET begin_snapshot = ?
-         WHERE begin_snapshot = ?
-           AND schema_id = (SELECT schema_id FROM ducklake_table WHERE table_id = ?)",
-        params![snapshot_id, crate::metadata_writer::PENDING_SNAPSHOT, table_id],
+    // Read once from the table's live row (a renamed table has ended versions under the same
+    // id), and updated only when pending, so an append to a committed table pays nothing.
+    let pending = crate::metadata_writer::PENDING_SNAPSHOT;
+    let (schema_id, schema_begin, table_begin): (i64, i64, i64) = tx.query_row(
+        "SELECT t.schema_id, s.begin_snapshot, t.begin_snapshot
+         FROM ducklake_table t JOIN ducklake_schema s ON s.schema_id = t.schema_id
+         WHERE t.table_id = ? AND t.end_snapshot IS NULL AND s.end_snapshot IS NULL",
+        params![table_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    tx.execute(
-        "UPDATE ducklake_table SET begin_snapshot = ? WHERE table_id = ? AND begin_snapshot = ?",
-        params![snapshot_id, table_id, crate::metadata_writer::PENDING_SNAPSHOT],
-    )?;
+    if schema_begin == pending {
+        tx.execute(
+            "UPDATE ducklake_schema SET begin_snapshot = ? WHERE schema_id = ? AND begin_snapshot = ?",
+            params![snapshot_id, schema_id, pending],
+        )?;
+    }
+    if table_begin == pending {
+        tx.execute(
+            "UPDATE ducklake_table SET begin_snapshot = ? WHERE table_id = ? AND begin_snapshot = ?",
+            params![snapshot_id, table_id, pending],
+        )?;
+    }
     let is_ddl = current.is_empty()
         || catalog_columns_differ(
             &existing_catalog_columns,
@@ -3529,10 +3541,21 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 return Ok((schema_id, false));
             },
             Some((schema_id, _)) => {
-                tx.execute(
-                    "UPDATE ducklake_schema SET begin_snapshot = ? WHERE schema_id = ?",
-                    params![snapshot_id, schema_id],
+                // Only while it is still pending: one a commit stamped since is returned as found.
+                let taken = tx.execute(
+                    "UPDATE ducklake_schema SET begin_snapshot = ?, path = ?
+                     WHERE schema_id = ? AND begin_snapshot = ?",
+                    params![
+                        snapshot_id,
+                        schema_path,
+                        schema_id,
+                        crate::metadata_writer::PENDING_SNAPSHOT
+                    ],
                 )?;
+                if taken == 0 {
+                    tx.commit()?;
+                    return Ok((schema_id, false));
+                }
                 schema_id
             },
             None => tx.query_row(
@@ -3591,10 +3614,21 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let table_path = directory_path(path.unwrap_or(name));
         let table_id: i64 = match pending {
             Some(table_id) => {
-                tx.execute(
-                    "UPDATE ducklake_table SET begin_snapshot = ? WHERE table_id = ?",
-                    params![snapshot_id, table_id],
+                // As for the schema: only while it is still pending.
+                let taken = tx.execute(
+                    "UPDATE ducklake_table SET begin_snapshot = ?, path = ?
+                     WHERE table_id = ? AND begin_snapshot = ?",
+                    params![
+                        snapshot_id,
+                        table_path,
+                        table_id,
+                        crate::metadata_writer::PENDING_SNAPSHOT
+                    ],
                 )?;
+                if taken == 0 {
+                    tx.commit()?;
+                    return Ok((table_id, false));
+                }
                 table_id
             }
             None => tx.query_row(

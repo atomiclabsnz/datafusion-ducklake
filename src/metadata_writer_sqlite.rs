@@ -4543,11 +4543,23 @@ impl MetadataWriter for SqliteMetadataWriter {
                     return Ok((schema_id, false));
                 }
                 Some((schema_id, _)) => {
-                    sqlx::query("UPDATE ducklake_schema SET begin_snapshot = ? WHERE schema_id = ?")
-                        .bind(snapshot_id)
-                        .bind(schema_id)
-                        .execute(&mut *tx)
-                        .await?;
+                    // Only while it is still pending: a commit that stamped it since makes
+                    // it committed, and it is returned as found.
+                    let taken = sqlx::query(
+                        "UPDATE ducklake_schema SET begin_snapshot = ?, path = ?
+                         WHERE schema_id = ? AND begin_snapshot = ?",
+                    )
+                    .bind(snapshot_id)
+                    .bind(directory_path(path.unwrap_or(name)))
+                    .bind(schema_id)
+                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                    if taken == 0 {
+                        commit(tx).await?;
+                        return Ok((schema_id, false));
+                    }
                     Some(schema_id)
                 }
                 None => None,
@@ -4610,11 +4622,22 @@ impl MetadataWriter for SqliteMetadataWriter {
                     return Ok((table_id, false));
                 }
                 Some((table_id, _)) => {
-                    sqlx::query("UPDATE ducklake_table SET begin_snapshot = ? WHERE table_id = ?")
-                        .bind(snapshot_id)
-                        .bind(table_id)
-                        .execute(&mut *tx)
-                        .await?;
+                    // As for the schema: only while it is still pending.
+                    let taken = sqlx::query(
+                        "UPDATE ducklake_table SET begin_snapshot = ?, path = ?
+                         WHERE table_id = ? AND begin_snapshot = ?",
+                    )
+                    .bind(snapshot_id)
+                    .bind(directory_path(path.unwrap_or(name)))
+                    .bind(table_id)
+                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                    if taken == 0 {
+                        commit(tx).await?;
+                        return Ok((table_id, false));
+                    }
                     Some(table_id)
                 }
                 None => None,

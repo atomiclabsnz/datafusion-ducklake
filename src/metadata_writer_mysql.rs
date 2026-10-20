@@ -2216,23 +2216,37 @@ async fn finalize_table_snapshot(
         ));
     }
     // A row the write's start made is pending until here: it takes this commit's snapshot.
-    sqlx::query(
-        "UPDATE ducklake_schema AS s JOIN ducklake_table AS t ON t.schema_id = s.schema_id
-         SET s.begin_snapshot = ? WHERE t.table_id = ? AND s.begin_snapshot = ?",
+    // Read once from the table's live row, and updated only when pending, so an append to a
+    // committed table pays nothing.
+    let pending = crate::metadata_writer::PENDING_SNAPSHOT;
+    let (schema_id, schema_begin, table_begin): (i64, i64, i64) = sqlx::query_as(
+        "SELECT t.schema_id, s.begin_snapshot, t.begin_snapshot
+         FROM ducklake_table t JOIN ducklake_schema s ON s.schema_id = t.schema_id
+         WHERE t.table_id = ? AND t.end_snapshot IS NULL AND s.end_snapshot IS NULL",
     )
-    .bind(snapshot_id)
     .bind(table_id)
-    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
-    .execute(&mut **tx)
+    .fetch_one(&mut **tx)
     .await?;
-    sqlx::query(
-        "UPDATE ducklake_table SET begin_snapshot = ? WHERE table_id = ? AND begin_snapshot = ?",
-    )
-    .bind(snapshot_id)
-    .bind(table_id)
-    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
-    .execute(&mut **tx)
-    .await?;
+    if schema_begin == pending {
+        sqlx::query(
+            "UPDATE ducklake_schema SET begin_snapshot = ? WHERE schema_id = ? AND begin_snapshot = ?",
+        )
+        .bind(snapshot_id)
+        .bind(schema_id)
+        .bind(pending)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if table_begin == pending {
+        sqlx::query(
+            "UPDATE ducklake_table SET begin_snapshot = ? WHERE table_id = ? AND begin_snapshot = ?",
+        )
+        .bind(snapshot_id)
+        .bind(table_id)
+        .bind(pending)
+        .execute(&mut **tx)
+        .await?;
+    }
     let is_ddl = current.is_empty()
         || catalog_columns_differ(
             &existing_catalog_columns,
@@ -3661,11 +3675,23 @@ impl MetadataWriter for MySqlMetadataWriter {
                     return Ok((schema_id, false));
                 }
                 Some((schema_id, _)) => {
-                    sqlx::query("UPDATE ducklake_schema SET begin_snapshot = ? WHERE schema_id = ?")
-                        .bind(snapshot_id)
-                        .bind(schema_id)
-                        .execute(&mut *tx)
-                        .await?;
+                    // Only while it is still pending: one a commit stamped since is returned as
+                    // found.
+                    let taken = sqlx::query(
+                        "UPDATE ducklake_schema SET begin_snapshot = ?, path = ?
+                         WHERE schema_id = ? AND begin_snapshot = ?",
+                    )
+                    .bind(snapshot_id)
+                    .bind(&schema_path)
+                    .bind(schema_id)
+                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                    if taken == 0 {
+                        tx.commit().await?;
+                        return Ok((schema_id, false));
+                    }
                     schema_id
                 }
                 None => {
@@ -3733,11 +3759,22 @@ impl MetadataWriter for MySqlMetadataWriter {
             let table_path = directory_path(path.unwrap_or(name));
             let table_id: i64 = match pending {
                 Some(table_id) => {
-                    sqlx::query("UPDATE ducklake_table SET begin_snapshot = ? WHERE table_id = ?")
-                        .bind(snapshot_id)
-                        .bind(table_id)
-                        .execute(&mut *tx)
-                        .await?;
+                    // As for the schema: only while it is still pending.
+                    let taken = sqlx::query(
+                        "UPDATE ducklake_table SET begin_snapshot = ?, path = ?
+                         WHERE table_id = ? AND begin_snapshot = ?",
+                    )
+                    .bind(snapshot_id)
+                    .bind(&table_path)
+                    .bind(table_id)
+                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                    if taken == 0 {
+                        tx.commit().await?;
+                        return Ok((table_id, false));
+                    }
                     table_id
                 }
                 None => sqlx::query(
