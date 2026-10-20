@@ -116,8 +116,9 @@ pub enum DuckLakeError {
 
     /// A write that would make a table met a live view with the table's name, there
     /// before it began or created by another writer before it committed. The view is
-    /// left as it is, whatever the write's mode: a table never stands beside a view of
-    /// its name.
+    /// left as it is, whatever the write's mode: no write makes a table beside a view of
+    /// its name. A write into a table that exists is not asked, so a catalog another
+    /// writer left with both keeps them.
     #[error("A view has that name: {0}")]
     ViewExists(String),
 

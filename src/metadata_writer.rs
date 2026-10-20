@@ -102,7 +102,8 @@ pub(crate) fn refuse_create_into(
 /// table's name ([`view_exists_error`]): [`WriteMode::Create`], or any mode on a table with no
 /// live columns yet. A table row with none is no table to a reader (DuckDB will not load a
 /// lake over one), whether this write's start made it or an older write left it. A write
-/// into a table that has columns is not asked: a table never stands beside a view.
+/// into a table that has columns is not asked, so a catalog another writer left with a table
+/// and a view of one name keeps both.
 pub(crate) fn makes_table(mode: WriteMode, has_live_columns: bool) -> bool {
     mode == WriteMode::Create || !has_live_columns
 }
