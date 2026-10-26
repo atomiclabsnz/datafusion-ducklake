@@ -532,6 +532,8 @@ async fn retire_prior_generation(
     .bind(table_id)
     .execute(&mut **tx)
     .await?;
+    // A delete file another writer (official DuckLake) wrote ends with its data file.
+    crate::metadata_writer_postgres::end_delete_files_of_ended(tx, table_id, snapshot_id).await?;
 
     // And its inlined rows, as the SQLite writer retires them: a replace that left them
     // live would keep them beside the new generation. A catalog that never inlined may
@@ -2568,6 +2570,12 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .bind(snapshot_id)
             .bind(table_id)
             .execute(&mut *tx)
+            .await?;
+            crate::metadata_writer_postgres::end_delete_files_of_ended(
+                &mut tx,
+                table_id,
+                snapshot_id,
+            )
             .await?;
 
             self.commit(tx).await?;

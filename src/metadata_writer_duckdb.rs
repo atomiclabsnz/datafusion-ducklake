@@ -1727,6 +1727,7 @@ fn retire_prior_generation(tx: &Transaction<'_>, table_id: i64, snapshot_id: i64
          WHERE table_id = ? AND end_snapshot IS NULL AND begin_snapshot < ?",
         params![snapshot_id, table_id, snapshot_id],
     )?;
+    end_delete_files_of_ended(tx, table_id, snapshot_id)?;
     for (table_name, system) in inlined_tables(tx, table_id)? {
         tx.execute(
             &format!(
@@ -1738,6 +1739,20 @@ fn retire_prior_generation(tx: &Transaction<'_>, table_id: i64, snapshot_id: i64
             params![snapshot_id, snapshot_id],
         )?;
     }
+    Ok(())
+}
+
+/// End the live delete files of the data files ended at `snapshot_id`, as official's
+/// drop of a table ends them with its data files. (A whole-file `DELETE` leaves them,
+/// as official's `DropDataFiles` does; see `drop_data_files`.) Mirrors the SQLite writer.
+fn end_delete_files_of_ended(tx: &Transaction<'_>, table_id: i64, snapshot_id: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE ducklake_delete_file SET end_snapshot = ?
+         WHERE table_id = ? AND end_snapshot IS NULL AND data_file_id IN (
+             SELECT data_file_id FROM ducklake_data_file
+             WHERE table_id = ? AND end_snapshot = ?)",
+        params![snapshot_id, table_id, table_id, snapshot_id],
+    )?;
     Ok(())
 }
 
@@ -5580,6 +5595,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
              WHERE table_id = ? AND end_snapshot IS NULL",
             params![snapshot_id, table_id],
         )? as u64;
+        end_delete_files_of_ended(&tx, table_id, snapshot_id)?;
 
         tx.commit()?;
         Ok(rows_affected)
