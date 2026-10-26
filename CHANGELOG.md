@@ -221,6 +221,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A replace (`INSERT OVERWRITE`, `WriteMode::Replace`) and `end_table_files` end the delete files
+  of the data files they end, as official's `CREATE OR REPLACE` does, on every backend (#19).
 - A write that never committed (refused, failed, or abandoned) no longer leaves a column-less table
   for the next commit to publish, which DuckDB refuses to open a lake over (SQLite, DuckDB, MySQL).
 - A streaming write with no tokio runtime on its thread uploads its rolled files itself instead

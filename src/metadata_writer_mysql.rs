@@ -1234,6 +1234,7 @@ async fn retire_prior_generation(
     .bind(snapshot_id)
     .execute(&mut **tx)
     .await?;
+    end_delete_files_of_ended(tx, table_id, snapshot_id).await?;
 
     for (table_name, system) in inlined_tables(tx, table_id).await? {
         let sql = format!(
@@ -1248,6 +1249,29 @@ async fn retire_prior_generation(
             .execute(&mut **tx)
             .await?;
     }
+    Ok(())
+}
+
+/// End the live delete files of the data files ended at `snapshot_id`, as official's
+/// drop of a table ends them with its data files. (A whole-file `DELETE` leaves them,
+/// as official's `DropDataFiles` does.) Mirrors the SQLite writer.
+async fn end_delete_files_of_ended(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    table_id: i64,
+    snapshot_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE ducklake_delete_file SET end_snapshot = ?
+         WHERE table_id = ? AND end_snapshot IS NULL AND data_file_id IN (
+             SELECT data_file_id FROM ducklake_data_file
+             WHERE table_id = ? AND end_snapshot = ?)",
+    )
+    .bind(snapshot_id)
+    .bind(table_id)
+    .bind(table_id)
+    .bind(snapshot_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -6072,6 +6096,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
+            end_delete_files_of_ended(&mut tx, table_id, snapshot_id).await?;
 
             tx.commit().await?;
             Ok(result.rows_affected())

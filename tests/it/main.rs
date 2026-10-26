@@ -100,6 +100,7 @@ mod postgres_metadata_provider_test;
 mod postgres_single_catalog_write_tests;
 mod pushdown_row_preservation_tests;
 mod renamed_columns_tests;
+mod replace_delete_file_tests;
 mod resolve_positions_projection_tests;
 mod retire_appends_inlined_tests;
 mod row_count_tests;
