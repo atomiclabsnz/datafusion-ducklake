@@ -5818,7 +5818,17 @@ impl TableProvider for DuckLakeTable {
 
         let write_mode = match insert_op {
             InsertOp::Append => WriteMode::Append,
-            InsertOp::Overwrite | InsertOp::Replace => WriteMode::Replace,
+            InsertOp::Overwrite => WriteMode::Replace,
+            // `REPLACE INTO` / `INSERT OR REPLACE` mean "replace the rows that conflict on a
+            // key". A DuckLake table has no key to conflict on, and replacing the whole
+            // table under that name would be a different statement, so it is refused.
+            InsertOp::Replace => {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "REPLACE INTO DuckLake table {}: a DuckLake table has no key to replace \
+                     by; INSERT appends, INSERT OVERWRITE replaces its rows",
+                    self.table_name
+                )));
+            },
         };
 
         // Resolve the partition spec at the CURRENT catalog head, NOT the snapshot

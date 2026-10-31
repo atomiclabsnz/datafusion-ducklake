@@ -858,3 +858,71 @@ async fn test_insert_from_query_with_filter() {
         },
     }
 }
+
+/// `REPLACE INTO` / `INSERT OR REPLACE` (`InsertOp::Replace`) mean "replace the rows that
+/// conflict on a key". A DuckLake table has none, so the statement is refused rather than run
+/// as a replace of the whole table, and the table keeps its rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_replace_into_is_refused() {
+    let (_ctx, temp_dir) = create_writable_catalog().await;
+    let object_store = create_object_store();
+    let db_path = temp_dir.path().join("test.db");
+    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+    let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("value", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .unwrap();
+    datafusion_ducklake::DuckLakeTableWriter::new(Arc::new(writer), object_store)
+        .unwrap()
+        .write_table("main", "replace_test", &[batch])
+        .await
+        .unwrap();
+
+    let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    for sql in [
+        "INSERT OR REPLACE INTO ducklake.main.replace_test VALUES (1, 'z')",
+        "REPLACE INTO ducklake.main.replace_test VALUES (1, 'z')",
+    ] {
+        let refused = match ctx.sql(sql).await {
+            Ok(df) => df.collect().await.map(|_| ()),
+            Err(e) => Err(e),
+        }
+        .expect_err(sql);
+        assert!(
+            matches!(refused.find_root(), datafusion::error::DataFusionError::NotImplemented(m) if m.contains("no key to replace by"))
+                || refused
+                    .to_string()
+                    .contains("Unsupported statement REPLACE"),
+            "{sql}: {refused}"
+        );
+    }
+
+    let read_ctx = create_read_context(&temp_dir).await;
+    let rows = read_ctx
+        .sql("SELECT COUNT(*) FROM ducklake.main.replace_test")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = rows[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 3, "the table keeps its rows");
+}
