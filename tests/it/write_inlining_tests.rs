@@ -618,6 +618,7 @@ async fn duckdb_multi_table_write_commits_nested_inline_rows() {
 
     let metadata_path = catalog_path.to_string_lossy().replace('\'', "''");
     let output = Command::new("duckdb")
+        .env_remove("AI_AGENT")
         .args([
             "-csv",
             "-noheader",

@@ -723,14 +723,18 @@ async fn duckdb_written_catalog_is_read_correctly() {
     // Absent binary: skip, so an outside contributor running the suite on a
     // laptop is not red-lighted. Present but the wrong vintage: fail hard, which
     // is the case that would otherwise test a different writer in silence.
-    let Ok(version) = Command::new("duckdb").arg("--version").output() else {
+    let Ok(version) = Command::new("duckdb")
+        .env_remove("AI_AGENT")
+        .arg("--version")
+        .output()
+    else {
         eprintln!("skipping: no `duckdb` on PATH (CI installs the pinned CLI)");
         return;
     };
     let version = String::from_utf8_lossy(&version.stdout).to_string();
     assert!(
-        version.contains("v1.5.5"),
-        "fixture must be built by the pinned DuckDB CLI (CI installs v1.5.5), found: {version}"
+        version.contains("v2.0.0"),
+        "fixture must be built by the pinned DuckDB CLI (CI installs v2.0.0), found: {version}"
     );
 
     let temp = TempDir::new().unwrap();
@@ -751,6 +755,7 @@ async fn duckdb_written_catalog_is_read_correctly() {
         data = data_path.to_string_lossy(),
     );
     let out = Command::new("duckdb")
+        .env_remove("AI_AGENT")
         .args(["-csv", "-noheader", ":memory:", "-c", &sql])
         .output()
         .unwrap();
@@ -765,6 +770,7 @@ async fn duckdb_written_catalog_is_read_correctly() {
     // extension can be rebuilt against an existing engine release. Pin the
     // extension that every finding in this module was checked against.
     let extension = Command::new("duckdb")
+        .env_remove("AI_AGENT")
         .args([
             "-csv",
             "-noheader",

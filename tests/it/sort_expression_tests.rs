@@ -274,6 +274,7 @@ async fn compaction_orders_by_expression_keys() {
 /// Run `sql` with the DuckDB CLI: its output lines, or its error.
 fn cli(sql: &str) -> Result<Vec<String>, String> {
     let out = Command::new("duckdb")
+        .env_remove("AI_AGENT")
         .args(["-csv", "-noheader", ":memory:", "-c", sql])
         .output()
         .unwrap();
@@ -310,14 +311,18 @@ const ROWS: &str = "('1', '3', '10', '2.5', 'b'), ('2', '-2', '18000000000000000
 /// ids in `rowid` order.
 #[tokio::test(flavor = "multi_thread")]
 async fn bare_column_keys_order_inserts_as_the_duckdb_cli() {
-    let Ok(version) = Command::new("duckdb").arg("--version").output() else {
+    let Ok(version) = Command::new("duckdb")
+        .env_remove("AI_AGENT")
+        .arg("--version")
+        .output()
+    else {
         eprintln!("skipping: no `duckdb` on PATH (CI installs the pinned CLI)");
         return;
     };
     let version = String::from_utf8_lossy(&version.stdout).to_string();
     assert!(
-        version.contains("v1.5.5"),
-        "the oracle is the pinned DuckDB CLI (CI installs v1.5.5), found: {version}"
+        version.contains("v2.0.0"),
+        "the oracle is the pinned DuckDB CLI (CI installs v2.0.0), found: {version}"
     );
     for keys in [
         "ti",

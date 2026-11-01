@@ -1120,6 +1120,7 @@ mod sqlite {
             ));
         }
         let output = std::process::Command::new("duckdb")
+            .env_remove("AI_AGENT")
             .args(["-csv", "-noheader", ":memory:", "-c", &script])
             .output()
             .unwrap();

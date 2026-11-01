@@ -2499,6 +2499,7 @@ async fn crate_and_duckdb_round_trip_inlined_rows() {
         t.path().join("test.db").display()
     );
     let output = Command::new("duckdb")
+        .env_remove("AI_AGENT")
         .args([
             "-csv",
             "-noheader",
@@ -2522,6 +2523,7 @@ async fn crate_and_duckdb_round_trip_inlined_rows() {
     );
 
     let output = Command::new("duckdb")
+        .env_remove("AI_AGENT")
         .args([
             ":memory:",
             "-c",

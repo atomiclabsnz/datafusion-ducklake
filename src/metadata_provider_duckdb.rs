@@ -894,22 +894,22 @@ fn get_table_columns_sql(capabilities: SchemaCapabilities) -> String {
     let initial_default = if capabilities.column_initial_default {
         "initial_default"
     } else {
-        "NULL AS initial_default"
+        "CAST(NULL AS VARCHAR) AS initial_default"
     };
     let default_value = if capabilities.column_default_value {
         "default_value"
     } else {
-        "NULL AS default_value"
+        "CAST(NULL AS VARCHAR) AS default_value"
     };
     let value_type = if capabilities.column_default_value_type {
         "default_value_type"
     } else {
-        "NULL AS default_value_type"
+        "CAST(NULL AS VARCHAR) AS default_value_type"
     };
     let dialect = if capabilities.column_default_value_dialect {
         "default_value_dialect"
     } else {
-        "NULL AS default_value_dialect"
+        "CAST(NULL AS VARCHAR) AS default_value_dialect"
     };
     format!(
         "SELECT column_id, column_name, column_type, nulls_allowed, parent_column,
@@ -926,22 +926,22 @@ fn list_all_columns_sql(capabilities: SchemaCapabilities) -> String {
     let initial_default = if capabilities.column_initial_default {
         "c.initial_default"
     } else {
-        "NULL AS initial_default"
+        "CAST(NULL AS VARCHAR) AS initial_default"
     };
     let default_value = if capabilities.column_default_value {
         "c.default_value"
     } else {
-        "NULL AS default_value"
+        "CAST(NULL AS VARCHAR) AS default_value"
     };
     let value_type = if capabilities.column_default_value_type {
         "c.default_value_type"
     } else {
-        "NULL AS default_value_type"
+        "CAST(NULL AS VARCHAR) AS default_value_type"
     };
     let dialect = if capabilities.column_default_value_dialect {
         "c.default_value_dialect"
     } else {
-        "NULL AS default_value_dialect"
+        "CAST(NULL AS VARCHAR) AS default_value_dialect"
     };
     format!(
         "SELECT
@@ -2965,21 +2965,23 @@ fn parse_partial_file_info_max(info: &str) -> Option<i64> {
 }
 
 fn file_provenance_sql(sql: &str, capabilities: SchemaCapabilities) -> String {
+    // Typed: a bare `NULL` is Arrow's `Null` type, which duckdb-rs (from 1.20000)
+    // cannot read back through a row (`invalid value: Null`).
     let schema_version = if capabilities.schema_versions {
         SQL_FILE_SCHEMA_VERSION
     } else {
-        "NULL"
+        "CAST(NULL AS BIGINT)"
     };
     let partial_max = if capabilities.data_file_partial_max {
         "data.partial_max"
     } else {
-        "NULL"
+        "CAST(NULL AS BIGINT)"
     };
     // A catalog predating partition support holds no partitioned files.
     let partition_id = if capabilities.data_file_partition_id {
         "data.partition_id"
     } else {
-        "NULL"
+        "CAST(NULL AS BIGINT)"
     };
     sql.replacen(
         "\n    FROM ",
