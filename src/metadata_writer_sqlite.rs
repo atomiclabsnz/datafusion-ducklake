@@ -2966,12 +2966,17 @@ async fn merge_file_table_column_stats(
     files: &[Vec<crate::stats_encode::FileColumnStat>],
 ) -> Result<()> {
     let initialized = table_stats_initialized(tx, table_id).await?;
+    let table_has_rows = table_has_rows(tx, table_id).await?;
     let live: Vec<i64> = fields.iter().map(|(id, _)| *id).collect();
     let existing = load_table_column_stats(tx, table_id).await?;
-    let merged =
-        crate::stats_encode::merge_file_column_stats(existing, initialized, files, &live, |id| {
-            crate::metadata_writer::stat_kind_of(fields, id)
-        });
+    let merged = crate::stats_encode::merge_file_column_stats(
+        existing,
+        initialized,
+        table_has_rows,
+        files,
+        &live,
+        |id| crate::metadata_writer::stat_kind_of(fields, id),
+    );
     store_table_column_stats(tx, table_id, merged).await
 }
 
@@ -3071,6 +3076,21 @@ async fn store_table_column_stats(
 /// zeros before updating it (`INSERT OR IGNORE`), so a zero row may predate
 /// any write; a row counts once it has recorded a row (`next_row_id > 0`) or
 /// the table has column statistics.
+/// Whether the table holds rows before this write (`ducklake_table_stats.record_count`), as
+/// official asks when it reads the stored statistics: a row with neither bound on a table
+/// with rows is bounds unknown (see [`crate::stats_encode::ColumnStats::from_global`]).
+async fn table_has_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE(MAX(record_count), 0) > 0 FROM ducklake_table_stats WHERE table_id = ?",
+    )
+    .bind(table_id)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
 async fn table_stats_initialized(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: i64,
@@ -3102,6 +3122,7 @@ async fn merge_inlined_table_column_stats(
     snapshot_id_columns: &[String],
     snapshot_id: i64,
     initialized: bool,
+    table_has_rows: bool,
 ) -> Result<()> {
     let fields = crate::metadata_writer::catalog_fields(columns, column_ids)?;
     let inlined = crate::stats_encode::inlined_column_stats(batches, &fields, |i| {
@@ -3111,10 +3132,13 @@ async fn merge_inlined_table_column_stats(
             .map(|_| datafusion::common::ScalarValue::Int64(Some(snapshot_id)))
     })?;
     let existing = load_table_column_stats(tx, table_id).await?;
-    let merged =
-        crate::stats_encode::merge_inlined_column_stats(existing, inlined, initialized, |id| {
-            crate::metadata_writer::stat_kind_of(&fields, id)
-        });
+    let merged = crate::stats_encode::merge_inlined_column_stats(
+        existing,
+        inlined,
+        initialized,
+        table_has_rows,
+        |id| crate::metadata_writer::stat_kind_of(&fields, id),
+    );
     store_table_column_stats(tx, table_id, merged).await
 }
 
@@ -3948,6 +3972,7 @@ async fn commit_inlined_at_snapshot(
         .await?
         .system;
     let stats_initialized = table_stats_initialized(tx, write.table_id).await?;
+    let stats_had_rows = table_has_rows(tx, write.table_id).await?;
     sqlx::query(
         "INSERT INTO ducklake_table_stats
              (table_id, record_count, next_row_id, file_size_bytes)
@@ -4017,6 +4042,7 @@ async fn commit_inlined_at_snapshot(
         &write.snapshot_id_columns,
         snapshot_id,
         stats_initialized,
+        stats_had_rows,
     )
     .await?;
     // Preserved row ids were drawn when the rows were first written.
@@ -5921,6 +5947,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let system = inlined_table_layout(&mut *tx, &physical_name).await?.system;
 
             let stats_initialized = table_stats_initialized(&mut tx, table_id).await?;
+            let stats_had_rows = table_has_rows(&mut tx, table_id).await?;
             sqlx::query(
                 "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
@@ -5974,6 +6001,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 &[],
                 snapshot_id,
                 stats_initialized,
+                stats_had_rows,
             )
             .await?;
             let record_count = i64::try_from(record_count).map_err(|_| {

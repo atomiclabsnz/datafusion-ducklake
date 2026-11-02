@@ -1847,12 +1847,17 @@ fn merge_file_table_column_stats(
     files: &[Vec<crate::stats_encode::FileColumnStat>],
 ) -> Result<()> {
     let initialized = table_stats_initialized(tx, table_id)?;
+    let table_has_rows = table_has_rows(tx, table_id)?;
     let live: Vec<i64> = fields.iter().map(|(id, _)| *id).collect();
     let existing = load_table_column_stats(tx, table_id)?;
-    let merged =
-        crate::stats_encode::merge_file_column_stats(existing, initialized, files, &live, |id| {
-            crate::metadata_writer::stat_kind_of(fields, id)
-        });
+    let merged = crate::stats_encode::merge_file_column_stats(
+        existing,
+        initialized,
+        table_has_rows,
+        files,
+        &live,
+        |id| crate::metadata_writer::stat_kind_of(fields, id),
+    );
     store_table_column_stats(tx, table_id, merged)
 }
 
@@ -1948,6 +1953,17 @@ fn store_table_column_stats(
 /// `ducklake_table_stats` row. This crate seeds that row with zeros when it
 /// creates a table, so a seeded row counts once it has recorded a row
 /// (`next_row_id > 0`) or the table has column statistics.
+/// Whether the table holds rows before this write (`ducklake_table_stats.record_count`), as
+/// official asks when it reads the stored statistics: a row with neither bound on a table
+/// with rows is bounds unknown (see [`crate::stats_encode::ColumnStats::from_global`]).
+fn table_has_rows(tx: &Transaction<'_>, table_id: i64) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT COALESCE(MAX(record_count), 0) > 0 FROM ducklake_table_stats WHERE table_id = ?",
+        params![table_id],
+        |row| row.get(0),
+    )?)
+}
+
 fn table_stats_initialized(tx: &Transaction<'_>, table_id: i64) -> Result<bool> {
     Ok(tx.query_row(
         "SELECT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ? AND next_row_id > 0)
@@ -1974,6 +1990,7 @@ fn merge_inlined_table_column_stats(
     snapshot_id_columns: &[String],
     snapshot_id: i64,
     initialized: bool,
+    table_has_rows: bool,
 ) -> Result<()> {
     let fields = crate::metadata_writer::catalog_fields(columns, column_ids)?;
     let inlined = crate::stats_encode::inlined_column_stats(batches, &fields, |i| {
@@ -1983,10 +2000,13 @@ fn merge_inlined_table_column_stats(
             .map(|_| datafusion::common::ScalarValue::Int64(Some(snapshot_id)))
     })?;
     let existing = load_table_column_stats(tx, table_id)?;
-    let merged =
-        crate::stats_encode::merge_inlined_column_stats(existing, inlined, initialized, |id| {
-            crate::metadata_writer::stat_kind_of(&fields, id)
-        });
+    let merged = crate::stats_encode::merge_inlined_column_stats(
+        existing,
+        inlined,
+        initialized,
+        table_has_rows,
+        |id| crate::metadata_writer::stat_kind_of(&fields, id),
+    );
     store_table_column_stats(tx, table_id, merged)
 }
 
@@ -2898,6 +2918,7 @@ fn commit_staged_inline(
     let physical_name = inlined_insert_table(tx, write.table_id, snapshot_id, &fields)?;
     let system = inlined_table_layout(tx, &physical_name)?.system;
     let stats_initialized = table_stats_initialized(tx, write.table_id)?;
+    let stats_had_rows = table_has_rows(tx, write.table_id)?;
     seed_stats_if_missing(tx, write.table_id)?;
     let mut row_id: i64 = tx.query_row(
         "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?",
@@ -2977,6 +2998,7 @@ fn commit_staged_inline(
         &write.snapshot_id_columns,
         snapshot_id,
         stats_initialized,
+        stats_had_rows,
     )?;
     let record_count = i64::try_from(record_count).map_err(|_| {
         crate::DuckLakeError::InvalidConfig("multi-table inline row count exceeds i64".to_string())
@@ -4223,6 +4245,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let physical_name = inlined_insert_table(&tx, table_id, snapshot_id, &fields)?;
         let system = inlined_table_layout(&tx, &physical_name)?.system;
         let stats_initialized = table_stats_initialized(&tx, table_id)?;
+        let stats_had_rows = table_has_rows(&tx, table_id)?;
         seed_stats_if_missing(&tx, table_id)?;
         let mut row_id: i64 = tx.query_row(
             "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?",
@@ -4281,6 +4304,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             &[],
             snapshot_id,
             stats_initialized,
+            stats_had_rows,
         )?;
         let record_count = i64::try_from(record_count).map_err(|_| {
             crate::DuckLakeError::InvalidConfig(

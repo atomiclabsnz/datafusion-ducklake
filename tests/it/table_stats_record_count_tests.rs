@@ -174,8 +174,9 @@ fn scenarios() -> Vec<Scenario> {
                 Op::Append(&[5]),
             ],
         },
-        // A roll-up with neither bound over files holding only NULLs means no
-        // valid value, as official reads it: the next write takes its bounds.
+        // A roll-up with neither bound over files holding only NULLs: from 1.5.6
+        // official reads it as bounds unknown on a table with rows (it cannot tell
+        // them from bounds a retype invalidated), so the next write keeps them unknown.
         Scenario {
             name: "all-NULL column then append",
             limit: 0,

@@ -613,14 +613,20 @@ impl ColumnStats {
     /// A stored `ducklake_table_column_stats` row, read as official's
     /// `FromGlobalStats` reads it: a row with neither bound holds no valid
     /// value.
-    pub fn from_global(stat: &GlobalColumnStat) -> Self {
+    ///
+    /// A row with neither bound on a table that has rows reads as values whose bounds are
+    /// **unknown**, as official reads it from 1.5.6 (`FromGlobalStats`, `bounds_unknown`):
+    /// it cannot tell a column that held only NULLs from bounds a retype invalidated, so a
+    /// later write never narrows it to its own bounds. On an empty table it holds no value.
+    pub fn from_global(stat: &GlobalColumnStat, table_has_rows: bool) -> Self {
+        let bounded = stat.min_value.is_some() || stat.max_value.is_some();
         Self {
             min_value: stat.min_value.clone(),
             max_value: stat.max_value.clone(),
             null_count: stat.contains_null.map(u64::from),
             num_values: None,
             contains_nan: stat.contains_nan,
-            any_valid: stat.min_value.is_some() || stat.max_value.is_some(),
+            any_valid: bounded || table_has_rows,
         }
     }
 
@@ -743,15 +749,25 @@ impl ColumnStats {
 pub fn merge_table_column_stats(
     existing: Vec<GlobalColumnStat>,
     initialized: bool,
+    table_has_rows: bool,
     new: impl IntoIterator<Item = (i64, ColumnStats)>,
     kind: impl Fn(i64) -> StatKind,
 ) -> Vec<GlobalColumnStat> {
     use std::collections::BTreeMap;
 
     let mut merged: BTreeMap<i64, ColumnStats> = BTreeMap::new();
+    // Stored rows whose bounds are already unknown (see `ColumnStats::from_global`): kept as
+    // the row official keeps, neither bound, whatever is merged into them.
+    let mut stored_unknown = std::collections::BTreeSet::new();
     if initialized {
         for stat in &existing {
-            merged.insert(stat.column_id, ColumnStats::from_global(stat));
+            if table_has_rows && stat.min_value.is_none() && stat.max_value.is_none() {
+                stored_unknown.insert(stat.column_id);
+            }
+            merged.insert(
+                stat.column_id,
+                ColumnStats::from_global(stat, table_has_rows),
+            );
         }
     }
     let mut added = std::collections::BTreeSet::new();
@@ -797,10 +813,11 @@ pub fn merge_table_column_stats(
         // Official stores that row, reads it as holding no value, and narrows
         // it to the next write's bounds; here the field gets no row.
         .filter(|(column_id, stats)| {
-            !(touched.contains(column_id)
-                && stats.has_valid()
-                && stats.min_value.is_none()
-                && stats.max_value.is_none())
+            stored_unknown.contains(column_id)
+                || !(touched.contains(column_id)
+                    && stats.has_valid()
+                    && stats.min_value.is_none()
+                    && stats.max_value.is_none())
         })
         .map(|(column_id, stats)| stats.to_global(column_id))
         .collect()
@@ -818,6 +835,7 @@ pub fn merge_table_column_stats(
 pub fn merge_file_column_stats(
     existing: Vec<GlobalColumnStat>,
     initialized: bool,
+    table_has_rows: bool,
     files: &[Vec<FileColumnStat>],
     live_fields: &[i64],
     kind: impl Fn(i64) -> StatKind,
@@ -840,6 +858,7 @@ pub fn merge_file_column_stats(
     let mut merged = merge_table_column_stats(
         existing,
         initialized,
+        table_has_rows,
         files
             .iter()
             .flatten()
@@ -1161,11 +1180,13 @@ pub fn merge_inlined_column_stats(
     existing: Vec<GlobalColumnStat>,
     inlined: Vec<InlinedColumnStat>,
     initialized: bool,
+    table_has_rows: bool,
     kind: impl Fn(i64) -> StatKind,
 ) -> Vec<GlobalColumnStat> {
     merge_table_column_stats(
         existing,
         initialized,
+        table_has_rows,
         inlined
             .iter()
             .map(|stat| (stat.column_id, ColumnStats::from_inlined(stat))),
@@ -1965,6 +1986,7 @@ mod tests {
             vec![stored(1, Some(false), Some(("5", "9")))],
             inlined(vec![Some(10), Some(-2)]),
             true,
+            true,
             |_| StatKind::Numeric,
         );
         assert_eq!(
@@ -1982,23 +2004,36 @@ mod tests {
             vec![stored(1, Some(false), Some(("5", "9")))],
             inlined(vec![None]),
             true,
+            true,
             |_| StatKind::Numeric,
         );
         assert_eq!(merged[0].min_value.as_deref(), Some("5"));
         assert_eq!(merged[0].max_value.as_deref(), Some("9"));
         assert_eq!(merged[0].contains_null, Some(true));
 
-        // A stored row with neither bound is official's "no valid value", so
-        // it takes the inlined bounds whatever its NULL flag says.
+        // A stored row with neither bound, whatever its NULL flag says: on an empty table
+        // official's "no valid value", so it takes the inlined bounds; on a table with rows,
+        // official 1.5.6's "bounds unknown", which a write never narrows, and the row stays.
         for null in [Some(true), Some(false), None] {
             let merged = merge_inlined_column_stats(
                 vec![stored(1, null, None)],
                 inlined(vec![Some(3)]),
                 true,
+                false,
                 |_| StatKind::Numeric,
             );
             assert_eq!(merged[0].min_value.as_deref(), Some("3"));
             assert_eq!(merged[0].max_value.as_deref(), Some("3"));
+            let merged = merge_inlined_column_stats(
+                vec![stored(1, null, None)],
+                inlined(vec![Some(3)]),
+                true,
+                true,
+                |_| StatKind::Numeric,
+            );
+            assert_eq!(merged.len(), 1, "{null:?}: the row is kept");
+            assert_eq!(merged[0].min_value, None, "{null:?}");
+            assert_eq!(merged[0].max_value, None, "{null:?}");
         }
         // One unknown bound beside a known one stays unknown.
         let merged = merge_inlined_column_stats(
@@ -2007,6 +2042,7 @@ mod tests {
                 ..stored(1, Some(false), Some(("5", "9")))
             }],
             inlined(vec![Some(3)]),
+            true,
             true,
             |_| StatKind::Numeric,
         );
@@ -2017,15 +2053,19 @@ mod tests {
             vec![stored(2, Some(false), Some(("a", "b")))],
             inlined(vec![Some(3)]),
             true,
+            true,
             |_| StatKind::Numeric,
         );
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].column_id, 2);
 
-        let merged =
-            merge_inlined_column_stats(Vec::new(), inlined(vec![Some(3), None]), false, |_| {
-                StatKind::Numeric
-            });
+        let merged = merge_inlined_column_stats(
+            Vec::new(),
+            inlined(vec![Some(3), None]),
+            false,
+            false,
+            |_| StatKind::Numeric,
+        );
         assert_eq!(
             merged,
             vec![GlobalColumnStat {
@@ -2177,6 +2217,7 @@ mod tests {
         let merged = merge_file_column_stats(
             vec![stored(1, Some(false), Some(("1", "3")))],
             true,
+            true,
             &[vec![file(1, None, 0, 20)]],
             &[1],
             numeric,
@@ -2184,19 +2225,36 @@ mod tests {
         assert_eq!(merged[0].min_value.as_deref(), Some("1"));
         assert_eq!(merged[0].max_value.as_deref(), Some("3"));
         assert_eq!(merged[0].contains_null, Some(true));
-        // A stored row with neither bound takes the file's.
+        // A stored row with neither bound takes the file's on an empty table; on one with
+        // rows its bounds are unknown (official 1.5.6), and stay so in a kept row.
         let merged = merge_file_column_stats(
             vec![stored(1, Some(true), None)],
             true,
+            false,
             &[vec![file(1, Some(("4", "9")), 2, 0)]],
             &[1],
             numeric,
         );
         assert_eq!(merged[0].min_value.as_deref(), Some("4"));
         assert_eq!(merged[0].max_value.as_deref(), Some("9"));
+        let merged = merge_file_column_stats(
+            vec![stored(1, Some(true), None)],
+            true,
+            true,
+            &[vec![file(1, Some(("4", "9")), 2, 0)]],
+            &[1],
+            numeric,
+        );
+        assert_eq!(merged.len(), 1, "the row is kept");
+        assert_eq!(
+            (merged[0].min_value.clone(), merged[0].max_value.clone()),
+            (None, None)
+        );
+        assert_eq!(merged[0].contains_null, Some(true));
         // Fields without a stored row get none once the table has statistics.
         let merged = merge_file_column_stats(
             vec![stored(1, Some(false), Some(("1", "3")))],
+            true,
             true,
             &[vec![file(1, Some(("2", "2")), 1, 0), file(2, Some(("7", "7")), 1, 0)]],
             &[1, 2],
@@ -2207,6 +2265,7 @@ mod tests {
         let merged = merge_file_column_stats(
             Vec::new(),
             false,
+            false,
             &[vec![file(1, Some(("2", "2")), 1, 0), file(2, Some(("7", "7")), 1, 0)]],
             &[1, 2],
             numeric,
@@ -2216,6 +2275,7 @@ mod tests {
         let merged = merge_file_column_stats(
             vec![stored(1, Some(false), Some(("1", "3")))],
             true,
+            true,
             &[vec![file(1, Some(("2", "2")), 1, 0)], Vec::new()],
             &[1],
             numeric,
@@ -2224,6 +2284,7 @@ mod tests {
         // A NaN-bearing file's bounds still widen; its flag ORs in.
         let merged = merge_file_column_stats(
             vec![stored(1, Some(false), Some(("1.0", "3.0")))],
+            true,
             true,
             &[vec![FileColumnStat {
                 contains_nan: Some(true),
@@ -2407,6 +2468,7 @@ mod merge_regression_tests {
         let merged = merge_file_column_stats(
             Vec::new(),
             false,
+            false,
             &[file(None, 1, 0), file(Some("4"), 0, 1)],
             &[2],
             |_| StatKind::of_ducklake_type("int64"),
@@ -2437,10 +2499,13 @@ mod merge_regression_tests {
             contains_nan: None,
             any_valid: false,
         };
-        let merged =
-            merge_table_column_stats(Vec::new(), false, [(4, nan_only), (4, inlined)], |_| {
-                StatKind::of_ducklake_type("float")
-            });
+        let merged = merge_table_column_stats(
+            Vec::new(),
+            false,
+            false,
+            [(4, nan_only), (4, inlined)],
+            |_| StatKind::of_ducklake_type("float"),
+        );
         assert!(merged.is_empty(), "{merged:?}");
     }
 
@@ -2464,7 +2529,7 @@ mod merge_regression_tests {
             [file(Some(("1.0", "2.0")), false), file(None, true)],
             [file(None, true), file(Some(("1.0", "2.0")), false)],
         ] {
-            let merged = merge_file_column_stats(Vec::new(), false, &files, &[4], float);
+            let merged = merge_file_column_stats(Vec::new(), false, false, &files, &[4], float);
             assert!(merged.is_empty(), "{merged:?}");
         }
     }
@@ -2488,6 +2553,7 @@ mod merge_regression_tests {
         let merged = merge_file_column_stats(
             Vec::new(),
             false,
+            false,
             &[file("%_", "x"), file("a\0b", "c")],
             &[3],
             text,
@@ -2497,6 +2563,7 @@ mod merge_regression_tests {
         assert_eq!(merged[0].max_value.as_deref(), Some("x"));
         let merged = merge_file_column_stats(
             Vec::new(),
+            false,
             false,
             &[file("b", "x"), file("a\0b", "c")],
             &[3],
