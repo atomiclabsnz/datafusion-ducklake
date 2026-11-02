@@ -95,6 +95,21 @@ fn duckdb(catalog: &Path, data: &Path) -> duckdb::Connection {
     connection
 }
 
+fn duckdb_with_inlining(catalog: &Path, data: &Path, limit: usize) -> duckdb::Connection {
+    crate::common::ensure_ducklake_installed();
+    crate::common::ensure_extension_installed("sqlite");
+    let connection = duckdb::Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(&format!(
+            "LOAD ducklake; LOAD sqlite;
+             ATTACH 'ducklake:sqlite:{}' AS lake (DATA_PATH '{}/', DATA_INLINING_ROW_LIMIT {limit});",
+            catalog.display(),
+            data.display()
+        ))
+        .unwrap();
+    connection
+}
+
 async fn crate_context(catalog: &Path) -> (SessionContext, Arc<dyn MetadataWriter>) {
     let url = format!("sqlite:{}?mode=rw", catalog.display());
     let provider = SqliteMetadataProvider::new(&url).await.unwrap();
@@ -173,6 +188,12 @@ async fn standalone_ddl_writes_the_catalog_duckdb_writes() {
     std::fs::create_dir_all(&data).unwrap();
     let base = temp.path().join("base.sqlite");
     duckdb(&base, &data).execute_batch(SETUP).unwrap();
+    // `inl`'s rows inlined: attached with a limit rather than through `CALL set_option`, whose
+    // bind crashes the bundled engine with the release extension (inside the extension's
+    // `IsInlinedSystemColumn`); the CLI runs it fine.
+    duckdb_with_inlining(&base, &data, 10)
+        .execute_batch("INSERT INTO lake.main.inl VALUES (1), (2);")
+        .unwrap();
 
     let official = temp.path().join("official.sqlite");
     let ours = temp.path().join("ours.sqlite");
@@ -296,7 +317,7 @@ async fn a_schema_holding_a_table_is_not_dropped() {
         Err(e) => Err(e),
     }
     .expect_err("DataFusion does not drop a lake table");
-    assert!(!refused.to_string().is_empty());
+    assert!(refused.to_string().contains("doesn't exist"), "{refused}");
     ctx.sql("CREATE SCHEMA IF NOT EXISTS lake.s")
         .await
         .unwrap()
@@ -403,4 +424,66 @@ async fn ddl_on_a_catalog_this_crate_created() {
         1,
         "a tag keyed by the same number is not the schema's"
     );
+}
+
+/// A drop of one kind meets the other kind under the name: refused, as DuckDB refuses it
+/// ("Existing object … is of type Table, trying to drop type View"), not "no such object"
+/// (#24 review). And `CREATE SCHEMA` beside a schema a write's start has made, not committed,
+/// takes that row up rather than making a second live schema of the name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drop_of_the_wrong_kind_is_refused_and_a_pending_schema_is_taken_up() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let catalog = temp.path().join("c.sqlite");
+    duckdb(&catalog, &data)
+        .execute_batch(
+            "CREATE SCHEMA lake.s; CREATE TABLE lake.s.t (i INT);
+             CREATE VIEW lake.s.v AS SELECT 1 AS one;",
+        )
+        .unwrap();
+    let (_ctx, writer) = crate_context(&catalog).await;
+    for (refused, what) in [
+        (
+            writer.drop_view("s", "t").expect_err("a table"),
+            "DROP VIEW of a table",
+        ),
+        (
+            writer.drop_table("s", "v").expect_err("a view"),
+            "DROP TABLE of a view",
+        ),
+    ] {
+        assert!(
+            matches!(
+                refused,
+                datafusion_ducklake::DuckLakeError::WrongObjectKind(_)
+            ),
+            "{what}: {refused}"
+        );
+    }
+
+    // A write's start has made the schema row of a schema not there yet: pending
+    // (`begin_snapshot` = `PENDING_SNAPSHOT`, i64::MAX) until its commit stamps it.
+    let url = format!("sqlite:{}", catalog.display());
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_schema
+             (schema_id, schema_uuid, begin_snapshot, end_snapshot, schema_name, path,
+              path_is_relative)
+         VALUES (900, NULL, 9223372036854775807, NULL, 'staging', 'staging/', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        writer.create_schema("staging", false).unwrap(),
+        "made, from the pending row"
+    );
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ducklake_schema WHERE schema_name = 'staging' AND end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 1, "one live schema of the name");
 }

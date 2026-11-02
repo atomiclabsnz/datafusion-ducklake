@@ -21,9 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** in `stats_encode`, `ColumnStats::from_global` and the three merges take
   `table_has_rows: bool` (official's `record_count > 0`), `merge_table_column_stats` takes the
   fields a write leaves without statistics, and `ColumnStats` has a `bounds_unknown` field.
-- **Breaking:** `DuckLakeError::SchemaExists` (a `CREATE SCHEMA` of a live schema) and
-  `DuckLakeError::SchemaNotEmpty` (a `DROP SCHEMA` of a schema holding a table or view, without
-  `CASCADE`). Exhaustive matches need the two arms.
+- **Breaking:** `DuckLakeError::SchemaExists` (a `CREATE SCHEMA` of a live schema),
+  `DuckLakeError::SchemaNotEmpty` (a `DROP SCHEMA` of a schema holding a table, view or macro,
+  without `CASCADE`) and `DuckLakeError::WrongObjectKind` (a `DROP VIEW` of a table or a
+  `DROP TABLE` of a view, as DuckDB refuses it). Exhaustive matches need the three arms.
 - **Breaking:** a live view of a table's name is refused as `DuckLakeError::ViewExists`, no longer
   `TableExists`, and not only by `WriteMode::Create`: a Replace or Append that would make the
   table (it has no live columns yet) is refused inside the commit too, so a view created after

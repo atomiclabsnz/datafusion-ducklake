@@ -363,8 +363,9 @@ impl CatalogProvider for DuckLakeCatalog {
     /// `CREATE SCHEMA`: a schema in the lake, as its own snapshot ([`MetadataWriter::create_schema`]).
     /// DataFusion asks [`Self::schema`] first and hands an in-memory provider over, which is not
     /// kept: the lake's schema is. It asks only after finding no schema of the name, and does
-    /// not pass `IF NOT EXISTS` on, so a schema another writer creates in between is
-    /// [`DuckLakeError::SchemaExists`](crate::DuckLakeError::SchemaExists) either way.
+    /// not pass `IF NOT EXISTS` on, so a schema another writer creates in between is taken as
+    /// there: dbt's `create schema if not exists` must not fail on that race, and a plain
+    /// `CREATE SCHEMA` it lost would have met the schema a moment later anyway.
     ///
     /// The drops (`DROP TABLE`, `DROP VIEW`, `DROP SCHEMA`) are the writer's
     /// ([`MetadataWriter::drop_table`] and the rest), not DataFusion's `deregister_*`:
@@ -379,7 +380,7 @@ impl CatalogProvider for DuckLakeCatalog {
     ) -> DataFusionResult<Option<Arc<dyn SchemaProvider>>> {
         let writer = self.ddl_writer("CREATE SCHEMA")?;
         writer
-            .create_schema(name, false)
+            .create_schema(name, true)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(None)
     }

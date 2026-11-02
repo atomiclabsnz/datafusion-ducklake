@@ -119,6 +119,11 @@ pub enum DuckLakeError {
     #[error("Schema already exists: {0}")]
     SchemaExists(String),
 
+    /// A drop of one kind of object (`DROP VIEW`) met another kind under the name (a table),
+    /// as DuckDB refuses it ("Existing object … is of type Table, trying to drop type View").
+    #[error("Existing object is of another kind: {0}")]
+    WrongObjectKind(String),
+
     /// A `DROP SCHEMA` (without `CASCADE`) met a schema that still holds live tables or
     /// views, as DuckDB refuses it.
     #[error("Schema is not empty: {0}")]
