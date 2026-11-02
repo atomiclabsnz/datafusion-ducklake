@@ -110,6 +110,15 @@ pub(crate) fn makes_table(mode: WriteMode, has_live_columns: bool) -> bool {
 
 /// The refusal of a write that would make a table where a live view has its name, checked
 /// inside the commit, in every mode.
+/// The refusal of a standalone DDL statement on a backend that does not implement it yet
+/// (atomiclabsnz/datafusion-ducklake#18: SQLite and a host's SQLite do).
+pub(crate) fn standalone_ddl_unsupported(statement: &str) -> DuckLakeError {
+    DuckLakeError::Unsupported(format!(
+        "{statement} as its own snapshot is not implemented for this metadata backend yet; \
+         the SQLite catalog (and a host's SQLite) has it"
+    ))
+}
+
 pub(crate) fn view_exists_error(table: impl std::fmt::Display) -> DuckLakeError {
     DuckLakeError::ViewExists(format!(
         "{table}: a write does not create a table where a view has that name"
@@ -4808,6 +4817,37 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
 
     /// End all existing data files for a table. Returns count of files ended.
     fn end_table_files(&self, table_id: i64, snapshot_id: i64) -> Result<u64>;
+
+    /// `CREATE SCHEMA name`, as its own snapshot, as official writes it: a schema row at
+    /// `next_catalog_id`, path `name/`, and the change `created_schema:"name"`. `Ok(false)`,
+    /// and no snapshot, when a live schema has the name and `if_not_exists`; without it,
+    /// [`DuckLakeError::SchemaExists`]. Backends without standalone DDL refuse by name.
+    fn create_schema(&self, _schema_name: &str, _if_not_exists: bool) -> Result<bool> {
+        Err(standalone_ddl_unsupported("CREATE SCHEMA"))
+    }
+
+    /// `DROP TABLE`, as its own snapshot, as official writes it: the table, its columns,
+    /// data and delete files, sort and partition specs and tags all end at the snapshot
+    /// (time travel before it still reads them), and the change is `dropped_table:<id>`.
+    /// Its statistics stay, as official leaves them. `Ok(false)`, and no snapshot, when no
+    /// live table has the name.
+    fn drop_table(&self, _schema_name: &str, _table_name: &str) -> Result<bool> {
+        Err(standalone_ddl_unsupported("DROP TABLE"))
+    }
+
+    /// `DROP VIEW`, as its own snapshot: the view ends at it, change `dropped_view:<id>`.
+    /// `Ok(false)`, and no snapshot, when no live view has the name.
+    fn drop_view(&self, _schema_name: &str, _view_name: &str) -> Result<bool> {
+        Err(standalone_ddl_unsupported("DROP VIEW"))
+    }
+
+    /// `DROP SCHEMA` (without `CASCADE`), as its own snapshot: the schema ends at it, change
+    /// `dropped_schema:<id>`; [`DuckLakeError::SchemaNotEmpty`] while it holds a live table
+    /// or view, as DuckDB refuses it. `Ok(false)`, and no snapshot, when no live schema has
+    /// the name.
+    fn drop_schema(&self, _schema_name: &str) -> Result<bool> {
+        Err(standalone_ddl_unsupported("DROP SCHEMA"))
+    }
 
     /// Get the data path from catalog metadata.
     fn get_data_path(&self) -> Result<String>;

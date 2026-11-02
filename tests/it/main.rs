@@ -121,6 +121,7 @@ mod sql_update_tests;
 mod sql_write_tests;
 mod sqlite_metadata_provider_test;
 mod sqllogictest_runner;
+mod standalone_ddl_tests;
 mod table_changes_tests;
 mod table_deletions_repartition_tests;
 mod table_stats_record_count_tests;

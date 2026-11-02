@@ -1078,12 +1078,16 @@ impl SqliteMetadataWriter {
 
             bump_schema_version(&mut tx, drop_snapshot).await?;
 
+            // Everything of the table official ends with it (DuckDB 1.5.6's DROP TABLE,
+            // read off the catalog): its sort and partition specs too.
             for child in [
                 "ducklake_table",
                 "ducklake_column",
                 "ducklake_column_tag",
                 "ducklake_data_file",
                 "ducklake_delete_file",
+                "ducklake_sort_info",
+                "ducklake_partition_info",
             ] {
                 sqlx::query(AssertSqlSafe(format!(
                     "UPDATE {child} SET end_snapshot = ?
@@ -4111,6 +4115,173 @@ impl SqliteMetadataWriter {
 }
 
 impl MetadataWriter for SqliteMetadataWriter {
+    fn create_schema(&self, schema_name: &str, if_not_exists: bool) -> Result<bool> {
+        validate_name(schema_name, "Schema")?;
+        self.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            // Write-lock-first (see `insert_snapshot`): the snapshot before any read.
+            let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
+            // A pending schema (a write's start, not yet committed) is not one SQL sees.
+            let live: Option<i64> = sqlx::query_scalar(
+                "SELECT schema_id FROM ducklake_schema
+                 WHERE schema_name = ? AND end_snapshot IS NULL AND begin_snapshot <> ?",
+            )
+            .bind(schema_name)
+            .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if live.is_some() {
+                // Rolled back: no snapshot.
+                return if if_not_exists {
+                    Ok(false)
+                } else {
+                    Err(crate::DuckLakeError::SchemaExists(schema_name.to_string()))
+                };
+            }
+            bump_schema_version(&mut tx, snapshot_id).await?;
+            // As `get_or_create_schema` allocates it: the catalog's next id, or SQLite's own
+            // for a catalog without the allocator watermarks.
+            let next_id = next_catalog_id(&mut tx).await?;
+            let _schema_id: i64 = sqlx::query_scalar(
+                "INSERT INTO ducklake_schema
+                     (schema_id, schema_uuid, begin_snapshot, end_snapshot, schema_name, path,
+                      path_is_relative)
+                 VALUES (?, ?, ?, NULL, ?, ?, 1) RETURNING schema_id",
+            )
+            .bind(next_id)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(snapshot_id)
+            .bind(schema_name)
+            .bind(directory_path(schema_name))
+            .fetch_one(&mut *tx)
+            .await?;
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!(
+                    "created_schema:{}",
+                    crate::metadata_writer::quote_snapshot_name(schema_name)
+                ),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            commit(tx).await?;
+            Ok(true)
+        })
+    }
+
+    fn drop_table(&self, schema_name: &str, table_name: &str) -> Result<bool> {
+        SqliteMetadataWriter::drop_table(self, schema_name, table_name)
+    }
+
+    fn drop_view(&self, schema_name: &str, view_name: &str) -> Result<bool> {
+        validate_name(schema_name, "Schema")?;
+        validate_name(view_name, "View")?;
+        self.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
+            let view_id: Option<i64> = sqlx::query_scalar(
+                "SELECT v.view_id FROM ducklake_view v
+                 JOIN ducklake_schema s ON s.schema_id = v.schema_id
+                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL
+                   AND v.view_name = ? AND v.end_snapshot IS NULL",
+            )
+            .bind(schema_name)
+            .bind(view_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(view_id) = view_id else {
+                return Ok(false);
+            };
+            bump_schema_version(&mut tx, snapshot_id).await?;
+            sqlx::query(
+                "UPDATE ducklake_view SET end_snapshot = ? WHERE view_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(view_id)
+            .execute(&mut *tx)
+            .await?;
+            // A view's tags (`COMMENT ON VIEW`) are keyed by its id, as a table's are.
+            sqlx::query(
+                "UPDATE ducklake_tag SET end_snapshot = ? WHERE object_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(view_id)
+            .execute(&mut *tx)
+            .await?;
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!("dropped_view:{view_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            commit(tx).await?;
+            Ok(true)
+        })
+    }
+
+    fn drop_schema(&self, schema_name: &str) -> Result<bool> {
+        validate_name(schema_name, "Schema")?;
+        self.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
+            let schema_id: Option<i64> = sqlx::query_scalar(
+                "SELECT schema_id FROM ducklake_schema
+                 WHERE schema_name = ? AND end_snapshot IS NULL AND begin_snapshot <> ?",
+            )
+            .bind(schema_name)
+            .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(schema_id) = schema_id else {
+                return Ok(false);
+            };
+            // DuckDB without CASCADE: `table "x" depends on schema "s"`. A table a write has
+            // begun and not committed (pending) holds it too: it is about to be live.
+            let dependent: Option<String> = sqlx::query_scalar(
+                "SELECT table_name FROM ducklake_table WHERE schema_id = ? AND end_snapshot IS NULL
+                 UNION ALL
+                 SELECT view_name FROM ducklake_view WHERE schema_id = ? AND end_snapshot IS NULL
+                 LIMIT 1",
+            )
+            .bind(schema_id)
+            .bind(schema_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(dependent) = dependent {
+                return Err(crate::DuckLakeError::SchemaNotEmpty(format!(
+                    "{dependent:?} depends on schema {schema_name:?}; drop it first (CASCADE is \
+                     not supported)"
+                )));
+            }
+            bump_schema_version(&mut tx, snapshot_id).await?;
+            sqlx::query(
+                "UPDATE ducklake_schema SET end_snapshot = ? WHERE schema_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(schema_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE ducklake_tag SET end_snapshot = ? WHERE object_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(schema_id)
+            .execute(&mut *tx)
+            .await?;
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!("dropped_schema:{schema_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            commit(tx).await?;
+            Ok(true)
+        })
+    }
+
     fn maintenance(&self) -> Option<&dyn crate::maintenance::CatalogMaintenance> {
         super::maintenance(self)
     }
