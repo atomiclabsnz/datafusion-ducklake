@@ -33,10 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Standalone DDL as its own snapshot, as DuckDB 1.5.6 writes it (#18): `MetadataWriter::{create_schema,
-  drop_table, drop_view, drop_schema}`, reached from SQL through `DuckLakeCatalog::register_schema` /
-  `deregister_schema` and `DuckLakeSchema::deregister_table`. The SQLite catalog (and a host's
-  SQLite) implements them; other backends refuse by name. `DROP TABLE` now also ends the table's
-  sort and partition specs, as official does.
+  drop_table, drop_view, drop_schema}`. `CREATE SCHEMA` is also reached from SQL
+  (`DuckLakeCatalog::register_schema`); the drops are the writer's to call (a host's executor),
+  not DataFusion's `deregister_*`, which its `CREATE OR REPLACE` calls before registering. The
+  SQLite catalog (and a host's SQLite) implements them; other backends refuse by name.
+  `DROP SCHEMA` refuses a schema holding a table, view or macro. `DROP TABLE` now also ends the
+  table's sort and partition specs, as official does.
 - `WriteMode::Create` and `DuckLakeTableWriter::create_table`: `CREATE TABLE … AS`'s write, refused
   inside the commit (`DuckLakeError::TableExists`) when its name is a live table (#12).
 - `DuckLakeError::ViewExists`: a write that would make a table where a live view has the name.
