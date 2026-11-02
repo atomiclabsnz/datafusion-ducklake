@@ -316,8 +316,8 @@ async fn bare_column_keys_order_inserts_as_the_duckdb_cli() {
     };
     let version = String::from_utf8_lossy(&version.stdout).to_string();
     assert!(
-        version.contains("v1.5.5"),
-        "the oracle is the pinned DuckDB CLI (CI installs v1.5.5), found: {version}"
+        version.contains("v1.5.6"),
+        "the oracle is the pinned DuckDB CLI (CI installs v1.5.6), found: {version}"
     );
     for keys in [
         "ti",
