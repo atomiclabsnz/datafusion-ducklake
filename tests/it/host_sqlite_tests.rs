@@ -142,7 +142,7 @@ async fn duckdb_reads_a_lake_written_through_the_host() {
 }
 
 /// A browser host's DDL (#18): the same SQLite backend over the host's connection, so
-/// `CREATE SCHEMA` and `DROP TABLE` through SQL commit as they do natively, and DuckDB reads
+/// `CREATE SCHEMA` through SQL and `drop_table` through the writer commit as they do natively, and DuckDB reads
 /// the lake after them.
 #[tokio::test(flavor = "multi_thread")]
 async fn ddl_through_the_host_is_read_by_duckdb() {
@@ -155,8 +155,12 @@ async fn ddl_through_the_host_is_read_by_duckdb() {
     writer
         .set_data_path(data_dir(&temp).to_str().unwrap())
         .unwrap();
-    let tables =
-        DuckLakeTableWriter::new(Arc::new(writer), Arc::new(LocalFileSystem::new())).unwrap();
+    let writer = Arc::new(writer);
+    let tables = DuckLakeTableWriter::new(
+        Arc::clone(&writer) as Arc<dyn MetadataWriter>,
+        Arc::new(LocalFileSystem::new()),
+    )
+    .unwrap();
     tables
         .write_table("main", "t", &[ids(&[1, 2, 3])])
         .await
@@ -166,10 +170,11 @@ async fn ddl_through_the_host_is_read_by_duckdb() {
         .await
         .unwrap();
 
+    // CREATE SCHEMA through SQL; the drop through the writer, as a host's executor runs it.
     let ctx = context(Arc::clone(&host));
     run(&ctx, "CREATE SCHEMA ducklake.staging").await;
-    run(&ctx, "DROP TABLE ducklake.main.gone").await;
-    drop((ctx, tables, host));
+    assert!(writer.drop_table("main", "gone").unwrap());
+    drop((ctx, tables, writer, host));
 
     let lake = duckdb(&temp);
     assert_eq!(duckdb_ids(&lake), vec![1, 2, 3]);

@@ -399,43 +399,6 @@ impl SchemaProvider for DuckLakeSchema {
                 .unwrap_or(false)
     }
 
-    /// `DROP TABLE` or `DROP VIEW` of `name`, as its own snapshot
-    /// ([`MetadataWriter::drop_table`], [`MetadataWriter::drop_view`]). DataFusion has
-    /// checked the kind first; the provider dropped is returned, `None` when there is none.
-    #[cfg(feature = "write")]
-    fn deregister_table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
-        let writer = self.writer.as_ref().ok_or_else(|| {
-            DataFusionError::Plan(
-                "Schema is read-only. Use DuckLakeCatalog::with_writer() to enable writes."
-                    .to_string(),
-            )
-        })?;
-        if !matches!(self.snapshot, SnapshotSelection::Latest) {
-            return Err(DataFusionError::Plan(format!(
-                "DROP {name}: the schema is bound to a snapshot, which is read-only"
-            )));
-        }
-        let snapshot_id = self.resolve_snapshot()?;
-        let is_view = self
-            .provider
-            .get_view_by_name(self.schema_id, name, snapshot_id)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?
-            .is_some();
-        let dropped = if is_view {
-            writer.drop_view(&self.schema_name, name)
-        } else {
-            writer.drop_table(&self.schema_name, name)
-        }
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        // The provider as it read before the drop, for whoever asked; DataFusion only checks
-        // that there was one.
-        Ok(dropped.then(|| {
-            Arc::new(datafusion::datasource::empty::EmptyTable::new(Arc::new(
-                arrow::datatypes::Schema::empty(),
-            ))) as Arc<dyn TableProvider>
-        }))
-    }
-
     /// Register a new table in this schema.
     ///
     /// This is called by DataFusion for CREATE TABLE AS SELECT statements.

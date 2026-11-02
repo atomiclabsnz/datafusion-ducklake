@@ -362,7 +362,15 @@ impl CatalogProvider for DuckLakeCatalog {
 
     /// `CREATE SCHEMA`: a schema in the lake, as its own snapshot ([`MetadataWriter::create_schema`]).
     /// DataFusion asks [`Self::schema`] first and hands an in-memory provider over, which is not
-    /// kept: the lake's schema is.
+    /// kept: the lake's schema is. It asks only after finding no schema of the name, and does
+    /// not pass `IF NOT EXISTS` on, so a schema another writer creates in between is
+    /// [`DuckLakeError::SchemaExists`](crate::DuckLakeError::SchemaExists) either way.
+    ///
+    /// The drops (`DROP TABLE`, `DROP VIEW`, `DROP SCHEMA`) are the writer's
+    /// ([`MetadataWriter::drop_table`] and the rest), not DataFusion's `deregister_*`:
+    /// DataFusion's `CREATE OR REPLACE` deregisters before it registers, so a drop there would
+    /// be committed by a replace that then fails, and its `DROP TABLE` reports a refusal of
+    /// `deregister_table` as "doesn't exist". A host runs them through its own executor.
     #[cfg(feature = "write")]
     fn register_schema(
         &self,
@@ -374,29 +382,6 @@ impl CatalogProvider for DuckLakeCatalog {
             .create_schema(name, false)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(None)
-    }
-
-    /// `DROP SCHEMA` without `CASCADE`, as its own snapshot ([`MetadataWriter::drop_schema`]):
-    /// the schema that was dropped, or `None` when the lake has no live schema of the name.
-    #[cfg(feature = "write")]
-    fn deregister_schema(
-        &self,
-        name: &str,
-        cascade: bool,
-    ) -> DataFusionResult<Option<Arc<dyn SchemaProvider>>> {
-        let writer = self.ddl_writer("DROP SCHEMA")?;
-        if cascade {
-            return Err(DataFusionError::NotImplemented(format!(
-                "DROP SCHEMA {name} CASCADE: drop its tables and views first"
-            )));
-        }
-        let Some(schema) = self.schema(name) else {
-            return Ok(None);
-        };
-        let dropped = writer
-            .drop_schema(name)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(dropped.then_some(schema))
     }
 }
 

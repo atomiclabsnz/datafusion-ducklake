@@ -4142,19 +4142,34 @@ impl MetadataWriter for SqliteMetadataWriter {
             // As `get_or_create_schema` allocates it: the catalog's next id, or SQLite's own
             // for a catalog without the allocator watermarks.
             let next_id = next_catalog_id(&mut tx).await?;
-            let _schema_id: i64 = sqlx::query_scalar(
+            // The UUID official gives a schema, where the catalog has the column: the
+            // official schema does, this crate's own `initialize_schema` does not.
+            let has_uuid: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('ducklake_schema')
+                                WHERE name = 'schema_uuid')",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let insert = if has_uuid {
                 "INSERT INTO ducklake_schema
                      (schema_id, schema_uuid, begin_snapshot, end_snapshot, schema_name, path,
                       path_is_relative)
-                 VALUES (?, ?, ?, NULL, ?, ?, 1) RETURNING schema_id",
-            )
-            .bind(next_id)
-            .bind(uuid::Uuid::new_v4().to_string())
-            .bind(snapshot_id)
-            .bind(schema_name)
-            .bind(directory_path(schema_name))
-            .fetch_one(&mut *tx)
-            .await?;
+                 VALUES (?, ?, ?, NULL, ?, ?, 1)"
+            } else {
+                "INSERT INTO ducklake_schema
+                     (schema_id, begin_snapshot, end_snapshot, schema_name, path, path_is_relative)
+                 VALUES (?, ?, NULL, ?, ?, 1)"
+            };
+            let mut insert = sqlx::query(insert).bind(next_id);
+            if has_uuid {
+                insert = insert.bind(uuid::Uuid::new_v4().to_string());
+            }
+            insert
+                .bind(snapshot_id)
+                .bind(schema_name)
+                .bind(directory_path(schema_name))
+                .execute(&mut *tx)
+                .await?;
             record_snapshot_changes(
                 &mut tx,
                 snapshot_id,
@@ -4201,14 +4216,20 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(view_id)
             .execute(&mut *tx)
             .await?;
-            // A view's tags (`COMMENT ON VIEW`) are keyed by its id, as a table's are.
-            sqlx::query(
-                "UPDATE ducklake_tag SET end_snapshot = ? WHERE object_id = ? AND end_snapshot IS NULL",
-            )
-            .bind(snapshot_id)
-            .bind(view_id)
-            .execute(&mut *tx)
-            .await?;
+            // A view's tags (`COMMENT ON VIEW`) are keyed by its id, as a table's are. Only
+            // where schemas, tables and views draw ids from one counter (official's
+            // `next_catalog_id`): this crate's own catalogs number each kind apart, so an id
+            // there can also be a table's, whose tags this must not end.
+            if has_allocator_watermarks(&mut tx).await? {
+                sqlx::query(
+                    "UPDATE ducklake_tag SET end_snapshot = ?
+                     WHERE object_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(snapshot_id)
+                .bind(view_id)
+                .execute(&mut *tx)
+                .await?;
+            }
             record_snapshot_changes(
                 &mut tx,
                 snapshot_id,
@@ -4239,12 +4260,27 @@ impl MetadataWriter for SqliteMetadataWriter {
             };
             // DuckDB without CASCADE: `table "x" depends on schema "s"`. A table a write has
             // begun and not committed (pending) holds it too: it is about to be live.
-            let dependent: Option<String> = sqlx::query_scalar(
-                "SELECT table_name FROM ducklake_table WHERE schema_id = ? AND end_snapshot IS NULL
-                 UNION ALL
-                 SELECT view_name FROM ducklake_view WHERE schema_id = ? AND end_snapshot IS NULL
-                 LIMIT 1",
+            // Its tables, views and macros, as DuckDB counts them (`macro function "f"
+            // depends on schema "s"`). A catalog without the macro table has none.
+            let has_macros: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                                WHERE type = 'table' AND name = 'ducklake_macro')",
             )
+            .fetch_one(&mut *tx)
+            .await?;
+            let macros = if has_macros {
+                " UNION ALL
+                 SELECT macro_name FROM ducklake_macro WHERE schema_id = ?3 AND end_snapshot IS NULL"
+            } else {
+                ""
+            };
+            let dependent: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT table_name FROM ducklake_table WHERE schema_id = ?1 AND end_snapshot IS NULL
+                 UNION ALL
+                 SELECT view_name FROM ducklake_view WHERE schema_id = ?2 AND end_snapshot IS NULL{macros}
+                 LIMIT 1"
+            )))
+            .bind(schema_id)
             .bind(schema_id)
             .bind(schema_id)
             .fetch_optional(&mut *tx)
@@ -4263,13 +4299,17 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(schema_id)
             .execute(&mut *tx)
             .await?;
-            sqlx::query(
-                "UPDATE ducklake_tag SET end_snapshot = ? WHERE object_id = ? AND end_snapshot IS NULL",
-            )
-            .bind(snapshot_id)
-            .bind(schema_id)
-            .execute(&mut *tx)
-            .await?;
+            // As `drop_view`: only where ids are one counter.
+            if has_allocator_watermarks(&mut tx).await? {
+                sqlx::query(
+                    "UPDATE ducklake_tag SET end_snapshot = ?
+                     WHERE object_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(snapshot_id)
+                .bind(schema_id)
+                .execute(&mut *tx)
+                .await?;
+            }
             record_snapshot_changes(
                 &mut tx,
                 snapshot_id,

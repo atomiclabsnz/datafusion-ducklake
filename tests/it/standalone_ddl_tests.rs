@@ -12,7 +12,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
-use datafusion_ducklake::{DuckLakeCatalog, SqliteMetadataProvider, SqliteMetadataWriter};
+use datafusion_ducklake::{
+    DuckLakeCatalog, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
+};
 use tempfile::TempDir;
 
 /// The lake both sides start from, as DuckDB writes it: a schema holding a table with files,
@@ -33,16 +35,50 @@ const SETUP: &str = "
     CREATE TABLE lake.main.inl (id INT);
 ";
 
-/// The statements both sides run, one snapshot each.
-const DDL: &[&str] = &[
-    "DROP VIEW lake.s.vw",
-    "DROP TABLE lake.s.t",
-    "CREATE SCHEMA lake.s2",
-    "DROP SCHEMA lake.s2",
-    "DROP SCHEMA lake.s",
-    "DROP TABLE lake.main.p",
-    "DROP TABLE lake.main.inl",
+/// The statements both sides run, one snapshot each: DuckDB as SQL; this crate's
+/// `CREATE SCHEMA` through DataFusion (`register_schema`), and its drops through the writer,
+/// which is how a host's executor runs them (DataFusion's `deregister_*` would also be
+/// reached by `CREATE OR REPLACE`).
+enum Ddl {
+    CreateSchema(&'static str),
+    DropView(&'static str, &'static str),
+    DropTable(&'static str, &'static str),
+    DropSchema(&'static str),
+}
+
+const DDL: &[Ddl] = &[
+    Ddl::DropView("s", "vw"),
+    Ddl::DropTable("s", "t"),
+    Ddl::CreateSchema("s2"),
+    Ddl::DropSchema("s2"),
+    Ddl::DropSchema("s"),
+    Ddl::DropTable("main", "p"),
+    Ddl::DropTable("main", "inl"),
 ];
+
+impl Ddl {
+    fn sql(&self) -> String {
+        match self {
+            Ddl::CreateSchema(s) => format!("CREATE SCHEMA lake.{s}"),
+            Ddl::DropView(s, v) => format!("DROP VIEW lake.{s}.{v}"),
+            Ddl::DropTable(s, t) => format!("DROP TABLE lake.{s}.{t}"),
+            Ddl::DropSchema(s) => format!("DROP SCHEMA lake.{s}"),
+        }
+    }
+
+    async fn run(&self, ctx: &SessionContext, writer: &dyn MetadataWriter) {
+        let done = match self {
+            Ddl::CreateSchema(_) => {
+                ctx.sql(&self.sql()).await.unwrap().collect().await.unwrap();
+                true
+            },
+            Ddl::DropView(s, v) => writer.drop_view(s, v).unwrap(),
+            Ddl::DropTable(s, t) => writer.drop_table(s, t).unwrap(),
+            Ddl::DropSchema(s) => writer.drop_schema(s).unwrap(),
+        };
+        assert!(done, "{}", self.sql());
+    }
+}
 
 fn duckdb(catalog: &Path, data: &Path) -> duckdb::Connection {
     crate::common::ensure_ducklake_installed();
@@ -59,16 +95,16 @@ fn duckdb(catalog: &Path, data: &Path) -> duckdb::Connection {
     connection
 }
 
-async fn crate_context(catalog: &Path) -> SessionContext {
+async fn crate_context(catalog: &Path) -> (SessionContext, Arc<dyn MetadataWriter>) {
     let url = format!("sqlite:{}?mode=rw", catalog.display());
     let provider = SqliteMetadataProvider::new(&url).await.unwrap();
-    let writer = SqliteMetadataWriter::new(&url).await.unwrap();
+    let writer: Arc<dyn MetadataWriter> = Arc::new(SqliteMetadataWriter::new(&url).await.unwrap());
     let ctx = SessionContext::new();
     ctx.register_catalog(
         "lake",
-        Arc::new(DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap()),
+        Arc::new(DuckLakeCatalog::with_writer(Arc::new(provider), Arc::clone(&writer)).unwrap()),
     );
-    ctx
+    (ctx, writer)
 }
 
 /// Every row of every `ducklake_*` table, with a snapshot's time and a schema's or table's
@@ -145,18 +181,13 @@ async fn standalone_ddl_writes_the_catalog_duckdb_writes() {
 
     let connection = duckdb(&official, &data);
     for statement in DDL {
-        connection.execute_batch(statement).unwrap();
+        connection.execute_batch(&statement.sql()).unwrap();
     }
     drop(connection);
 
-    let ctx = crate_context(&ours).await;
+    let (ctx, writer) = crate_context(&ours).await;
     for statement in DDL {
-        ctx.sql(statement)
-            .await
-            .unwrap_or_else(|e| panic!("{statement}: {e}"))
-            .collect()
-            .await
-            .unwrap_or_else(|e| panic!("{statement}: {e}"));
+        statement.run(&ctx, writer.as_ref()).await;
     }
 
     let (official_rows, our_rows) = (dump(&official), dump(&ours));
@@ -213,9 +244,12 @@ async fn a_schema_holding_a_table_is_not_dropped() {
     std::fs::create_dir_all(&data).unwrap();
     let catalog = temp.path().join("c.sqlite");
     duckdb(&catalog, &data)
-        .execute_batch("CREATE SCHEMA lake.s; CREATE TABLE lake.s.x (i INT);")
+        .execute_batch(
+            "CREATE SCHEMA lake.s; CREATE TABLE lake.s.x (i INT);
+             CREATE SCHEMA lake.m; CREATE MACRO lake.m.f(x) AS x + 1;",
+        )
         .unwrap();
-    let ctx = crate_context(&catalog).await;
+    let (ctx, writer) = crate_context(&catalog).await;
     let snapshots = || {
         duckdb(&catalog, &data)
             .query_row("SELECT count(*) FROM lake.snapshots()", [], |row| {
@@ -224,18 +258,45 @@ async fn a_schema_holding_a_table_is_not_dropped() {
             .unwrap()
     };
     let before = snapshots();
-    for (sql, expected) in [
-        ("DROP SCHEMA lake.s", "depends on schema"),
-        ("DROP SCHEMA lake.s CASCADE", "CASCADE"),
-        ("CREATE SCHEMA lake.s", "already exists"),
-    ] {
-        let refused = match ctx.sql(sql).await {
-            Ok(df) => df.collect().await.map(|_| ()),
-            Err(e) => Err(e),
-        }
-        .expect_err(sql);
-        assert!(refused.to_string().contains(expected), "{sql}: {refused}");
+    // A macro holds its schema too, as DuckDB counts it (`macro function "f" depends on
+    // schema "m"`).
+    let refused = writer
+        .drop_schema("m")
+        .expect_err("a schema holding a macro");
+    assert!(
+        matches!(refused, datafusion_ducklake::DuckLakeError::SchemaNotEmpty(ref m) if m.contains("\"f\"")),
+        "{refused}"
+    );
+    let refused = writer
+        .drop_schema("s")
+        .expect_err("a schema holding a table");
+    assert!(
+        matches!(refused, datafusion_ducklake::DuckLakeError::SchemaNotEmpty(ref m) if m.contains("depends on schema")),
+        "{refused}"
+    );
+    let refused = writer.create_schema("s", false).expect_err("a live schema");
+    assert!(
+        matches!(refused, datafusion_ducklake::DuckLakeError::SchemaExists(_)),
+        "{refused}"
+    );
+    assert!(
+        !writer.create_schema("s", true).unwrap(),
+        "IF NOT EXISTS leaves it"
+    );
+    // DataFusion's CREATE SCHEMA asks the catalog first; DROP and CREATE OR REPLACE do not
+    // reach the lake through DataFusion at all: main's refusal stands.
+    let refused = ctx
+        .sql("CREATE SCHEMA lake.s")
+        .await
+        .map(|_| ())
+        .expect_err("already exists");
+    assert!(refused.to_string().contains("already exists"), "{refused}");
+    let refused = match ctx.sql("DROP TABLE lake.s.x").await {
+        Ok(df) => df.collect().await.map(|_| ()),
+        Err(e) => Err(e),
     }
+    .expect_err("DataFusion does not drop a lake table");
+    assert!(!refused.to_string().is_empty());
     ctx.sql("CREATE SCHEMA IF NOT EXISTS lake.s")
         .await
         .unwrap()
@@ -243,4 +304,103 @@ async fn a_schema_holding_a_table_is_not_dropped() {
         .await
         .unwrap();
     assert_eq!(snapshots(), before, "nothing was written");
+}
+
+/// DataFusion's `CREATE OR REPLACE TABLE` deregisters the old table before it registers the
+/// new one; the lake's schema has no `deregister_table`, so a replace there is refused before
+/// anything is written, as before standalone DDL, and the table keeps its rows (#24 review).
+#[tokio::test(flavor = "multi_thread")]
+async fn create_or_replace_through_datafusion_drops_nothing() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let catalog = temp.path().join("c.sqlite");
+    duckdb(&catalog, &data)
+        .execute_batch("CREATE TABLE lake.main.t AS SELECT 1 AS id;")
+        .unwrap();
+    let (ctx, _writer) = crate_context(&catalog).await;
+    for sql in [
+        "CREATE OR REPLACE TABLE lake.main.t AS SELECT 2 AS id",
+        "CREATE OR REPLACE TABLE lake.main.t (id INT)",
+    ] {
+        let refused = match ctx.sql(sql).await {
+            Ok(df) => df.collect().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        assert!(
+            refused.is_err(),
+            "{sql}: refused before anything is written"
+        );
+    }
+    let rows: i64 = duckdb(&catalog, &data)
+        .query_row("SELECT count(*) FROM lake.main.t WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 1, "the table and its row are as they were");
+}
+
+/// On a catalog this crate created itself (`initialize_schema`: no `schema_uuid`, ids numbered
+/// per kind): `CREATE SCHEMA` and `DROP SCHEMA` work, and a drop ends no tag keyed by the same
+/// number, which there can be another object's (#24 review).
+#[tokio::test(flavor = "multi_thread")]
+async fn ddl_on_a_catalog_this_crate_created() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let catalog = temp.path().join("own.sqlite");
+    let url = format!("sqlite:{}?mode=rwc", catalog.display());
+    let writer = SqliteMetadataWriter::new_with_init(&url).await.unwrap();
+    writer.set_data_path(data.to_str().unwrap()).unwrap();
+    let writer: Arc<dyn MetadataWriter> = Arc::new(writer);
+    let provider = SqliteMetadataProvider::new(&url).await.unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        "lake",
+        Arc::new(DuckLakeCatalog::with_writer(Arc::new(provider), Arc::clone(&writer)).unwrap()),
+    );
+    let sql = |statement: &'static str| {
+        let ctx = ctx.clone();
+        async move { ctx.sql(statement).await.unwrap().collect().await.unwrap() }
+    };
+    sql("CREATE SCHEMA lake.x").await;
+
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    let schema_id: i64 = sqlx::query_scalar(
+        "SELECT schema_id FROM ducklake_schema WHERE schema_name = 'x' AND end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    // A tag keyed by the schema's number, as another object's comment would be.
+    sqlx::query(
+        "INSERT INTO ducklake_tag (object_id, begin_snapshot, end_snapshot, key, value)
+         VALUES (?, 1, NULL, 'comment', 'another object')",
+    )
+    .bind(schema_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let live_tags = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM ducklake_tag WHERE object_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(schema_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(live_tags().await, 1);
+    assert!(
+        writer.drop_schema("x").unwrap(),
+        "the empty schema is dropped"
+    );
+    assert_eq!(
+        live_tags().await,
+        1,
+        "a tag keyed by the same number is not the schema's"
+    );
 }

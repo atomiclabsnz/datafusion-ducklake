@@ -110,18 +110,18 @@ pub(crate) fn makes_table(mode: WriteMode, has_live_columns: bool) -> bool {
 
 /// The refusal of a write that would make a table where a live view has its name, checked
 /// inside the commit, in every mode.
+pub(crate) fn view_exists_error(table: impl std::fmt::Display) -> DuckLakeError {
+    DuckLakeError::ViewExists(format!(
+        "{table}: a write does not create a table where a view has that name"
+    ))
+}
+
 /// The refusal of a standalone DDL statement on a backend that does not implement it yet
 /// (atomiclabsnz/datafusion-ducklake#18: SQLite and a host's SQLite do).
 pub(crate) fn standalone_ddl_unsupported(statement: &str) -> DuckLakeError {
     DuckLakeError::Unsupported(format!(
         "{statement} as its own snapshot is not implemented for this metadata backend yet; \
          the SQLite catalog (and a host's SQLite) has it"
-    ))
-}
-
-pub(crate) fn view_exists_error(table: impl std::fmt::Display) -> DuckLakeError {
-    DuckLakeError::ViewExists(format!(
-        "{table}: a write does not create a table where a view has that name"
     ))
 }
 
