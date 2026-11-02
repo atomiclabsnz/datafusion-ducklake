@@ -141,6 +141,55 @@ async fn duckdb_reads_a_lake_written_through_the_host() {
     assert_eq!(duckdb_ids(&lake), expected);
 }
 
+/// A browser host's DDL (#18): the same SQLite backend over the host's connection, so
+/// `CREATE SCHEMA` and `DROP TABLE` through SQL commit as they do natively, and DuckDB reads
+/// the lake after them.
+#[tokio::test(flavor = "multi_thread")]
+async fn ddl_through_the_host_is_read_by_duckdb() {
+    let temp = TempDir::new().unwrap();
+    let host = SqlxHost::open(&catalog_url(&temp)).unwrap();
+    let writer = HostSqliteMetadataWriter::from_host(Arc::clone(&host))
+        .unwrap()
+        .with_data_inlining_row_limit(0);
+    writer.initialize_official_schema().unwrap();
+    writer
+        .set_data_path(data_dir(&temp).to_str().unwrap())
+        .unwrap();
+    let tables =
+        DuckLakeTableWriter::new(Arc::new(writer), Arc::new(LocalFileSystem::new())).unwrap();
+    tables
+        .write_table("main", "t", &[ids(&[1, 2, 3])])
+        .await
+        .unwrap();
+    tables
+        .write_table("main", "gone", &[ids(&[9])])
+        .await
+        .unwrap();
+
+    let ctx = context(Arc::clone(&host));
+    run(&ctx, "CREATE SCHEMA ducklake.staging").await;
+    run(&ctx, "DROP TABLE ducklake.main.gone").await;
+    drop((ctx, tables, host));
+
+    let lake = duckdb(&temp);
+    assert_eq!(duckdb_ids(&lake), vec![1, 2, 3]);
+    let schemas: Vec<String> = lake
+        .prepare(
+            "SELECT schema_name FROM information_schema.schemata
+             WHERE catalog_name = 'lake' ORDER BY schema_name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(schemas.contains(&"staging".to_string()), "{schemas:?}");
+    assert!(
+        lake.execute_batch("SELECT * FROM lake.main.gone").is_err(),
+        "the dropped table is gone"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_host_reads_and_writes_a_lake_duckdb_wrote() {
     let temp = TempDir::new().unwrap();

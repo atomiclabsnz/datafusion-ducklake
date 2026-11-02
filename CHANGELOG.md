@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** in `stats_encode`, `ColumnStats::from_global` and the three merges take
   `table_has_rows: bool` (official's `record_count > 0`), `merge_table_column_stats` takes the
   fields a write leaves without statistics, and `ColumnStats` has a `bounds_unknown` field.
+- **Breaking:** `DuckLakeError::SchemaExists` (a `CREATE SCHEMA` of a live schema) and
+  `DuckLakeError::SchemaNotEmpty` (a `DROP SCHEMA` of a schema holding a table or view, without
+  `CASCADE`). Exhaustive matches need the two arms.
 - **Breaking:** a live view of a table's name is refused as `DuckLakeError::ViewExists`, no longer
   `TableExists`, and not only by `WriteMode::Create`: a Replace or Append that would make the
   table (it has no live columns yet) is refused inside the commit too, so a view created after
@@ -29,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Standalone DDL as its own snapshot, as DuckDB 1.5.6 writes it (#18): `MetadataWriter::{create_schema,
+  drop_table, drop_view, drop_schema}`, reached from SQL through `DuckLakeCatalog::register_schema` /
+  `deregister_schema` and `DuckLakeSchema::deregister_table`. The SQLite catalog (and a host's
+  SQLite) implements them; other backends refuse by name. `DROP TABLE` now also ends the table's
+  sort and partition specs, as official does.
 - `WriteMode::Create` and `DuckLakeTableWriter::create_table`: `CREATE TABLE … AS`'s write, refused
   inside the commit (`DuckLakeError::TableExists`) when its name is a live table (#12).
 - `DuckLakeError::ViewExists`: a write that would make a table where a live view has the name.
