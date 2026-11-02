@@ -654,12 +654,7 @@ fn build_datafusion_statistics(
         // deletes, retired files and truncates leave them wider than the rows.
         if use_current_table_statistics && let Some(raw) = table_column_rows.get(&column.column_id)
         {
-            // Not from a row with neither bound: on a table with rows its bounds are
-            // unknown (official 1.5.6), and a row an earlier release of this crate wrote that
-            // way may carry a NULL flag its files never backed (#23 review).
-            if raw.contains_null == Some(false)
-                && (raw.min_value.is_some() || raw.max_value.is_some())
-            {
+            if raw.contains_null == Some(false) {
                 output.null_count = Precision::Exact(0);
             }
             let bounds_usable = float_bound_is_usable(field_type, raw.contains_nan);

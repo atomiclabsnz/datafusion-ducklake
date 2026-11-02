@@ -791,12 +791,6 @@ Differences from official:
   prunes rows that match; 1.5.6 keeps the row unbounded and finds them. Repro with
   DuckDB 1.5.5: with the limit at `0`, insert `repeat('é', 300)`, then `'a'`;
   `WHERE c0 > 'b'` finds no row.
-- After a column is widened (`promote_column_type`, official's `ALTER ... SET DATA TYPE`),
-  DuckDB 1.5.5 drops its bounds at the next statistics merge (a flush, or an insert in a
-  session that read the table before) and narrows them on the write after, so it
-  prunes rows that match; 1.5.6 keeps them, as this crate does. Repro with DuckDB 1.5.5: inline `0`
-  into an `INTEGER` column, widen it to `BIGINT`, flush, then insert `5` to Parquet;
-  `WHERE c2 = 0` finds no row.
 - When a column is widened while the table's inlining limit is `0`, no inlined table is
   created for the new schema version, and official's later inlined inserts go to the older
   inlined table, whose column keeps the narrower type. On DuckDB metadata a value past that

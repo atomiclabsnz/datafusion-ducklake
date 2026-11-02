@@ -1866,8 +1866,13 @@ fn merge_file_table_column_stats(
 /// The table's stored `ducklake_table_column_stats` rows. A row with neither bound
 /// holds no valid value on a table without rows, and on one with rows its bounds are
 /// unknown, as official reads it from 1.5.6 (see
-/// [`crate::stats_encode::ColumnStats::from_global`]); either way it is merged into as it
-/// is, as official merges into it.
+/// [`crate::stats_encode::ColumnStats::from_global`]); it is merged into as it is, as
+/// official merges into it. But for one shape: releases of this crate up to 0.9 wrote a row
+/// with neither bound for a live file whose statistics they did not have, and its NULL
+/// flag can say "no NULLs" of a file that holds some, which any reader (DuckDB's too) would
+/// prune `IS NULL` by. A row with neither bound, `contains_null` false, no NaN and no
+/// `extra_stats`, over a live file of an earlier commit not known to hold only NULLs or only
+/// NaN, is dropped here: the field then has no row, which is unknown, NULL flag included.
 fn load_table_column_stats(
     tx: &Transaction<'_>,
     table_id: i64,
@@ -1875,7 +1880,20 @@ fn load_table_column_stats(
     let mut statement = tx.prepare(
         "SELECT s.column_id, s.contains_null, s.contains_nan, s.min_value, s.max_value
          FROM ducklake_table_column_stats s
-         WHERE s.table_id = ?",
+         WHERE s.table_id = ?
+           AND NOT (s.min_value IS NULL AND s.max_value IS NULL
+                    AND s.contains_null IS NOT NULL AND NOT s.contains_null
+                    AND (s.contains_nan IS NULL OR NOT s.contains_nan)
+                    AND s.extra_stats IS NULL AND EXISTS (
+               SELECT 1 FROM ducklake_data_file d
+               WHERE d.table_id = s.table_id AND d.end_snapshot IS NULL
+                 AND d.begin_snapshot < (SELECT MAX(snapshot_id) FROM ducklake_snapshot)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM ducklake_file_column_stats f
+                     WHERE f.data_file_id = d.data_file_id AND f.column_id = s.column_id
+                       AND ((f.null_count IS NOT NULL AND f.value_count = 0)
+                            OR (f.contains_nan AND f.min_value IS NULL
+                                AND f.max_value IS NULL)))))",
     )?;
     Ok(statement
         .query_map(params![table_id], |row| {

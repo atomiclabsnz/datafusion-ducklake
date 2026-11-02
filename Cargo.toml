@@ -60,11 +60,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 tempfile = { version = "3.14", optional = true }
 
 # Metadata providers (optional)
-# DuckDB 1.5.x only: duckdb-rs numbers DuckDB 1.x.y as 1.(10000x+y), so 1.5.6 is 1.10506
-# and 2.0.0 is 1.20000; a caret `^1.10506` would take 1.6 and 2.0 on the next `cargo update`.
-# Later 1.5.x patches (1.10507...) are taken; the oracle pins (CLI `v1.5.6`, the ducklake
-# extension) move with any other minor. 2.0 waits on its own work (DuckLake format 1.1, #22).
-duckdb = { version = ">=1.10506.1, <1.10600", optional = true }
+# DuckDB 1.5.6 builds only, because the oracle is pinned exactly to it (CI's CLI `v1.5.6`, the
+# ducklake extension `ac7595b0`): a later DuckDB moves with them, deliberately. duckdb-rs
+# numbers DuckDB X.Y.Z as 1.(10000*X + 100*Y + Z), so 1.5.6 is 1.10506 and 2.0.0 is
+# 1.20000, and a caret `^1.10506` would take both 1.5.7 and 2.0 on the next `cargo update`.
+# 2.0 waits on its own work (DuckLake format 1.1, #22).
+duckdb = { version = "~1.10506.1", optional = true }
 sqlx = { version = "0.9", features = ["runtime-tokio"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

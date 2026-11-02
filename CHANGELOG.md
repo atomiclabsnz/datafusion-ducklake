@@ -9,13 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- DuckDB 1.5.6 is the bundled engine (`duckdb >=1.10506.1, <1.10600`) and the oracle (CI's CLI,
+- DuckDB 1.5.6 is the bundled engine (`duckdb ~1.10506.1`) and the oracle (CI's CLI,
   the `ducklake` extension `ac7595b0`); 1.5.5 before. DuckDB 2.0 / format 1.1 is #22.
 - Table statistics as official reads them from 1.5.6: a `ducklake_table_column_stats` row with
   neither bound, on a table with rows, is **bounds unknown** and no later write narrows it
   (official's `bounds_unknown`, duckdb/ducklake#1397). It is kept, where the earlier load-time
-  repair of such rows (written by releases up to 0.9) dropped it. A row with neither bound no
-  longer reports an exact zero NULL count. The first write of a table through the
+  repair of such rows (written by releases up to 0.9) dropped it; that repair now drops only
+  the one shape that can mislead a reader, `contains_null` false. The first write of a table through the
   with-deletes commit (DuckDB and MySQL catalogs) now creates its statistics rows, as every
   other path does: the merge runs before the write advances `ducklake_table_stats`.
 - **Breaking:** in `stats_encode`, `ColumnStats::from_global` and the three merges take
