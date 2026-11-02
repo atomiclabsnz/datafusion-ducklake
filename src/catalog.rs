@@ -15,6 +15,8 @@ use datafusion::prelude::SessionContext;
 
 #[cfg(feature = "write")]
 use crate::metadata_writer::MetadataWriter;
+#[cfg(feature = "write")]
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 
 /// Configuration for write operations (when write feature is enabled)
 #[cfg(feature = "write")]
@@ -356,5 +358,50 @@ impl CatalogProvider for DuckLakeCatalog {
                 None
             },
         }
+    }
+
+    /// `CREATE SCHEMA`: a schema in the lake, as its own snapshot ([`MetadataWriter::create_schema`]).
+    /// DataFusion asks [`Self::schema`] first and hands an in-memory provider over, which is not
+    /// kept: the lake's schema is. It asks only after finding no schema of the name, and does
+    /// not pass `IF NOT EXISTS` on, so a schema another writer creates in between is taken as
+    /// there: dbt's `create schema if not exists` must not fail on that race, and a plain
+    /// `CREATE SCHEMA` it lost would have met the schema a moment later anyway.
+    ///
+    /// The drops (`DROP TABLE`, `DROP VIEW`, `DROP SCHEMA`) are the writer's
+    /// ([`MetadataWriter::drop_table`] and the rest), not DataFusion's `deregister_*`:
+    /// DataFusion's `CREATE OR REPLACE` deregisters before it registers, so a drop there would
+    /// be committed by a replace that then fails, and its `DROP TABLE` reports a refusal of
+    /// `deregister_table` as "doesn't exist". A host runs them through its own executor.
+    #[cfg(feature = "write")]
+    fn register_schema(
+        &self,
+        name: &str,
+        _schema: Arc<dyn SchemaProvider>,
+    ) -> DataFusionResult<Option<Arc<dyn SchemaProvider>>> {
+        let writer = self.ddl_writer("CREATE SCHEMA")?;
+        writer
+            .create_schema(name, true)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "write")]
+impl DuckLakeCatalog {
+    /// The writer a DDL statement commits through: refused on a read-only catalog, or one
+    /// bound to a snapshot (time travel reads; it does not write).
+    fn ddl_writer(&self, statement: &str) -> DataFusionResult<&Arc<dyn MetadataWriter>> {
+        let Some(config) = self.write_config.as_ref() else {
+            return Err(DataFusionError::Plan(format!(
+                "{statement}: the catalog is read-only. Use DuckLakeCatalog::with_writer() to \
+                 enable writes."
+            )));
+        };
+        if !matches!(self.snapshot, SnapshotSelection::Latest) {
+            return Err(DataFusionError::Plan(format!(
+                "{statement}: the catalog is bound to a snapshot, which is read-only"
+            )));
+        }
+        Ok(&config.writer)
     }
 }

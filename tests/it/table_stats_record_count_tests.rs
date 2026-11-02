@@ -1,4 +1,4 @@
-//! `ducklake_table_stats.record_count` against official DuckLake (DuckDB 1.5.5).
+//! `ducklake_table_stats.record_count` against official DuckLake (DuckDB 1.5.6).
 //!
 //! Official keeps `record_count` as the gross count of rows ever inserted: only
 //! inserts raise it, and deletes, truncates, flushes and compaction leave it.
@@ -44,6 +44,9 @@ enum Op {
     /// column held only NULLs: neither bound, meaning unknown. Official does
     /// nothing; its own rows already cover the values.
     LegacyNullBounds,
+    /// [`Op::LegacyNullBounds`], and the row's NULL flag says "no NULLs" as well, which an
+    /// earlier release could store for a file whose statistics it did not have.
+    LegacyNullBoundsNoNulls,
     /// Replace the table's rows (`DELETE` and `INSERT` in one transaction for
     /// official).
     Replace(&'static [i32]),
@@ -74,6 +77,11 @@ const QUERIES: [&str; 4] = [
 ];
 
 /// The statement [`Op::LegacyNullBounds`] runs on the crate's metadata.
+const LEGACY_NULL_BOUNDS_NO_NULLS: &str = "UPDATE ducklake_table_column_stats \
+     SET min_value = NULL, max_value = NULL, contains_nan = NULL, contains_null = false \
+     WHERE table_id = (SELECT table_id FROM ducklake_table \
+                       WHERE table_name = 't' AND end_snapshot IS NULL)";
+
 const LEGACY_NULL_BOUNDS: &str = "UPDATE ducklake_table_column_stats \
      SET min_value = NULL, max_value = NULL, contains_nan = NULL \
      WHERE table_id = (SELECT table_id FROM ducklake_table \
@@ -163,6 +171,19 @@ fn scenarios() -> Vec<Scenario> {
             limit: 0,
             ops: &[Op::AppendNull, Op::Append(&[50, 60]), Op::LegacyNullBounds, Op::Append(&[5])],
         },
+        // ...and one whose NULL flag says "no NULLs" over a file that holds one: dropped, so
+        // no reader prunes `IS NULL` by it (#23 review). Kept, its flags would not be
+        // official's, and the check below would say so.
+        Scenario {
+            name: "legacy unknown bounds without NULLs then append",
+            limit: 0,
+            ops: &[
+                Op::AppendNull,
+                Op::Append(&[50, 60]),
+                Op::LegacyNullBoundsNoNulls,
+                Op::Append(&[5]),
+            ],
+        },
         Scenario {
             name: "legacy unknown bounds then inlined append",
             limit: 0,
@@ -174,12 +195,25 @@ fn scenarios() -> Vec<Scenario> {
                 Op::Append(&[5]),
             ],
         },
-        // A roll-up with neither bound over files holding only NULLs means no
-        // valid value, as official reads it: the next write takes its bounds.
+        // A roll-up with neither bound over files holding only NULLs: from 1.5.6
+        // official reads it as bounds unknown on a table with rows (it cannot tell
+        // them from bounds a retype invalidated), so the next write keeps them unknown.
         Scenario {
             name: "all-NULL column then append",
             limit: 0,
             ops: &[Op::AppendNull, Op::AppendNull, Op::Append(&[5])],
+        },
+        // ...and stay unknown however many writes follow: official keeps the row, and its
+        // NULL flag, from then on.
+        Scenario {
+            name: "all-NULL column then two appends",
+            limit: 0,
+            ops: &[Op::AppendNull, Op::AppendNull, Op::Append(&[5]), Op::Append(&[7])],
+        },
+        Scenario {
+            name: "inlined all-NULL column then two appends",
+            limit: 10,
+            ops: &[Op::AppendNull, Op::Append(&[5]), Op::Append(&[7])],
         },
     ]
 }
@@ -224,7 +258,7 @@ fn official_statements(scenario: &Scenario) -> Vec<String> {
         match op {
             Op::Append(v) => out.push(format!("INSERT INTO lake.main.t VALUES {}", values(v))),
             Op::AppendNull => out.push("INSERT INTO lake.main.t VALUES (NULL)".to_string()),
-            Op::LegacyNullBounds => {},
+            Op::LegacyNullBounds | Op::LegacyNullBoundsNoNulls => {},
             Op::Limit(limit) => out.push(format!(
                 "CALL lake.set_option('data_inlining_row_limit', {limit})"
             )),
@@ -320,12 +354,17 @@ async fn apply_crate(side: &Side, scenario: &Scenario) {
                     .await
                     .unwrap();
             },
-            Op::LegacyNullBounds => {
+            Op::LegacyNullBounds | Op::LegacyNullBoundsNoNulls => {
                 let exec = side
                     .metadata_exec
                     .as_ref()
                     .expect("the backend runs metadata statements");
-                exec(LEGACY_NULL_BOUNDS).await;
+                exec(if matches!(op, Op::LegacyNullBounds) {
+                    LEGACY_NULL_BOUNDS
+                } else {
+                    LEGACY_NULL_BOUNDS_NO_NULLS
+                })
+                .await;
             },
             Op::Limit(new) => {
                 limit = *new;
@@ -502,7 +541,7 @@ async fn run(
     let legacy = scenario
         .ops
         .iter()
-        .any(|op| matches!(op, Op::LegacyNullBounds));
+        .any(|op| matches!(op, Op::LegacyNullBounds | Op::LegacyNullBoundsNoNulls));
     if legacy && side.metadata_exec.is_none() {
         return Vec::new();
     }
@@ -532,8 +571,16 @@ async fn run(
     let rewrite = scenario.ops.iter().any(|op| matches!(op, Op::Rewrite));
     if !rewrite {
         let (got, want) = (column_stats(check.raw), column_stats(&official_metadata));
-        // A legacy roll-up may also be dropped: no row is unknown.
-        if got != want && !(legacy && got.is_empty()) {
+        // A legacy roll-up is unknown however it is kept: as no row, or (official 1.5.6's
+        // reading) as a row with neither bound on a table with rows, whose NULL and NaN flags
+        // (the first two fields, which hold no comma) are official's.
+        let flags = |row: &str| row.splitn(3, ',').take(2).collect::<Vec<_>>().join(",");
+        let unknown_as_official = got.len() == want.len()
+            && got
+                .iter()
+                .zip(&want)
+                .all(|(g, w)| g.ends_with(",NULL,NULL") && flags(g) == flags(w));
+        if got != want && !(legacy && (got.is_empty() || unknown_as_official)) {
             failures.push(format!(
                 "{}: ducklake_table_column_stats is {got:?}, official's {want:?}",
                 scenario.name

@@ -3022,28 +3022,30 @@ pub(crate) async fn merge_file_table_column_stats(
     files: &[Vec<crate::stats_encode::FileColumnStat>],
 ) -> Result<()> {
     let initialized = table_stats_initialized(tx, table_id).await?;
+    let table_has_rows = table_has_rows(tx, table_id).await?;
     let live: Vec<i64> = fields.iter().map(|(id, _)| *id).collect();
     let existing = load_table_column_stats(tx, table_id).await?;
-    let merged =
-        crate::stats_encode::merge_file_column_stats(existing, initialized, files, &live, |id| {
-            crate::metadata_writer::stat_kind_of(fields, id)
-        });
+    let merged = crate::stats_encode::merge_file_column_stats(
+        existing,
+        initialized,
+        table_has_rows,
+        files,
+        &live,
+        |id| crate::metadata_writer::stat_kind_of(fields, id),
+    );
     store_table_column_stats(tx, table_id, merged).await
 }
 
-/// The table's stored `ducklake_table_column_stats` rows, less those whose
-/// bounds are unknown. A row with neither bound reads as holding no valid value
-/// (see [`crate::stats_encode::ColumnStats::from_global`]). Official writes one
-/// while the column's live files hold only NULLs or only NaN (whose bounds no
-/// reader uses once `contains_nan` is set), after a rewrite recomputes the
-/// statistics from such files, and for a `GEOMETRY` column, whose bounds are in
-/// `extra_stats`; this crate keeps those rows, as official merges into them.
-/// Releases of this crate up to 0.9 also wrote one, without NaN, when a live
-/// file's bounds were missing: a row with neither bound, no NaN and no
-/// `extra_stats` over a live file of an earlier commit not known to hold only
-/// NULLs or only NaN is dropped here, so the merge leaves the field with no row
-/// (unknown) instead of narrowing it to the new values. The commit's own
-/// snapshot is the newest, so its new files are not counted.
+/// The table's stored `ducklake_table_column_stats` rows. A row with neither bound
+/// holds no valid value on a table without rows, and on one with rows its bounds are
+/// unknown, as official reads it from 1.5.6 (see
+/// [`crate::stats_encode::ColumnStats::from_global`]); it is merged into as it is, as
+/// official merges into it. But for one shape: releases of this crate up to 0.9 wrote a row
+/// with neither bound for a live file whose statistics they did not have, and its NULL
+/// flag can say "no NULLs" of a file that holds some, which any reader (DuckDB's too) would
+/// prune `IS NULL` by. A row with neither bound, `contains_null` false, no NaN and no
+/// `extra_stats`, over a live file of an earlier commit not known to hold only NULLs or only
+/// NaN, is dropped here: the field then has no row, which is unknown, NULL flag included.
 async fn load_table_column_stats(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table_id: i64,
@@ -3054,6 +3056,7 @@ async fn load_table_column_stats(
          FROM ducklake_table_column_stats s
          WHERE s.table_id = $1
            AND NOT (s.min_value IS NULL AND s.max_value IS NULL
+                    AND s.contains_null IS NOT NULL AND NOT s.contains_null
                     AND (s.contains_nan IS NULL OR NOT s.contains_nan)
                     AND s.extra_stats IS NULL AND EXISTS (
                SELECT 1 FROM ducklake_data_file d
@@ -3157,6 +3160,21 @@ async fn table_stats_initialized(
     .await?)
 }
 
+/// Whether the table holds rows before this write (`ducklake_table_stats.record_count`), as
+/// official asks when it reads the stored statistics: a row with neither bound on a table
+/// with rows is bounds unknown (see [`crate::stats_encode::ColumnStats::from_global`]).
+async fn table_has_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: i64,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE(MAX(record_count), 0) > 0 FROM ducklake_table_stats WHERE table_id = $1",
+    )
+    .bind(table_id)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
 /// Merge the statistics of `batches`, written inline to the table, into its
 /// `ducklake_table_column_stats`, as official DuckLake does on an inlined write
 /// (see [`crate::stats_encode::merge_inlined_column_stats`]). A NULL in one of
@@ -3174,6 +3192,7 @@ pub(crate) async fn merge_inlined_table_column_stats(
     snapshot_id_columns: &[String],
     snapshot_id: i64,
     initialized: bool,
+    table_has_rows: bool,
 ) -> Result<()> {
     let fields = crate::metadata_writer::catalog_fields(columns, column_ids)?;
     let inlined = crate::stats_encode::inlined_column_stats(batches, &fields, |i| {
@@ -3183,10 +3202,13 @@ pub(crate) async fn merge_inlined_table_column_stats(
             .map(|_| datafusion::common::ScalarValue::Int64(Some(snapshot_id)))
     })?;
     let existing = load_table_column_stats(tx, table_id).await?;
-    let merged =
-        crate::stats_encode::merge_inlined_column_stats(existing, inlined, initialized, |id| {
-            crate::metadata_writer::stat_kind_of(&fields, id)
-        });
+    let merged = crate::stats_encode::merge_inlined_column_stats(
+        existing,
+        inlined,
+        initialized,
+        table_has_rows,
+        |id| crate::metadata_writer::stat_kind_of(&fields, id),
+    );
     store_table_column_stats(tx, table_id, merged).await
 }
 
@@ -4413,6 +4435,7 @@ pub(crate) async fn commit_inlined_at_snapshot(
         .await?
         .system;
     let stats_initialized = table_stats_initialized(tx, write.table_id).await?;
+    let stats_had_rows = table_has_rows(tx, write.table_id).await?;
     crate::metadata_writer_postgres_allocators::seed_table_stats(tx, write.table_id).await?;
     let mut row_id: i64 =
         sqlx::query_scalar("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
@@ -4473,6 +4496,7 @@ pub(crate) async fn commit_inlined_at_snapshot(
         &write.snapshot_id_columns,
         snapshot_id,
         stats_initialized,
+        stats_had_rows,
     )
     .await?;
     let record_count = i64::try_from(record_count).map_err(|_| {
@@ -6479,6 +6503,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 inlined_insert_table(&mut tx, table_id, snapshot_id, &fields).await?;
             let system = inlined_table_layout(&mut *tx, &physical_name).await?.system;
             let stats_initialized = table_stats_initialized(&mut tx, table_id).await?;
+            let stats_had_rows = table_has_rows(&mut tx, table_id).await?;
             sqlx::query(
                 "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
@@ -6539,6 +6564,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &[],
                 snapshot_id,
                 stats_initialized,
+                stats_had_rows,
             )
             .await?;
             let record_count = i64::try_from(record_count).map_err(|_| {

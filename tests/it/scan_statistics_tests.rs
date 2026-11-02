@@ -729,8 +729,8 @@ async fn duckdb_written_catalog_is_read_correctly() {
     };
     let version = String::from_utf8_lossy(&version.stdout).to_string();
     assert!(
-        version.contains("v1.5.5"),
-        "fixture must be built by the pinned DuckDB CLI (CI installs v1.5.5), found: {version}"
+        version.contains("v1.5.6"),
+        "fixture must be built by the pinned DuckDB CLI (CI installs v1.5.6), found: {version}"
     );
 
     let temp = TempDir::new().unwrap();
@@ -779,7 +779,7 @@ async fn duckdb_written_catalog_is_read_correctly() {
         .trim()
         .to_string();
     assert_eq!(
-        extension, "d8a1881e",
+        extension, "ac7595b0",
         "fixture must be written by the oracle ducklake extension"
     );
 

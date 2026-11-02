@@ -734,7 +734,7 @@ mod sqlite {
 
     /// A change-feed window spanning flushed history reports what it reported
     /// before the flush: each update as its pre- and postimage, once. Official
-    /// DuckLake (DuckDB 1.5.5) diverges here — after the flush its window repeats
+    /// DuckLake (DuckDB 1.5.x) diverges here — after the flush its window repeats
     /// the first update's rows and reports the second update as an insert.
     #[tokio::test(flavor = "multi_thread")]
     async fn change_feed_across_a_flush_is_unchanged() {

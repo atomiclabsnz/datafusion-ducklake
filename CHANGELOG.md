@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- DuckDB 1.5.6 is the bundled engine (`duckdb ~1.10506.1`) and the oracle (CI's CLI,
+  the `ducklake` extension `ac7595b0`); 1.5.5 before. DuckDB 2.0 / format 1.1 is #22.
+- Table statistics as official reads them from 1.5.6: a `ducklake_table_column_stats` row with
+  neither bound, on a table with rows, is **bounds unknown** and no later write narrows it
+  (official's `bounds_unknown`, duckdb/ducklake#1397). It is kept, where the earlier load-time
+  repair of such rows (written by releases up to 0.9) dropped it; that repair now drops only
+  the one shape that can mislead a reader, `contains_null` false. The first write of a table through the
+  with-deletes commit (DuckDB and MySQL catalogs) now creates its statistics rows, as every
+  other path does: the merge runs before the write advances `ducklake_table_stats`.
+- **Breaking:** in `stats_encode`, `ColumnStats::from_global` and the three merges take
+  `table_has_rows: bool` (official's `record_count > 0`), `merge_table_column_stats` takes the
+  fields a write leaves without statistics, and `ColumnStats` has a `bounds_unknown` field.
+- **Breaking:** `DuckLakeError::SchemaExists` (a `CREATE SCHEMA` of a live schema),
+  `DuckLakeError::SchemaNotEmpty` (a `DROP SCHEMA` of a schema holding a table, view or macro,
+  without `CASCADE`) and `DuckLakeError::WrongObjectKind` (a `DROP VIEW` of a table or a
+  `DROP TABLE` of a view, as DuckDB refuses it). Exhaustive matches need the three arms.
 - **Breaking:** a live view of a table's name is refused as `DuckLakeError::ViewExists`, no longer
   `TableExists`, and not only by `WriteMode::Create`: a Replace or Append that would make the
   table (it has no live columns yet) is refused inside the commit too, so a view created after
@@ -17,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Standalone DDL as its own snapshot, as DuckDB 1.5.6 writes it (#18): `MetadataWriter::{create_schema,
+  drop_table, drop_view, drop_schema}`. `CREATE SCHEMA` is also reached from SQL
+  (`DuckLakeCatalog::register_schema`); the drops are the writer's to call (a host's executor),
+  not DataFusion's `deregister_*`, which its `CREATE OR REPLACE` calls before registering. The
+  SQLite catalog (and a host's SQLite) implements them; other backends refuse by name.
+  `DROP SCHEMA` refuses a schema holding a table, view or macro. `DROP TABLE` now also ends the
+  table's sort and partition specs, as official does.
 - `WriteMode::Create` and `DuckLakeTableWriter::create_table`: `CREATE TABLE … AS`'s write, refused
   inside the commit (`DuckLakeError::TableExists`) when its name is a live table (#12).
 - `DuckLakeError::ViewExists`: a write that would make a table where a live view has the name.

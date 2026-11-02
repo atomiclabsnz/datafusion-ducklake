@@ -4065,8 +4065,10 @@ impl Run<'_> {
 
     /// Whether the table-wide statistics of top-level `column` in metadata
     /// catalog `catalog` (attached to official's connection) cover every
-    /// non-NaN value the truth table holds. A missing row claims nothing; a
-    /// row with neither bound claims there is no value.
+    /// non-NaN value the truth table holds. A missing row claims nothing, and
+    /// so, since DuckDB 1.5.6, does a row with neither bound: the truth holds
+    /// a value, so the table has rows, and such a row on a table with rows is
+    /// `bounds_unknown` (duckdb/ducklake#1397), never reseeded.
     fn covers(&self, column: &Col, catalog: &str) -> Result<bool, String> {
         let ty = match column.ty {
             Ty::List | Ty::Struct | Ty::Map | Ty::Blob => return Ok(true),
@@ -4092,11 +4094,11 @@ impl Run<'_> {
                  d AS (SELECT min({name}) AS lo, max({name}) AS hi, count({name}) AS n \
                    FROM truth{finite}) \
                  SELECT count(*) FROM s, d WHERE d.n > 0 AND \
-                   ((s.min_value IS NULL AND s.max_value IS NULL) \
-                   OR (NOT coalesce(TRY_CAST(s.contains_nan AS BOOLEAN), false) AND \
+                   NOT (s.min_value IS NULL AND s.max_value IS NULL) AND \
+                   NOT coalesce(TRY_CAST(s.contains_nan AS BOOLEAN), false) AND \
                    (s.min_value IS NULL OR s.max_value IS NULL \
                    OR TRY_CAST(s.min_value AS {ty}) > d.lo \
-                   OR TRY_CAST(s.max_value AS {ty}) < d.hi)))"
+                   OR TRY_CAST(s.max_value AS {ty}) < d.hi)"
             ),
         )?;
         Ok(rows[0][0] == "0")
@@ -4156,11 +4158,16 @@ impl Run<'_> {
             // A widened column whose bounds official dropped (see
             // `known::widened`) is "covered" when no row is left to hold.
             let widened_shape = boundless && known::widened(self.history, step, column);
-            if !covered || nested_shape || nan_shape || widened_shape {
+            // A boundless row covers (`covers`), but where a modelled
+            // divergence explains it the column is still no longer compared:
+            // this crate keeps the bounds official could not.
+            let failed = !covered || nested_shape || nan_shape || widened_shape;
+            if failed || boundless {
                 match known::lost_bounds(self.history, step, column) {
                     Some(reason) => {
                         self.stats_diverged.insert(column.name.clone(), reason);
                     },
+                    None if !failed => {},
                     None => {
                         return Err(Mismatch {
                             kind: "official_model",
@@ -6327,7 +6334,8 @@ async fn regression_modelled_upstream_divergences() {
                 Step::Rewrite,
             ],
         },
-        // A widened column's bounds, dropped and narrowed by the 1.5.5 oracle.
+        // A widened column's bounds, dropped and narrowed by the 1.5.5 oracle;
+        // 1.5.6 keeps them (`0..5`), so this crate follows official here now.
         History {
             columns: vec![col("c2", Ty::Int)],
             limit: Some(10),
@@ -6371,7 +6379,7 @@ async fn regression_modelled_upstream_divergences() {
         &["official stats: unstored bound"],
         &["official stats: NaN-only write", "crate footer NaN/-0.0"],
         &["#1377 rewrite recomputes"],
-        &["official stats: widened column"],
+        &[],
         &["official rewrite fails on the greatest TIMESTAMPTZ"],
     ];
     for (index, (history, models)) in histories.iter().chain(&more).zip(fired).enumerate() {

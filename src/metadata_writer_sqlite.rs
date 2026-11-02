@@ -1073,17 +1073,33 @@ impl SqliteMetadataWriter {
             .await?
             {
                 Some(r) => r.try_get(0)?,
-                None => return Ok(false),
+                // A view of the name is DuckDB's type mismatch, not "no such table".
+                None => {
+                    return if live_view_id(&mut tx, schema_name, table_name)
+                        .await?
+                        .is_some()
+                    {
+                        Err(crate::DuckLakeError::WrongObjectKind(format!(
+                            "{schema_name}.{table_name} is a view, not a table: DROP VIEW it"
+                        )))
+                    } else {
+                        Ok(false)
+                    };
+                },
             };
 
             bump_schema_version(&mut tx, drop_snapshot).await?;
 
+            // Everything of the table official ends with it (DuckDB 1.5.6's DROP TABLE,
+            // read off the catalog): its sort and partition specs too.
             for child in [
                 "ducklake_table",
                 "ducklake_column",
                 "ducklake_column_tag",
                 "ducklake_data_file",
                 "ducklake_delete_file",
+                "ducklake_sort_info",
+                "ducklake_partition_info",
             ] {
                 sqlx::query(AssertSqlSafe(format!(
                     "UPDATE {child} SET end_snapshot = ?
@@ -1095,14 +1111,18 @@ impl SqliteMetadataWriter {
                 .await?;
             }
 
-            sqlx::query(
-                "UPDATE ducklake_tag SET end_snapshot = ?
-                 WHERE object_id = ? AND end_snapshot IS NULL",
-            )
-            .bind(drop_snapshot)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
+            // Its own tags (`COMMENT ON TABLE`), keyed by its id: only where schemas, tables and
+            // views draw ids from one counter, as `drop_view` and `drop_schema` end theirs.
+            if has_allocator_watermarks(&mut tx).await? {
+                sqlx::query(
+                    "UPDATE ducklake_tag SET end_snapshot = ?
+                     WHERE object_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(drop_snapshot)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+            }
 
             record_snapshot_changes(
                 &mut tx,
@@ -2966,28 +2986,30 @@ async fn merge_file_table_column_stats(
     files: &[Vec<crate::stats_encode::FileColumnStat>],
 ) -> Result<()> {
     let initialized = table_stats_initialized(tx, table_id).await?;
+    let table_has_rows = table_has_rows(tx, table_id).await?;
     let live: Vec<i64> = fields.iter().map(|(id, _)| *id).collect();
     let existing = load_table_column_stats(tx, table_id).await?;
-    let merged =
-        crate::stats_encode::merge_file_column_stats(existing, initialized, files, &live, |id| {
-            crate::metadata_writer::stat_kind_of(fields, id)
-        });
+    let merged = crate::stats_encode::merge_file_column_stats(
+        existing,
+        initialized,
+        table_has_rows,
+        files,
+        &live,
+        |id| crate::metadata_writer::stat_kind_of(fields, id),
+    );
     store_table_column_stats(tx, table_id, merged).await
 }
 
-/// The table's stored `ducklake_table_column_stats` rows, less those whose
-/// bounds are unknown. A row with neither bound reads as holding no valid value
-/// (see [`crate::stats_encode::ColumnStats::from_global`]). Official writes one
-/// while the column's live files hold only NULLs or only NaN (whose bounds no
-/// reader uses once `contains_nan` is set), after a rewrite recomputes the
-/// statistics from such files, and for a `GEOMETRY` column, whose bounds are in
-/// `extra_stats`; this crate keeps those rows, as official merges into them.
-/// Releases of this crate up to 0.9 also wrote one, without NaN, when a live
-/// file's bounds were missing: a row with neither bound, no NaN and no
-/// `extra_stats` over a live file of an earlier commit not known to hold only
-/// NULLs or only NaN is dropped here, so the merge leaves the field with no row
-/// (unknown) instead of narrowing it to the new values. The commit's own
-/// snapshot is the newest, so its new files are not counted.
+/// The table's stored `ducklake_table_column_stats` rows. A row with neither bound
+/// holds no valid value on a table without rows, and on one with rows its bounds are
+/// unknown, as official reads it from 1.5.6 (see
+/// [`crate::stats_encode::ColumnStats::from_global`]); it is merged into as it is, as
+/// official merges into it. But for one shape: releases of this crate up to 0.9 wrote a row
+/// with neither bound for a live file whose statistics they did not have, and its NULL
+/// flag can say "no NULLs" of a file that holds some, which any reader (DuckDB's too) would
+/// prune `IS NULL` by. A row with neither bound, `contains_null` false, no NaN and no
+/// `extra_stats`, over a live file of an earlier commit not known to hold only NULLs or only
+/// NaN, is dropped here: the field then has no row, which is unknown, NULL flag included.
 async fn load_table_column_stats(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: i64,
@@ -2998,6 +3020,7 @@ async fn load_table_column_stats(
          FROM ducklake_table_column_stats s
          WHERE s.table_id = ?
            AND NOT (s.min_value IS NULL AND s.max_value IS NULL
+                    AND s.contains_null IS NOT NULL AND NOT s.contains_null
                     AND (s.contains_nan IS NULL OR NOT s.contains_nan)
                     AND s.extra_stats IS NULL AND EXISTS (
                SELECT 1 FROM ducklake_data_file d
@@ -3085,6 +3108,21 @@ async fn table_stats_initialized(
     .await?)
 }
 
+/// Whether the table holds rows before this write (`ducklake_table_stats.record_count`), as
+/// official asks when it reads the stored statistics: a row with neither bound on a table
+/// with rows is bounds unknown (see [`crate::stats_encode::ColumnStats::from_global`]).
+async fn table_has_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE(MAX(record_count), 0) > 0 FROM ducklake_table_stats WHERE table_id = ?",
+    )
+    .bind(table_id)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
 /// Merge the statistics of `batches`, written inline to the table, into its
 /// `ducklake_table_column_stats`, as official DuckLake does on an inlined write
 /// (see [`crate::stats_encode::merge_inlined_column_stats`]). A NULL in one of
@@ -3102,6 +3140,7 @@ async fn merge_inlined_table_column_stats(
     snapshot_id_columns: &[String],
     snapshot_id: i64,
     initialized: bool,
+    table_has_rows: bool,
 ) -> Result<()> {
     let fields = crate::metadata_writer::catalog_fields(columns, column_ids)?;
     let inlined = crate::stats_encode::inlined_column_stats(batches, &fields, |i| {
@@ -3111,10 +3150,13 @@ async fn merge_inlined_table_column_stats(
             .map(|_| datafusion::common::ScalarValue::Int64(Some(snapshot_id)))
     })?;
     let existing = load_table_column_stats(tx, table_id).await?;
-    let merged =
-        crate::stats_encode::merge_inlined_column_stats(existing, inlined, initialized, |id| {
-            crate::metadata_writer::stat_kind_of(&fields, id)
-        });
+    let merged = crate::stats_encode::merge_inlined_column_stats(
+        existing,
+        inlined,
+        initialized,
+        table_has_rows,
+        |id| crate::metadata_writer::stat_kind_of(&fields, id),
+    );
     store_table_column_stats(tx, table_id, merged).await
 }
 
@@ -3518,6 +3560,69 @@ async fn finalize_table_snapshot(
         .await?;
     }
     Ok(())
+}
+
+/// The live view `schema_name.view_name`, if there is one.
+async fn live_view_id(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    schema_name: &str,
+    view_name: &str,
+) -> Result<Option<i64>> {
+    Ok(sqlx::query_scalar(
+        "SELECT v.view_id FROM ducklake_view v
+         JOIN ducklake_schema s ON s.schema_id = v.schema_id
+         WHERE s.schema_name = ? AND s.end_snapshot IS NULL
+           AND v.view_name = ? AND v.end_snapshot IS NULL",
+    )
+    .bind(schema_name)
+    .bind(view_name)
+    .fetch_optional(&mut **tx)
+    .await?)
+}
+
+/// A new live `ducklake_schema` row for `name` at `snapshot_id`, with official's UUID where
+/// the catalog has the column (the official schema does; this crate's own `initialize_schema`
+/// does not): the one insert `CREATE SCHEMA` and a write's implicit schema share.
+async fn insert_schema_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    name: &str,
+    path: &str,
+    snapshot_id: i64,
+) -> Result<i64> {
+    let next_id = next_catalog_id(tx).await?;
+    let has_uuid: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('ducklake_schema')
+                        WHERE name = 'schema_uuid')",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    let schema_id = if has_uuid {
+        sqlx::query_scalar(
+            "INSERT INTO ducklake_schema
+                 (schema_id, schema_uuid, begin_snapshot, end_snapshot, schema_name, path,
+                  path_is_relative)
+             VALUES (?, ?, ?, NULL, ?, ?, 1) RETURNING schema_id",
+        )
+        .bind(next_id)
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(snapshot_id)
+        .bind(name)
+        .bind(path)
+        .fetch_one(&mut **tx)
+        .await?
+    } else {
+        sqlx::query_scalar(
+            "INSERT INTO ducklake_schema (schema_id, schema_name, path, path_is_relative, begin_snapshot)
+             VALUES (?, ?, ?, 1, ?) RETURNING schema_id",
+        )
+        .bind(next_id)
+        .bind(name)
+        .bind(path)
+        .bind(snapshot_id)
+        .fetch_one(&mut **tx)
+        .await?
+    };
+    Ok(schema_id)
 }
 
 async fn record_snapshot_changes(
@@ -3948,6 +4053,7 @@ async fn commit_inlined_at_snapshot(
         .await?
         .system;
     let stats_initialized = table_stats_initialized(tx, write.table_id).await?;
+    let stats_had_rows = table_has_rows(tx, write.table_id).await?;
     sqlx::query(
         "INSERT INTO ducklake_table_stats
              (table_id, record_count, next_row_id, file_size_bytes)
@@ -4017,6 +4123,7 @@ async fn commit_inlined_at_snapshot(
         &write.snapshot_id_columns,
         snapshot_id,
         stats_initialized,
+        stats_had_rows,
     )
     .await?;
     // Preserved row ids were drawn when the rows were first written.
@@ -4087,6 +4194,215 @@ impl SqliteMetadataWriter {
 }
 
 impl MetadataWriter for SqliteMetadataWriter {
+    fn create_schema(&self, schema_name: &str, if_not_exists: bool) -> Result<bool> {
+        validate_name(schema_name, "Schema")?;
+        self.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            // Write-lock-first (see `insert_snapshot`): the snapshot before any read.
+            let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
+            let existing: Option<(i64, i64)> = sqlx::query_as(
+                "SELECT schema_id, begin_snapshot FROM ducklake_schema
+                 WHERE schema_name = ? AND end_snapshot IS NULL
+                 ORDER BY begin_snapshot LIMIT 1",
+            )
+            .bind(schema_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let exists = |if_not_exists: bool| {
+                if if_not_exists {
+                    Ok(false)
+                } else {
+                    Err(crate::DuckLakeError::SchemaExists(schema_name.to_string()))
+                }
+            };
+            let schema_path = directory_path(schema_name);
+            match existing {
+                // Committed: there already (rolled back, no snapshot).
+                Some((_, begin)) if begin != crate::metadata_writer::PENDING_SNAPSHOT => {
+                    return exists(if_not_exists);
+                },
+                // A write's start made it and has not committed: taken up here, at this
+                // snapshot, as `get_or_create_schema` takes it up, not made a second time.
+                Some((schema_id, _)) => {
+                    let taken = sqlx::query(
+                        "UPDATE ducklake_schema SET begin_snapshot = ?, path = ?
+                         WHERE schema_id = ? AND begin_snapshot = ?",
+                    )
+                    .bind(snapshot_id)
+                    .bind(&schema_path)
+                    .bind(schema_id)
+                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                    if taken == 0 {
+                        return exists(if_not_exists);
+                    }
+                },
+                None => {
+                    insert_schema_row(&mut tx, schema_name, &schema_path, snapshot_id).await?;
+                },
+            }
+            bump_schema_version(&mut tx, snapshot_id).await?;
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!(
+                    "created_schema:{}",
+                    crate::metadata_writer::quote_snapshot_name(schema_name)
+                ),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            commit(tx).await?;
+            Ok(true)
+        })
+    }
+
+    fn drop_table(&self, schema_name: &str, table_name: &str) -> Result<bool> {
+        SqliteMetadataWriter::drop_table(self, schema_name, table_name)
+    }
+
+    fn drop_view(&self, schema_name: &str, view_name: &str) -> Result<bool> {
+        validate_name(schema_name, "Schema")?;
+        validate_name(view_name, "View")?;
+        self.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
+            let Some(view_id) = live_view_id(&mut tx, schema_name, view_name).await? else {
+                // A table of the name is DuckDB's type mismatch, not "no such view".
+                let table: Option<i64> = sqlx::query_scalar(
+                    "SELECT t.table_id FROM ducklake_table t
+                     JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                     WHERE s.schema_name = ? AND s.end_snapshot IS NULL
+                       AND t.table_name = ? AND t.end_snapshot IS NULL",
+                )
+                .bind(schema_name)
+                .bind(view_name)
+                .fetch_optional(&mut *tx)
+                .await?;
+                return if table.is_some() {
+                    Err(crate::DuckLakeError::WrongObjectKind(format!(
+                        "{schema_name}.{view_name} is a table, not a view: DROP TABLE it"
+                    )))
+                } else {
+                    Ok(false)
+                };
+            };
+            bump_schema_version(&mut tx, snapshot_id).await?;
+            sqlx::query(
+                "UPDATE ducklake_view SET end_snapshot = ? WHERE view_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(view_id)
+            .execute(&mut *tx)
+            .await?;
+            // A view's tags (`COMMENT ON VIEW`) are keyed by its id, as a table's are. Only
+            // where schemas, tables and views draw ids from one counter (official's
+            // `next_catalog_id`): this crate's own catalogs number each kind apart, so an id
+            // there can also be a table's, whose tags this must not end.
+            if has_allocator_watermarks(&mut tx).await? {
+                sqlx::query(
+                    "UPDATE ducklake_tag SET end_snapshot = ?
+                     WHERE object_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(snapshot_id)
+                .bind(view_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!("dropped_view:{view_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            commit(tx).await?;
+            Ok(true)
+        })
+    }
+
+    fn drop_schema(&self, schema_name: &str) -> Result<bool> {
+        validate_name(schema_name, "Schema")?;
+        self.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
+            let schema_id: Option<i64> = sqlx::query_scalar(
+                "SELECT schema_id FROM ducklake_schema
+                 WHERE schema_name = ? AND end_snapshot IS NULL AND begin_snapshot <> ?",
+            )
+            .bind(schema_name)
+            .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(schema_id) = schema_id else {
+                return Ok(false);
+            };
+            // DuckDB without CASCADE: `table "x" depends on schema "s"`. A table a write has
+            // begun and not committed (pending) holds it too: it is about to be live.
+            // Its tables, views and macros, as DuckDB counts them (`macro function "f"
+            // depends on schema "s"`). A catalog without the macro table has none.
+            let has_macros: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                                WHERE type = 'table' AND name = 'ducklake_macro')",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let macros = if has_macros {
+                " UNION ALL
+                 SELECT macro_name FROM ducklake_macro WHERE schema_id = ?3 AND end_snapshot IS NULL"
+            } else {
+                ""
+            };
+            let dependent: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT table_name FROM ducklake_table WHERE schema_id = ?1 AND end_snapshot IS NULL
+                 UNION ALL
+                 SELECT view_name FROM ducklake_view WHERE schema_id = ?2 AND end_snapshot IS NULL{macros}
+                 LIMIT 1"
+            )))
+            .bind(schema_id)
+            .bind(schema_id)
+            .bind(schema_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(dependent) = dependent {
+                return Err(crate::DuckLakeError::SchemaNotEmpty(format!(
+                    "{dependent:?} depends on schema {schema_name:?}; drop it first (CASCADE is \
+                     not supported)"
+                )));
+            }
+            bump_schema_version(&mut tx, snapshot_id).await?;
+            sqlx::query(
+                "UPDATE ducklake_schema SET end_snapshot = ? WHERE schema_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(schema_id)
+            .execute(&mut *tx)
+            .await?;
+            // As `drop_view`: only where ids are one counter.
+            if has_allocator_watermarks(&mut tx).await? {
+                sqlx::query(
+                    "UPDATE ducklake_tag SET end_snapshot = ?
+                     WHERE object_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(snapshot_id)
+                .bind(schema_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!("dropped_schema:{schema_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            commit(tx).await?;
+            Ok(true)
+        })
+    }
+
     fn maintenance(&self) -> Option<&dyn crate::maintenance::CatalogMaintenance> {
         super::maintenance(self)
     }
@@ -4565,7 +4881,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 Some((schema_id, begin)) if begin != crate::metadata_writer::PENDING_SNAPSHOT => {
                     commit(tx).await?;
                     return Ok((schema_id, false));
-                }
+                },
                 Some((schema_id, _)) => {
                     // Only while it is still pending: a commit that stamped it since makes
                     // it committed, and it is returned as found.
@@ -4585,25 +4901,14 @@ impl MetadataWriter for SqliteMetadataWriter {
                         return Ok((schema_id, false));
                     }
                     Some(schema_id)
-                }
+                },
                 None => None,
             };
 
             let schema_path = directory_path(path.unwrap_or(name));
             let schema_id: i64 = match pending {
                 Some(schema_id) => schema_id,
-                None => {
-                    sqlx::query_scalar(
-                        "INSERT INTO ducklake_schema (schema_id, schema_name, path, path_is_relative, begin_snapshot)
-                         VALUES (?, ?, ?, 1, ?) RETURNING schema_id",
-                    )
-                    .bind(next_catalog_id(&mut tx).await?)
-                    .bind(name)
-                    .bind(&schema_path)
-                    .bind(snapshot_id)
-                    .fetch_one(&mut *tx)
-                    .await?
-                }
+                None => insert_schema_row(&mut tx, name, &schema_path, snapshot_id).await?,
             };
             record_snapshot_changes(
                 &mut tx,
@@ -5921,6 +6226,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let system = inlined_table_layout(&mut *tx, &physical_name).await?.system;
 
             let stats_initialized = table_stats_initialized(&mut tx, table_id).await?;
+            let stats_had_rows = table_has_rows(&mut tx, table_id).await?;
             sqlx::query(
                 "INSERT INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
@@ -5974,6 +6280,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 &[],
                 snapshot_id,
                 stats_initialized,
+                stats_had_rows,
             )
             .await?;
             let record_count = i64::try_from(record_count).map_err(|_| {
