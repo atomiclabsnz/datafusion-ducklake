@@ -60,10 +60,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 tempfile = { version = "3.14", optional = true }
 
 # Metadata providers (optional)
-# `~`, not a caret: duckdb-rs numbers DuckDB 1.x.y as 1.(10000x+y), and DuckDB 2.0.0 is
-# 1.20000.x, so `^1.10506` would take 2.0 on the next `cargo update`. 2.0 waits on its
-# own work (DuckLake format 1.1).
-duckdb = { version = "~1.10506.1", optional = true }
+# Bounded below 2.0: duckdb-rs numbers DuckDB 1.x.y as 1.(10000x+y), and DuckDB 2.0.0 is
+# 1.20000.x, so a caret `^1.10506` would take 2.0 on the next `cargo update`. Later 1.5.x
+# patches (1.10507...) are taken. 2.0 waits on its own work (DuckLake format 1.1, #22).
+duckdb = { version = ">=1.10506.1, <1.20000", optional = true }
 sqlx = { version = "0.9", features = ["runtime-tokio"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

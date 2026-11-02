@@ -728,7 +728,9 @@ Table-wide column statistics (`ducklake_table_column_stats`) are kept as officia
 them. Each commit of Parquet files or inlined rows merges their statistics into the
 stored rows as official's `MergeStats` does: NULL counts and NaN flags combine, unknown
 once either side is; values that are all NULL leave the bounds alone; a stored row with
-neither bound, which official reads as holding no valid value, takes the write's bounds;
+neither bound takes the write's bounds while the table has no rows, and on a table with
+rows its bounds are unknown, as official reads it from 1.5.6 (it cannot tell a column of
+only NULLs from bounds a retype invalidated), so no write narrows it and the row stays;
 otherwise each bound widens. A table's first write creates a row per field it has
 statistics for; after that only existing rows are updated, so a column added later
 gets none. Deletes and `merge_adjacent_files` leave the rows unchanged, so a
@@ -757,11 +759,9 @@ the live row count, which holds only when no row has left. This crate's own `cou
 comes from the files' counts, and `DuckLakeTable::statistics()` reports the row count
 and table-wide bounds as inexact.
 
-A row with neither bound, no NaN and no `extra_stats`, while a live file of the column
-is not known to hold only NULLs, is unknown: the next write drops it instead of
-narrowing it to its own bounds. Releases up to 0.9 wrote such a row when a live file
-was all NULL or had no statistics. A row over only all-NULL files is kept, as official
-keeps it.
+Releases up to 0.9 wrote a row with neither bound when a live file was all NULL or had
+no statistics. On a table with rows that row now reads as unknown, as above, so it needs
+no repair: it is kept, and never narrowed.
 
 Releases up to 0.9 left inlined rows out of the table-wide bounds. In a catalog where
 they inlined rows, run a flush (or `checkpoint`) once, with each table's `auto_compact`

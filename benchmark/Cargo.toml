@@ -36,7 +36,8 @@ datafusion-ducklake = { path = "..", features = ["duckdb-bundled"] }
 
 # Core dependencies
 datafusion = "55"
-duckdb = { version = "1.10505.0", features = ["bundled"] }
+# As the root crate pins it: DuckDB 1.5.x, not 2.0 (duckdb-rs numbers 2.0.0 as 1.20000).
+duckdb = { version = ">=1.10506.1, <1.20000", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 

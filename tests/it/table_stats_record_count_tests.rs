@@ -1,4 +1,4 @@
-//! `ducklake_table_stats.record_count` against official DuckLake (DuckDB 1.5.5).
+//! `ducklake_table_stats.record_count` against official DuckLake (DuckDB 1.5.6).
 //!
 //! Official keeps `record_count` as the gross count of rows ever inserted: only
 //! inserts raise it, and deletes, truncates, flushes and compaction leave it.
@@ -181,6 +181,18 @@ fn scenarios() -> Vec<Scenario> {
             name: "all-NULL column then append",
             limit: 0,
             ops: &[Op::AppendNull, Op::AppendNull, Op::Append(&[5])],
+        },
+        // ...and stay unknown however many writes follow: official keeps the row, and its
+        // NULL flag, from then on.
+        Scenario {
+            name: "all-NULL column then two appends",
+            limit: 0,
+            ops: &[Op::AppendNull, Op::AppendNull, Op::Append(&[5]), Op::Append(&[7])],
+        },
+        Scenario {
+            name: "inlined all-NULL column then two appends",
+            limit: 10,
+            ops: &[Op::AppendNull, Op::Append(&[5]), Op::Append(&[7])],
         },
     ]
 }
@@ -533,8 +545,11 @@ async fn run(
     let rewrite = scenario.ops.iter().any(|op| matches!(op, Op::Rewrite));
     if !rewrite {
         let (got, want) = (column_stats(check.raw), column_stats(&official_metadata));
-        // A legacy roll-up may also be dropped: no row is unknown.
-        if got != want && !(legacy && got.is_empty()) {
+        // A legacy roll-up is unknown however it is kept: as no row, or (official 1.5.6's
+        // reading) as a row with neither bound on a table with rows.
+        let unknown =
+            |rows: &[String]| rows.is_empty() || rows.iter().all(|row| row.ends_with(",NULL,NULL"));
+        if got != want && !(legacy && unknown(&got)) {
             failures.push(format!(
                 "{}: ducklake_table_column_stats is {got:?}, official's {want:?}",
                 scenario.name

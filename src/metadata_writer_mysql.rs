@@ -1974,19 +1974,11 @@ async fn merge_file_table_column_stats(
     store_table_column_stats(tx, table_id, merged).await
 }
 
-/// The table's stored `ducklake_table_column_stats` rows, less those whose
-/// bounds are unknown. A row with neither bound reads as holding no valid value
-/// (see [`crate::stats_encode::ColumnStats::from_global`]). Official writes one
-/// while the column's live files hold only NULLs or only NaN (whose bounds no
-/// reader uses once `contains_nan` is set), after a rewrite recomputes the
-/// statistics from such files, and for a `GEOMETRY` column, whose bounds are in
-/// `extra_stats`; this crate keeps those rows, as official merges into them.
-/// Releases of this crate up to 0.9 also wrote one, without NaN, when a live
-/// file's bounds were missing: a row with neither bound, no NaN and no
-/// `extra_stats` over a live file of an earlier commit not known to hold only
-/// NULLs or only NaN is dropped here, so the merge leaves the field with no row
-/// (unknown) instead of narrowing it to the new values. The commit's own
-/// snapshot is the newest, so its new files are not counted.
+/// The table's stored `ducklake_table_column_stats` rows. A row with neither bound
+/// holds no valid value on a table without rows, and on one with rows its bounds are
+/// unknown, as official reads it from 1.5.6 (see
+/// [`crate::stats_encode::ColumnStats::from_global`]); either way it is merged into as it
+/// is, as official merges into it.
 async fn load_table_column_stats(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     table_id: i64,
@@ -1995,19 +1987,7 @@ async fn load_table_column_stats(
     for row in sqlx::query(
         "SELECT s.column_id, s.contains_null, s.contains_nan, s.min_value, s.max_value
          FROM ducklake_table_column_stats s
-         WHERE s.table_id = ?
-           AND NOT (s.min_value IS NULL AND s.max_value IS NULL
-                    AND (s.contains_nan IS NULL OR NOT s.contains_nan)
-                    AND s.extra_stats IS NULL AND EXISTS (
-               SELECT 1 FROM ducklake_data_file d
-               WHERE d.table_id = s.table_id AND d.end_snapshot IS NULL
-                 AND d.begin_snapshot < (SELECT MAX(snapshot_id) FROM ducklake_snapshot)
-                 AND NOT EXISTS (
-                     SELECT 1 FROM ducklake_file_column_stats f
-                     WHERE f.data_file_id = d.data_file_id AND f.column_id = s.column_id
-                       AND ((f.null_count IS NOT NULL AND f.value_count = 0)
-                            OR (f.contains_nan AND f.min_value IS NULL
-                                AND f.max_value IS NULL)))))",
+         WHERE s.table_id = ?",
     )
     .bind(table_id)
     .fetch_all(&mut **tx)
@@ -2069,6 +2049,21 @@ async fn store_table_column_stats(
 /// `ducklake_table_stats` row. This crate seeds that row with zeros when it
 /// creates a table, so a seeded row counts once it has recorded a row
 /// (`next_row_id > 0`) or the table has column statistics.
+async fn table_stats_initialized(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    table_id: i64,
+) -> Result<bool> {
+    let initialized: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ? AND next_row_id > 0)
+             OR EXISTS (SELECT 1 FROM ducklake_table_column_stats WHERE table_id = ?)",
+    )
+    .bind(table_id)
+    .bind(table_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(initialized != 0)
+}
+
 /// Whether the table holds rows before this write (`ducklake_table_stats.record_count`), as
 /// official asks when it reads the stored statistics: a row with neither bound on a table
 /// with rows is bounds unknown (see [`crate::stats_encode::ColumnStats::from_global`]).
@@ -2083,21 +2078,6 @@ async fn table_has_rows(
     .fetch_one(&mut **tx)
     .await?;
     Ok(has_rows != 0)
-}
-
-async fn table_stats_initialized(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    table_id: i64,
-) -> Result<bool> {
-    let initialized: i64 = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ? AND next_row_id > 0)
-             OR EXISTS (SELECT 1 FROM ducklake_table_column_stats WHERE table_id = ?)",
-    )
-    .bind(table_id)
-    .bind(table_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    Ok(initialized != 0)
 }
 
 /// Merge the statistics of `batches`, written inline to the table, into its
@@ -4557,6 +4537,15 @@ impl MetadataWriter for MySqlMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
+            // Before the loop advances `ducklake_table_stats`, as every other commit path
+            // merges: the merge asks the stats as they stood before this write.
+            merge_file_table_column_stats(
+                &mut tx,
+                table_id,
+                &crate::metadata_writer::catalog_fields(columns, column_ids)?,
+                &crate::metadata_writer::file_column_stats(files),
+            )
+            .await?;
             // Each file draws its own row ids from the advancing counter.
             for file in files {
                 let next_row_id: i64 = sqlx::query_scalar(
@@ -4599,13 +4588,6 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
             }
-            merge_file_table_column_stats(
-                &mut tx,
-                table_id,
-                &crate::metadata_writer::catalog_fields(columns, column_ids)?,
-                &crate::metadata_writer::file_column_stats(files),
-            )
-            .await?;
             for entry in deletes {
                 apply_delete_entry(&mut tx, table_id, base_snapshot, snapshot_id, entry).await?;
             }

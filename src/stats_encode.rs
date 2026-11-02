@@ -803,7 +803,7 @@ pub fn merge_table_column_stats(
     merged
         .into_iter()
         .filter(|(column_id, _)| !initialized || !added.contains(column_id))
-        .filter(|(column_id, _)| !unknown.contains(column_id))
+        .filter(|(column_id, _)| stored_unknown.contains(column_id) || !unknown.contains(column_id))
         .filter(|(column_id, stats)| {
             !touched.contains(column_id) || !(nul(&stats.min_value) || nul(&stats.max_value))
         })
@@ -855,6 +855,14 @@ pub fn merge_file_column_stats(
                 .any(|file| !file.iter().any(|stat| stat.column_id == *id))
         })
         .collect();
+    // A stored row whose bounds are already unknown stays as it is, as official keeps it.
+    let stored_unknown: BTreeSet<i64> = existing
+        .iter()
+        .filter(|stat| {
+            initialized && table_has_rows && stat.min_value.is_none() && stat.max_value.is_none()
+        })
+        .map(|stat| stat.column_id)
+        .collect();
     let mut merged = merge_table_column_stats(
         existing,
         initialized,
@@ -865,7 +873,9 @@ pub fn merge_file_column_stats(
             .map(|stat| (stat.column_id, ColumnStats::from_file(stat))),
         kind,
     );
-    merged.retain(|stat| !unknown.contains(&stat.column_id));
+    merged.retain(|stat| {
+        stored_unknown.contains(&stat.column_id) || !unknown.contains(&stat.column_id)
+    });
     merged
 }
 

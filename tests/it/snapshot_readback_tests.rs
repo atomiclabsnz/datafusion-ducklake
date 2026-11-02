@@ -123,7 +123,7 @@ async fn duckdb_commit_metadata_is_exposed_by_both_snapshot_surfaces() {
         .into_iter()
         .find(|table| table.table_name == "users")
         .unwrap();
-    // DuckDB 1.5.5 inlines the small insert, which registers an inlined data
+    // DuckDB 1.5.x inlines the small insert, which registers an inlined data
     // table and therefore advances the schema version.
     let changes_made = format!("inlined_insert:{}", table.table_id);
     let expected = ExpectedSnapshot {

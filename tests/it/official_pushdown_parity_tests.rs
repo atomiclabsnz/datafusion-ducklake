@@ -100,7 +100,7 @@ const PAGE_LIMIT: usize = 1024;
 /// `ducklake` itself — `sqlite`, `postgres`, `mysql`.
 ///
 /// `DATA_INLINING_ROW_LIMIT 0` keeps the fourth `INSERT` a data file. DuckDB
-/// 1.5.5 inlines a single-row `INSERT` into the catalog by default, which leaves
+/// 1.5.x inlines a single-row `INSERT` into the catalog by default, which leaves
 /// the table with three data files and nothing for `i != 501000` to prune —
 /// official's own comment on that statement ("Single row so it should be able to
 /// be pruned with != filter") says a fourth file is what it means to create.
@@ -713,7 +713,7 @@ async fn postgres_catalog_matches_official_pushdown() {
 /// "Unsupported operator type HASH_JOIN in UPDATE statement — only simple
 /// deletes are supported in the MySQL connector". The first `INSERT` into a
 /// MySQL-hosted DuckLake catalog succeeds; the second aborts at commit. That is
-/// upstream and on the write path, and reproduces on the bundled DuckDB 1.5.5.
+/// upstream and on the write path, and reproduces on the bundled DuckDB 1.5.x.
 ///
 /// So official DuckLake writes the catalog where it can, into its own DuckDB
 /// format, and DuckDB copies the rows across unchanged. Every statistic the
