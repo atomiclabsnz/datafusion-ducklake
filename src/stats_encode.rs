@@ -607,17 +607,18 @@ pub struct ColumnStats {
     /// Whether some value is not NULL, when `num_values` and `null_count` do
     /// not say.
     pub any_valid: bool,
+    /// The bounds are unknown, and no merge reseeds them: official's `bounds_unknown`
+    /// (1.5.6). Set by [`Self::from_global`] for a stored row with neither bound on a table
+    /// with rows.
+    pub bounds_unknown: bool,
 }
 
 impl ColumnStats {
     /// A stored `ducklake_table_column_stats` row, read as official's
-    /// `FromGlobalStats` reads it: a row with neither bound holds no valid
-    /// value.
-    ///
-    /// A row with neither bound on a table that has rows reads as values whose bounds are
-    /// **unknown**, as official reads it from 1.5.6 (`FromGlobalStats`, `bounds_unknown`):
-    /// it cannot tell a column that held only NULLs from bounds a retype invalidated, so a
-    /// later write never narrows it to its own bounds. On an empty table it holds no value.
+    /// `FromGlobalStats` reads it from 1.5.6: a row with neither bound holds no valid value
+    /// on a table without rows, and on one with rows its bounds are **unknown**
+    /// ([`Self::bounds_unknown`]): official cannot tell a column that held only NULLs from
+    /// bounds a retype invalidated, so a later write never narrows it to its own bounds.
     pub fn from_global(stat: &GlobalColumnStat, table_has_rows: bool) -> Self {
         let bounded = stat.min_value.is_some() || stat.max_value.is_some();
         Self {
@@ -626,7 +627,8 @@ impl ColumnStats {
             null_count: stat.contains_null.map(u64::from),
             num_values: None,
             contains_nan: stat.contains_nan,
-            any_valid: bounded || table_has_rows,
+            any_valid: bounded,
+            bounds_unknown: !bounded && table_has_rows,
         }
     }
 
@@ -644,6 +646,7 @@ impl ColumnStats {
             num_values,
             contains_nan: stat.contains_nan,
             any_valid: true,
+            bounds_unknown: false,
         }
     }
 
@@ -657,6 +660,7 @@ impl ColumnStats {
             num_values: None,
             contains_nan: None,
             any_valid: stat.any_valid,
+            bounds_unknown: false,
         }
     }
 
@@ -697,6 +701,10 @@ impl ColumnStats {
             return;
         }
         if !had_valid {
+            // Invalidated bounds are never reseeded (official 1.5.6's `MergeStats`).
+            if self.bounds_unknown {
+                return;
+            }
             self.min_value = new.min_value.clone();
             self.max_value = new.max_value.clone();
             self.any_valid = true;
@@ -745,25 +753,23 @@ impl ColumnStats {
 /// field with no stored row — a column added since, or a nested column's
 /// container — keeps none. A field some of `new` has values but no bounds
 /// for, other than for NaN, gets no row: its bounds are unknown, which a row
-/// cannot say. `new` is merged in order. Output is sorted by `column_id`.
+/// cannot say. So does a field in `fields_unknown`, one a write leaves without statistics.
+/// A stored row whose bounds are already unknown ([`ColumnStats::bounds_unknown`]) is kept
+/// through all of these, as official keeps it. `new` is merged in order. Output is sorted
+/// by `column_id`.
 pub fn merge_table_column_stats(
     existing: Vec<GlobalColumnStat>,
     initialized: bool,
     table_has_rows: bool,
+    fields_unknown: &std::collections::BTreeSet<i64>,
     new: impl IntoIterator<Item = (i64, ColumnStats)>,
     kind: impl Fn(i64) -> StatKind,
 ) -> Vec<GlobalColumnStat> {
     use std::collections::BTreeMap;
 
     let mut merged: BTreeMap<i64, ColumnStats> = BTreeMap::new();
-    // Stored rows whose bounds are already unknown (see `ColumnStats::from_global`): kept as
-    // the row official keeps, neither bound, whatever is merged into them.
-    let mut stored_unknown = std::collections::BTreeSet::new();
     if initialized {
         for stat in &existing {
-            if table_has_rows && stat.min_value.is_none() && stat.max_value.is_none() {
-                stored_unknown.insert(stat.column_id);
-            }
             merged.insert(
                 stat.column_id,
                 ColumnStats::from_global(stat, table_has_rows),
@@ -777,9 +783,9 @@ pub fn merge_table_column_stats(
         touched.insert(column_id);
         // Values whose bounds are not known, which official's writers only
         // produce for NaN (whose flag keeps a float's bounds unused), would
-        // leave a row with neither bound: one official reads as holding no
-        // valid value, and a later write would then narrow it to its own
-        // bounds. The field gets no row instead.
+        // leave a row with neither bound. Official stores it, and from 1.5.6
+        // reads it as bounds unknown once the table has rows; here the field
+        // gets no row, which says the same without a NULL flag (COMPATIBILITY).
         if stats.has_valid()
             && (stats.min_value.is_none() || stats.max_value.is_none())
             && stats.contains_nan != Some(true)
@@ -803,21 +809,24 @@ pub fn merge_table_column_stats(
     merged
         .into_iter()
         .filter(|(column_id, _)| !initialized || !added.contains(column_id))
-        .filter(|(column_id, _)| stored_unknown.contains(column_id) || !unknown.contains(column_id))
+        .filter(|(column_id, stats)| {
+            stats.bounds_unknown
+                || !(unknown.contains(column_id) || fields_unknown.contains(column_id))
+        })
         .filter(|(column_id, stats)| {
             !touched.contains(column_id) || !(nul(&stats.min_value) || nul(&stats.max_value))
         })
         // Nor may the merge itself leave a row with neither bound: a file
         // whose float values are NaN, or whose writer omitted the bounds for
         // one, has none, and merged in it leaves the column with none.
-        // Official stores that row, reads it as holding no value, and narrows
-        // it to the next write's bounds; here the field gets no row.
+        // Official stores that row (bounds unknown, from 1.5.6, once the table
+        // has rows); here the field gets no row, as above. A stored row whose
+        // bounds are unknown holds no valid value here, so it is kept.
         .filter(|(column_id, stats)| {
-            stored_unknown.contains(column_id)
-                || !(touched.contains(column_id)
-                    && stats.has_valid()
-                    && stats.min_value.is_none()
-                    && stats.max_value.is_none())
+            !(touched.contains(column_id)
+                && stats.has_valid()
+                && stats.min_value.is_none()
+                && stats.max_value.is_none())
         })
         .map(|(column_id, stats)| stats.to_global(column_id))
         .collect()
@@ -830,8 +839,8 @@ pub fn merge_table_column_stats(
 /// `live_fields` are the field ids of the table's columns. A file that records
 /// no statistics for one of them while another file or the stored roll-up
 /// does, which official's writers never commit, leaves that field's bounds
-/// unknown; a stored row cannot say so — official reads one with neither
-/// bound as holding no valid value — so the field gets no row.
+/// unknown, and the field gets no row (a stored row whose bounds are already unknown is
+/// kept, as official keeps it).
 pub fn merge_file_column_stats(
     existing: Vec<GlobalColumnStat>,
     initialized: bool,
@@ -855,28 +864,17 @@ pub fn merge_file_column_stats(
                 .any(|file| !file.iter().any(|stat| stat.column_id == *id))
         })
         .collect();
-    // A stored row whose bounds are already unknown stays as it is, as official keeps it.
-    let stored_unknown: BTreeSet<i64> = existing
-        .iter()
-        .filter(|stat| {
-            initialized && table_has_rows && stat.min_value.is_none() && stat.max_value.is_none()
-        })
-        .map(|stat| stat.column_id)
-        .collect();
-    let mut merged = merge_table_column_stats(
+    merge_table_column_stats(
         existing,
         initialized,
         table_has_rows,
+        &unknown,
         files
             .iter()
             .flatten()
             .map(|stat| (stat.column_id, ColumnStats::from_file(stat))),
         kind,
-    );
-    merged.retain(|stat| {
-        stored_unknown.contains(&stat.column_id) || !unknown.contains(&stat.column_id)
-    });
-    merged
+    )
 }
 
 /// The statistics of one column or nested leaf field over rows written inline,
@@ -1197,6 +1195,7 @@ pub fn merge_inlined_column_stats(
         existing,
         initialized,
         table_has_rows,
+        &std::collections::BTreeSet::new(),
         inlined
             .iter()
             .map(|stat| (stat.column_id, ColumnStats::from_inlined(stat))),
@@ -2518,6 +2517,7 @@ mod merge_regression_tests {
             num_values: Some(1),
             contains_nan: Some(true),
             any_valid: true,
+            bounds_unknown: false,
         };
         let inlined = ColumnStats {
             min_value: None,
@@ -2526,11 +2526,13 @@ mod merge_regression_tests {
             num_values: None,
             contains_nan: None,
             any_valid: false,
+            bounds_unknown: false,
         };
         let merged = merge_table_column_stats(
             Vec::new(),
             false,
             false,
+            &Default::default(),
             [(4, nan_only), (4, inlined)],
             |_| StatKind::of_ducklake_type("float"),
         );

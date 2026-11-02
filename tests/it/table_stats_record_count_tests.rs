@@ -546,10 +546,18 @@ async fn run(
     if !rewrite {
         let (got, want) = (column_stats(check.raw), column_stats(&official_metadata));
         // A legacy roll-up is unknown however it is kept: as no row, or (official 1.5.6's
-        // reading) as a row with neither bound on a table with rows.
-        let unknown =
-            |rows: &[String]| rows.is_empty() || rows.iter().all(|row| row.ends_with(",NULL,NULL"));
-        if got != want && !(legacy && unknown(&got)) {
+        // reading) as a row with neither bound on a table with rows, which then says what
+        // official's row says but for the bounds.
+        let masked: Vec<String> = want
+            .iter()
+            .map(|row| {
+                let mut fields: Vec<&str> = row.split(',').collect();
+                let n = fields.len();
+                fields[n.saturating_sub(2)..].fill("NULL");
+                fields.join(",")
+            })
+            .collect();
+        if got != want && !(legacy && (got.is_empty() || got == masked)) {
             failures.push(format!(
                 "{}: ducklake_table_column_stats is {got:?}, official's {want:?}",
                 scenario.name
