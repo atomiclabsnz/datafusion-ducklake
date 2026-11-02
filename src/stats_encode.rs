@@ -2271,7 +2271,7 @@ mod tests {
                 vec![stored(1, Some(true), None), stored(2, Some(false), Some(("1", "2")))],
                 true,
                 true,
-                &[later.clone()],
+                std::slice::from_ref(&later),
                 &[1, 2],
                 numeric,
             );
