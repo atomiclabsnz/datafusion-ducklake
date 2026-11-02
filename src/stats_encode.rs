@@ -2261,6 +2261,24 @@ mod tests {
             (None, None)
         );
         assert_eq!(merged[0].contains_null, Some(true));
+        // ...and a later file with no statistics for the column, or values without bounds,
+        // leaves that kept row as it is: it is already unknown (#23 review).
+        for later in [
+            vec![file(2, Some(("1", "2")), 2, 0)],
+            vec![file(1, Some(("4", "4")), 1, 0), file(1, None, 3, 0)],
+        ] {
+            let merged = merge_file_column_stats(
+                vec![stored(1, Some(true), None), stored(2, Some(false), Some(("1", "2")))],
+                true,
+                true,
+                &[later.clone()],
+                &[1, 2],
+                numeric,
+            );
+            let row = merged.iter().find(|stat| stat.column_id == 1);
+            assert!(row.is_some(), "{later:?}: the unknown row is kept");
+            assert_eq!(row.unwrap().min_value, None, "{later:?}");
+        }
         // Fields without a stored row get none once the table has statistics.
         let merged = merge_file_column_stats(
             vec![stored(1, Some(false), Some(("1", "3")))],
