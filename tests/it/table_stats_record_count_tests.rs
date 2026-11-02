@@ -78,7 +78,7 @@ const QUERIES: [&str; 4] = [
 
 /// The statement [`Op::LegacyNullBounds`] runs on the crate's metadata.
 const LEGACY_NULL_BOUNDS_NO_NULLS: &str = "UPDATE ducklake_table_column_stats \
-     SET min_value = NULL, max_value = NULL, contains_nan = NULL, contains_null = 0 \
+     SET min_value = NULL, max_value = NULL, contains_nan = NULL, contains_null = false \
      WHERE table_id = (SELECT table_id FROM ducklake_table \
                        WHERE table_name = 't' AND end_snapshot IS NULL)";
 
