@@ -126,7 +126,7 @@ async fn crate_context(catalog: &Path) -> (SessionContext, Arc<dyn MetadataWrite
 /// UUID (which each side draws for itself) blanked.
 ///
 /// Read through DuckDB's own sqlite scanner, so no second SQLite binding is needed here.
-fn dump(catalog: &Path) -> Vec<String> {
+pub(crate) fn dump(catalog: &Path) -> Vec<String> {
     crate::common::ensure_extension_installed("sqlite");
     let connection = duckdb::Connection::open_in_memory().unwrap();
     connection

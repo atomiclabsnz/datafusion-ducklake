@@ -975,6 +975,20 @@ async fn finalize_table_snapshot(
     {
         Some(id) => id,
         None => {
+            // The write began on a table another writer has since dropped (and perhaps
+            // replaced with a view): its id is taken, so this is a conflict, as on the
+            // multi-catalog writer, not an insert that collides with the dropped row. A new
+            // table's id was reserved (or, in a catalog the extension created, is a negative
+            // stand-in), and so is in no row.
+            let dropped: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM ducklake_table WHERE table_id = $1)",
+            )
+            .bind(table_id_hint)
+            .fetch_one(&mut **tx)
+            .await?;
+            if dropped {
+                return Err(crate::metadata_writer::table_dropped_error(table_id_hint));
+            }
             // In a catalog the DuckDB extension created there is no sequence to have
             // reserved from: the id is allocated here, under the snapshot's lock.
             let table_id_hint =
@@ -1048,32 +1062,7 @@ async fn finalize_table_snapshot(
     // A write that makes the table refuses a live view of its name, read here so one another
     // writer created since this write began is refused too.
     if crate::metadata_writer::makes_table(mode, !current.is_empty()) {
-        // A catalog from before views has no `ducklake_view`, and so no view.
-        let views: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pg_catalog.pg_class WHERE oid = to_regclass('ducklake_view')",
-        )
-        .fetch_one(&mut **tx)
-        .await?;
-        let live_view = if views > 0 {
-            sqlx::query(
-                "SELECT 1 FROM ducklake_view view_meta
-                 JOIN ducklake_table table_meta ON table_meta.schema_id = view_meta.schema_id
-                 WHERE table_meta.table_id = $1 AND table_meta.end_snapshot IS NULL
-                   AND view_meta.view_name = table_meta.table_name
-                   AND view_meta.end_snapshot IS NULL
-                 LIMIT 1",
-            )
-            .bind(table_id)
-            .fetch_optional(&mut **tx)
-            .await?
-        } else {
-            None
-        };
-        if live_view.is_some() {
-            return Err(crate::metadata_writer::view_exists_error(format!(
-                "{schema_name}.{table_name}"
-            )));
-        }
+        crate::metadata_writer_postgres::refuse_view_of_table(tx, table_id).await?;
     }
     let committed_ids = assign_column_ids(&proposed, &existing_catalog_columns, column_ids)?;
     if committed_ids != column_ids {
@@ -2907,6 +2896,13 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                         )));
                     }
                 }
+            }
+
+            // A write that makes the table is refused a live view of its name here, before
+            // any file is written; the commit asks again, for a view made since.
+            if crate::metadata_writer::makes_table(mode, !existing_catalog_columns.is_empty()) {
+                crate::metadata_writer_postgres::refuse_view_at_start(&mut tx, schema_id, table_name)
+                    .await?;
             }
 
             let column_ids = top_level_column_ids(&catalog_columns, &field_ids)?;

@@ -2252,6 +2252,56 @@ fn finalize_snapshot(
     )
 }
 
+/// Whether the catalog has `ducklake_view`: one from before views has none, and so no view.
+fn has_view_table(tx: &Transaction<'_>) -> Result<bool> {
+    let views: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'ducklake_view'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(views > 0)
+}
+
+/// A write that makes its table ([`makes_table`](crate::metadata_writer::makes_table)), at its
+/// start: refused a live view of the table's name before any file is written.
+fn refuse_view_at_start(tx: &Transaction<'_>, schema_id: i64, table_name: &str) -> Result<()> {
+    if !has_view_table(tx)? {
+        return Ok(());
+    }
+    let view = tx
+        .query_row(
+            crate::metadata_writer::LIVE_VIEW_NAMED_SQL,
+            params![schema_id, table_name],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    crate::metadata_writer::refuse_live_view(view)
+}
+
+/// A write that makes its table, at its commit: refused a live view of the table's name, read
+/// here so one another writer created since the write began is refused too. A table another
+/// writer dropped since the write began (and perhaps replaced with a view) has no live row to
+/// name it by, and is a conflict.
+fn refuse_view_at_commit(tx: &Transaction<'_>, table_id: i64) -> Result<()> {
+    let live_rows: i64 = tx.query_row(
+        crate::metadata_writer::LIVE_TABLE_ROWS_SQL,
+        params![table_id],
+        |row| row.get(0),
+    )?;
+    crate::metadata_writer::refuse_dropped_table(live_rows, table_id)?;
+    if !has_view_table(tx)? {
+        return Ok(());
+    }
+    let view = tx
+        .query_row(
+            crate::metadata_writer::LIVE_VIEW_OF_TABLE_SQL,
+            params![table_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    crate::metadata_writer::refuse_live_view(view)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_table_snapshot(
     tx: &Transaction<'_>,
@@ -2324,36 +2374,8 @@ fn finalize_table_snapshot(
         !current.is_empty(),
         format!("table {table_id}"),
     )?;
-    // A write that makes the table refuses a live view of its name, read here so one another
-    // writer created since this write began is refused too.
     if crate::metadata_writer::makes_table(mode, !current.is_empty()) {
-        // A catalog from before views has no `ducklake_view`, and so no view.
-        let views: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'ducklake_view'",
-            [],
-            |row| row.get(0),
-        )?;
-        let live_view = if views == 0 {
-            None
-        } else {
-            tx.query_row(
-                "SELECT schema_meta.schema_name, view_meta.view_name FROM ducklake_view view_meta
-                 JOIN ducklake_table table_meta ON table_meta.schema_id = view_meta.schema_id
-                 JOIN ducklake_schema schema_meta ON schema_meta.schema_id = view_meta.schema_id
-                 WHERE table_meta.table_id = ? AND table_meta.end_snapshot IS NULL
-                   AND view_meta.view_name = table_meta.table_name
-                   AND view_meta.end_snapshot IS NULL
-                 LIMIT 1",
-                params![table_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?
-        };
-        if let Some((schema_name, view_name)) = live_view {
-            return Err(crate::metadata_writer::view_exists_error(format!(
-                "{schema_name}.{view_name}"
-            )));
-        }
+        refuse_view_at_commit(tx, table_id)?;
     }
     let committed_ids = assign_column_ids(&proposed, &existing_catalog_columns, column_ids)?;
     if committed_ids != column_ids {
@@ -3229,8 +3251,8 @@ impl DuckdbMetadataWriter {
             .query_row(
                 "SELECT schema_id FROM ducklake_schema
                  WHERE schema_name = ? AND end_snapshot IS NULL
-                   AND begin_snapshot <> 9223372036854775807",
-                params![schema_name],
+                   AND begin_snapshot <> ?",
+                params![schema_name, crate::metadata_writer::PENDING_SNAPSHOT],
                 |row| row.get(0),
             )
             .optional()?;
@@ -3239,8 +3261,8 @@ impl DuckdbMetadataWriter {
                 .query_row(
                     "SELECT table_id FROM ducklake_table
                      WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL
-                   AND begin_snapshot <> 9223372036854775807",
-                    params![schema_id, table_name],
+                   AND begin_snapshot <> ?",
+                    params![schema_id, table_name, crate::metadata_writer::PENDING_SNAPSHOT],
                     |row| row.get(0),
                 )
                 .optional()?,
@@ -5912,6 +5934,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
             }
         }
 
+        // A write that makes the table is refused a live view of its name here, before any
+        // file is written; the commit asks again, for a view made since.
+        if crate::metadata_writer::makes_table(mode, !existing_catalog_columns.is_empty()) {
+            refuse_view_at_start(&tx, schema_id, table_name)?;
+        }
+
         // Final per-column ids: reuse the existing id for a column already in the
         // table, consume a freshly reserved id only for a genuinely new column.
         // These are baked into the staged parquet's field_id metadata, so they
@@ -6950,5 +6978,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(live_columns, 1);
+    }
+
+    /// Another writer's `DROP TABLE main.t; CREATE VIEW main.t`, as official writes them: one
+    /// snapshot ends the table's row, columns and files, the next adds the view.
+    fn drop_t_for_a_view(writer: &DuckdbMetadataWriter, table_id: i64) {
+        let dropped = writer.create_snapshot().unwrap();
+        let viewed = writer.create_snapshot().unwrap();
+        writer
+            .connection()
+            .execute_batch(&format!(
+                "UPDATE ducklake_table SET end_snapshot = {dropped}
+                   WHERE table_id = {table_id} AND end_snapshot IS NULL;
+                 UPDATE ducklake_column SET end_snapshot = {dropped}
+                   WHERE table_id = {table_id} AND end_snapshot IS NULL;
+                 UPDATE ducklake_data_file SET end_snapshot = {dropped}
+                   WHERE table_id = {table_id} AND end_snapshot IS NULL;
+                 INSERT INTO ducklake_view
+                 SELECT 1000, '00000000-0000-0000-0000-000000000001', {viewed}, NULL,
+                        schema_id, 't', 'duckdb', 'SELECT 1 AS id', ''
+                 FROM ducklake_schema WHERE schema_name = 'main' AND end_snapshot IS NULL;"
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_table_dropped_and_replaced_by_a_view_during_a_write_is_a_conflict() {
+        // atomiclabsnz/datafusion-ducklake#17: the commit found no live table row to name the
+        // view by, and failed further on with an untyped row-not-found.
+        for mode in [WriteMode::Append, WriteMode::Replace] {
+            let temp = TempDir::new().unwrap();
+            let writer = test_writer(&temp);
+            let (first, _) = append(&writer, "first.parquet", 1);
+            let columns = int_column();
+            let setup = writer
+                .begin_write_transaction("main", "t", &columns, mode)
+                .unwrap();
+            drop_t_for_a_view(&writer, first.table_id);
+            let error = writer
+                .register_data_file(
+                    setup.table_id,
+                    "main",
+                    "t",
+                    setup.snapshot_id,
+                    &DataFileInfo::new("late.parquet", 10, 1),
+                    mode,
+                    setup.base_snapshot_id,
+                    &columns,
+                    &setup.column_ids,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(error, crate::DuckLakeError::Conflict(_)),
+                "{mode:?}: {error:?}"
+            );
+            let late: i64 = writer
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM ducklake_data_file WHERE path = 'late.parquet'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(late, 0, "{mode:?}: the refused commit registered its file");
+            // A retry begins on the catalog as it now is, and is refused there.
+            let error = writer
+                .begin_write_transaction("main", "t", &columns, mode)
+                .unwrap_err();
+            assert!(
+                matches!(error, crate::DuckLakeError::ViewExists(_)),
+                "{mode:?}: {error:?}"
+            );
+        }
     }
 }

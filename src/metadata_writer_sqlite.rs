@@ -1065,10 +1065,11 @@ impl SqliteMetadataWriter {
                  JOIN ducklake_schema s ON s.schema_id = t.schema_id
                  WHERE s.schema_name = ? AND s.end_snapshot IS NULL
                    AND t.table_name = ? AND t.end_snapshot IS NULL
-                   AND t.begin_snapshot <> 9223372036854775807",
+                   AND t.begin_snapshot <> ?",
             )
             .bind(schema_name)
             .bind(table_name)
+            .bind(crate::metadata_writer::PENDING_SNAPSHOT)
             .fetch_optional(&mut *tx)
             .await?
             {
@@ -3304,35 +3305,8 @@ async fn finalize_table_snapshot(
         !current.is_empty(),
         format!("{schema_name}.{table_name}"),
     )?;
-    // A write that makes the table refuses a live view of its name, read here so one another
-    // writer created since this write began is refused too.
     if crate::metadata_writer::makes_table(mode, !current.is_empty()) {
-        // A catalog from before views has no `ducklake_view`, and so no view.
-        let views: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ducklake_view'",
-        )
-        .fetch_one(&mut **tx)
-        .await?;
-        let live_view = if views > 0 {
-            sqlx::query(
-                "SELECT 1 FROM ducklake_view view_meta
-                 JOIN ducklake_table table_meta ON table_meta.schema_id = view_meta.schema_id
-                 WHERE table_meta.table_id = ? AND table_meta.end_snapshot IS NULL
-                   AND view_meta.view_name = table_meta.table_name
-                   AND view_meta.end_snapshot IS NULL
-                 LIMIT 1",
-            )
-            .bind(table_id)
-            .fetch_optional(&mut **tx)
-            .await?
-        } else {
-            None
-        };
-        if live_view.is_some() {
-            return Err(crate::metadata_writer::view_exists_error(format!(
-                "{schema_name}.{table_name}"
-            )));
-        }
+        refuse_view_at_commit(tx, table_id).await?;
     }
     let committed_ids = assign_column_ids(&proposed, &existing_catalog_columns, column_ids)?;
     if committed_ids != column_ids {
@@ -3560,6 +3534,59 @@ async fn finalize_table_snapshot(
         .await?;
     }
     Ok(())
+}
+
+/// Whether the catalog has `ducklake_view`: one from before views has none, and so no view.
+async fn has_view_table(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<bool> {
+    let views: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ducklake_view'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(views > 0)
+}
+
+/// A write that makes its table ([`makes_table`](crate::metadata_writer::makes_table)), at its
+/// start: refused a live view of the table's name before any file is written.
+async fn refuse_view_at_start(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    schema_id: i64,
+    table_name: &str,
+) -> Result<()> {
+    if !has_view_table(tx).await? {
+        return Ok(());
+    }
+    let view: Option<(String, String)> =
+        sqlx::query_as(crate::metadata_writer::LIVE_VIEW_NAMED_SQL)
+            .bind(schema_id)
+            .bind(table_name)
+            .fetch_optional(&mut **tx)
+            .await?;
+    crate::metadata_writer::refuse_live_view(view)
+}
+
+/// A write that makes its table, at its commit: refused a live view of the table's name, read
+/// here so one another writer created since the write began is refused too. A table another
+/// writer dropped since the write began (and perhaps replaced with a view) has no live row to
+/// name it by, and is a conflict.
+async fn refuse_view_at_commit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+) -> Result<()> {
+    let live_rows: i64 = sqlx::query_scalar(crate::metadata_writer::LIVE_TABLE_ROWS_SQL)
+        .bind(table_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    crate::metadata_writer::refuse_dropped_table(live_rows, table_id)?;
+    if !has_view_table(tx).await? {
+        return Ok(());
+    }
+    let view: Option<(String, String)> =
+        sqlx::query_as(crate::metadata_writer::LIVE_VIEW_OF_TABLE_SQL)
+            .bind(table_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    crate::metadata_writer::refuse_live_view(view)
 }
 
 /// The live view `schema_name.view_name`, if there is one.
@@ -4163,9 +4190,10 @@ impl SqliteMetadataWriter {
             let schema_id: Option<i64> = sqlx::query_scalar(
                 "SELECT schema_id FROM ducklake_schema
                  WHERE schema_name = ? AND end_snapshot IS NULL
-                   AND begin_snapshot <> 9223372036854775807",
+                   AND begin_snapshot <> ?",
             )
             .bind(schema_name)
+            .bind(crate::metadata_writer::PENDING_SNAPSHOT)
             .fetch_optional(&self.pool)
             .await?;
             let table_id: Option<i64> = match schema_id {
@@ -4173,10 +4201,11 @@ impl SqliteMetadataWriter {
                     sqlx::query_scalar(
                         "SELECT table_id FROM ducklake_table
                          WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL
-                   AND begin_snapshot <> 9223372036854775807",
+                   AND begin_snapshot <> ?",
                     )
                     .bind(schema_id)
                     .bind(table_name)
+                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                     .fetch_optional(&self.pool)
                     .await?
                 },
@@ -8524,6 +8553,12 @@ impl MetadataWriter for SqliteMetadataWriter {
                         )));
                     }
                 }
+            }
+
+            // A write that makes the table is refused a live view of its name here, before
+            // any file is written; the commit asks again, for a view made since.
+            if crate::metadata_writer::makes_table(mode, !existing_catalog_columns.is_empty()) {
+                refuse_view_at_start(&mut tx, schema_id, table_name).await?;
             }
 
             // Final per-column ids: reuse the existing id for a column already in

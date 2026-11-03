@@ -1157,6 +1157,54 @@ pub trait PostgresCommitGuard: Send + Sync + std::fmt::Debug {
     ) -> std::result::Result<(), CommitGuardError>;
 }
 
+/// Whether the catalog has `ducklake_view`: one from before views has none, and so no view.
+async fn has_view_table(conn: &mut sqlx::PgConnection) -> Result<bool> {
+    let views: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_catalog.pg_class WHERE oid = to_regclass('ducklake_view')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(views > 0)
+}
+
+/// A write that makes its table ([`makes_table`](crate::metadata_writer::makes_table)), at its
+/// start: refused a live view of the table's name before any file is written. Asked by name,
+/// since a Postgres start reserves a new table's id without writing its row.
+pub(crate) async fn refuse_view_at_start(
+    conn: &mut sqlx::PgConnection,
+    schema_id: i64,
+    table_name: &str,
+) -> Result<()> {
+    if !has_view_table(conn).await? {
+        return Ok(());
+    }
+    let view: Option<(String, String)> =
+        sqlx::query_as(crate::metadata_writer::LIVE_VIEW_NAMED_SQL_PG)
+            .bind(schema_id)
+            .bind(table_name)
+            .fetch_optional(&mut *conn)
+            .await?;
+    crate::metadata_writer::refuse_live_view(view)
+}
+
+/// A write that makes its table, at its commit: refused a live view of the live table
+/// `table_id`'s name, read inside the commit so one another writer created since the write
+/// began is refused too.
+pub(crate) async fn refuse_view_of_table(
+    conn: &mut sqlx::PgConnection,
+    table_id: i64,
+) -> Result<()> {
+    if !has_view_table(conn).await? {
+        return Ok(());
+    }
+    let view: Option<(String, String)> =
+        sqlx::query_as(crate::metadata_writer::LIVE_VIEW_OF_TABLE_SQL_PG)
+            .bind(table_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    crate::metadata_writer::refuse_live_view(view)
+}
+
 /// Commit `tx` once `guard` approves it; with no guard this is `tx.commit()`.
 /// A refusal rolls `tx` back and returns
 /// [`DuckLakeError::CommitRefused`](crate::DuckLakeError::CommitRefused).
@@ -3369,10 +3417,7 @@ async fn finalize_table_snapshot(
             if dropped {
                 check_table_conflicts(tx, table_id_hint, base_snapshot, TableChanges::append())
                     .await?;
-                return Err(crate::DuckLakeError::Conflict(format!(
-                    "Transaction conflict - attempting to insert into table with index \"{table_id_hint}\" \
-                     - but another transaction has dropped it"
-                )));
+                return Err(crate::metadata_writer::table_dropped_error(table_id_hint));
             }
             sqlx::query(
                 "INSERT INTO ducklake_table
@@ -3435,32 +3480,7 @@ async fn finalize_table_snapshot(
     // A write that makes the table refuses a live view of its name, read here so one another
     // writer created since this write began is refused too.
     if crate::metadata_writer::makes_table(mode, !existing_column_rows.is_empty()) {
-        // A catalog from before views has no `ducklake_view`, and so no view.
-        let views: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pg_catalog.pg_class WHERE oid = to_regclass('ducklake_view')",
-        )
-        .fetch_one(&mut **tx)
-        .await?;
-        let live_view = if views > 0 {
-            sqlx::query(
-                "SELECT 1 FROM ducklake_view view_meta
-                 JOIN ducklake_table table_meta ON table_meta.schema_id = view_meta.schema_id
-                 WHERE table_meta.table_id = $1 AND table_meta.end_snapshot IS NULL
-                   AND view_meta.view_name = table_meta.table_name
-                   AND view_meta.end_snapshot IS NULL
-                 LIMIT 1",
-            )
-            .bind(table_id)
-            .fetch_optional(&mut **tx)
-            .await?
-        } else {
-            None
-        };
-        if live_view.is_some() {
-            return Err(crate::metadata_writer::view_exists_error(format!(
-                "{schema_name}.{table_name}"
-            )));
-        }
+        refuse_view_of_table(tx, table_id).await?;
     }
     let committed_ids = assign_column_ids(&proposed, &existing_catalog_columns, column_ids)?;
     if committed_ids != column_ids {
@@ -9196,6 +9216,12 @@ impl MetadataWriter for PostgresMetadataWriter {
                         )));
                     }
                 }
+            }
+
+            // A write that makes the table is refused a live view of its name here, before
+            // any file is written; the commit asks again, for a view made since.
+            if crate::metadata_writer::makes_table(mode, !existing_catalog_columns.is_empty()) {
+                refuse_view_at_start(&mut tx, schema_id, table_name).await?;
             }
 
             // Reserve N column ids, then compute the final per-column ids. These
