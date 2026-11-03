@@ -244,16 +244,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A write that would make a table where a live view has the name is refused
-  `DuckLakeError::ViewExists` at its start, before any file is staged or uploaded and with no
-  catalog row written; the commit still checks, for a view made since (#17).
-- A write whose table another writer drops (and perhaps replaces with a view of its name) before
-  it commits is refused `DuckLakeError::Conflict`, as official words it ("another transaction has
-  dropped it"), on every backend. On DuckDB and MySQL it was an untyped row-not-found; on the
-  single-catalog PostgreSQL writer a unique violation (or, in a catalog the extension created, a
-  new table under the dropped one's name), and a rename there reads as the alter it is; on SQLite
-  the conflict check already refused an insert, but a `Replace` of a table with no data committed
-  into the dropped table (#17).
+- A write onto a view's name is refused `ViewExists` before any file is written (#17).
+- A write whose table another writer drops before it commits is refused `Conflict` (#17).
+- `drop_table` / `drop_view` of a missing name return `false` in a catalog with no views (#17).
 - A replace (`INSERT OVERWRITE`, `WriteMode::Replace`) and `end_table_files` end the delete files
   of the data files they end, as official's `CREATE OR REPLACE` does, on every backend (#19).
 - A write that never committed (refused, failed, or abandoned) no longer leaves a column-less table
