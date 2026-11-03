@@ -642,3 +642,275 @@ async fn duckdb_catalog_refuses_it() {
         "{refused:?}"
     );
 }
+
+/// A replace of no rows staged in a `DuckLakeWriteTransaction` still drops the old table and
+/// creates the new one, the catalog official's writes, where every other mode stages nothing
+/// for no rows (#26 review). A replace stage with deletes is refused: they would name rows of
+/// the table it drops.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_replaces_with_no_rows_and_refuses_deletes() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let base = temp.path().join("base.sqlite");
+    duckdb(&base, &data, 0)
+        .execute_batch("CREATE TABLE lake.t (id INTEGER); INSERT INTO lake.t VALUES (1), (2);")
+        .unwrap();
+    drop(metadata_writer(&base, 0, false).await);
+    let official = temp.path().join("official.sqlite");
+    let ours = temp.path().join("ours.sqlite");
+    std::fs::copy(&base, &official).unwrap();
+    std::fs::copy(&base, &ours).unwrap();
+    duckdb(&official, &data, 0)
+        .execute_batch("CREATE OR REPLACE TABLE lake.t (id BIGINT)")
+        .unwrap();
+
+    let writer = table_writer(metadata_writer(&ours, 0, false).await);
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let refused = {
+        let mut transaction = writer.transaction();
+        let refused = transaction
+            .stage_write_with_deletes(
+                "main",
+                "t",
+                schema.as_ref(),
+                WriteMode::CreateOrReplace,
+                &[RecordBatch::new_empty(Arc::clone(&schema))],
+                &[],
+                &[datafusion_ducklake::InlinedRowRef {
+                    table_name: "ducklake_inlined_data_1_1".to_string(),
+                    row_id: 0,
+                }],
+            )
+            .await
+            .expect_err("a replace takes no deletes");
+        transaction.abort().await.unwrap();
+        refused
+    };
+    assert!(
+        matches!(refused, DuckLakeError::InvalidConfig(ref m) if m.contains("no deletes")),
+        "{refused:?}"
+    );
+    let mut transaction = writer.transaction();
+    transaction
+        .stage_write(
+            "main",
+            "t",
+            schema.as_ref(),
+            WriteMode::CreateOrReplace,
+            &[RecordBatch::new_empty(Arc::clone(&schema))],
+        )
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    assert_same_catalog(&official, &ours);
+}
+
+/// A session's replace of no rows commits with the session's commit metadata (#26 review),
+/// and a commit that refuses it says so, rather than anything its cleanup met.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_session_replace_keeps_its_commit_metadata() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let catalog = temp.path().join("c.sqlite");
+    duckdb(&catalog, &data, 0)
+        .execute_batch(NOT_NULL_BIGINT)
+        .unwrap();
+    let writer = table_writer(metadata_writer(&catalog, 0, false).await);
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let options = datafusion_ducklake::TableWriteOptions::new().with_commit_metadata(
+        datafusion_ducklake::SnapshotCommitMetadata::new()
+            .with_author("ferrion")
+            .with_message("replace"),
+    );
+    let written = writer
+        .begin_write("main", "t", schema.as_ref(), WriteMode::CreateOrReplace)
+        .unwrap()
+        .with_options(&options)
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(written.files_written, 0);
+    let last = rows(
+        &duckdb::Connection::open_in_memory().unwrap(),
+        &format!(
+            "SELECT changes_made, author, commit_message
+             FROM sqlite_scan('{}', 'ducklake_snapshot_changes')
+             ORDER BY snapshot_id DESC LIMIT 1",
+            catalog.display()
+        ),
+    );
+    assert_eq!(
+        last,
+        vec![format!(r#"dropped_table:1,created_table:"main"."t"|ferrion|replace"#)]
+    );
+
+    let session = writer
+        .begin_write("main", "t", schema.as_ref(), WriteMode::CreateOrReplace)
+        .unwrap();
+    duckdb(&catalog, &data, 0)
+        .execute_batch("DROP TABLE lake.t")
+        .unwrap();
+    let refused = session.finish().await.expect_err("dropped since it began");
+    assert!(matches!(refused, DuckLakeError::Conflict(_)), "{refused:?}");
+}
+
+/// A table renamed to the name since the replace began is not the table the replace saw: it
+/// is refused, not dropped (a rename records only `altered_table` of the renamed table).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_table_renamed_to_the_name_is_not_dropped() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let catalog = temp.path().join("c.sqlite");
+    duckdb(&catalog, &data, 0)
+        .execute_batch("CREATE TABLE lake.u (i INTEGER); INSERT INTO lake.u VALUES (7);")
+        .unwrap();
+    let writer = table_writer(metadata_writer(&catalog, 0, false).await);
+    let batch = bigint_and_varchar(1, "a");
+    let mut session = writer
+        .begin_write(
+            "main",
+            "t",
+            batch.schema().as_ref(),
+            WriteMode::CreateOrReplace,
+        )
+        .unwrap();
+    session.write_batch(&batch).unwrap();
+    duckdb(&catalog, &data, 0)
+        .execute_batch("ALTER TABLE lake.u RENAME TO t")
+        .unwrap();
+    let refused = session.finish().await.expect_err("t is another table now");
+    assert!(matches!(refused, DuckLakeError::Conflict(_)), "{refused:?}");
+    let left = rows(&duckdb(&catalog, &data, 0), "SELECT i FROM lake.main.t");
+    assert_eq!(
+        left,
+        vec!["Int(7)"],
+        "the renamed table and its row are as they were"
+    );
+
+    // DuckDB records its rename as `created_table` of the new name, which the replace's
+    // created-name check refuses on its own. A writer that records only `altered_table:<id>`
+    // is refused too: the table live under the name is not the one the replace saw.
+    let mut session = writer
+        .begin_write(
+            "main",
+            "w",
+            batch.schema().as_ref(),
+            WriteMode::CreateOrReplace,
+        )
+        .unwrap();
+    session.write_batch(&batch).unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", catalog.display()))
+        .await
+        .unwrap();
+    for statement in [
+        "INSERT INTO ducklake_snapshot
+             SELECT snapshot_id + 1, snapshot_time, schema_version + 1, next_catalog_id,
+                    next_file_id
+             FROM ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1",
+        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+             SELECT max(snapshot_id), 'altered_table:1' FROM ducklake_snapshot",
+        "INSERT INTO ducklake_table
+             SELECT table_id, table_uuid, (SELECT max(snapshot_id) FROM ducklake_snapshot),
+                    NULL, schema_id, 'w', path, path_is_relative
+             FROM ducklake_table WHERE table_id = 1 AND end_snapshot IS NULL",
+        "UPDATE ducklake_table SET end_snapshot = (SELECT max(snapshot_id) FROM ducklake_snapshot)
+             WHERE table_id = 1 AND end_snapshot IS NULL AND table_name = 't'",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+    pool.close().await;
+    let refused = session
+        .finish()
+        .await
+        .expect_err("w is a table the replace did not see");
+    assert!(
+        matches!(refused, DuckLakeError::Conflict(ref m) if m.contains("changed the table")),
+        "{refused:?}"
+    );
+}
+
+/// Rows staged with commit-snapshot columns are inlined by the new table's limit, as the
+/// stage itself decides it, not refused by the old table's own limit (#26 review).
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_columns_follow_the_new_tables_limit() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let catalog = temp.path().join("c.sqlite");
+    duckdb(&catalog, &data, 10)
+        .execute_batch(NOT_NULL_BIGINT)
+        .unwrap();
+    let metadata = metadata_writer(&catalog, 10, false).await;
+    metadata
+        .set_table_setting(1, "data_inlining_row_limit", "0")
+        .unwrap();
+    let writer = table_writer(metadata);
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("version", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![5])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![None::<i64>])),
+        ],
+    )
+    .unwrap();
+    let mut transaction = writer.transaction();
+    transaction
+        .stage_write_with_snapshot_columns(
+            "main",
+            "t",
+            batch.schema().as_ref(),
+            WriteMode::CreateOrReplace,
+            &[batch],
+            &datafusion_ducklake::DuckLakeWriteOptions::default(),
+            &["version"],
+        )
+        .await
+        .unwrap();
+    let committed = transaction.commit().await.unwrap();
+    let read = rows(
+        &duckdb(&catalog, &data, 10),
+        "SELECT id, version FROM lake.main.t",
+    );
+    assert_eq!(
+        read,
+        vec![format!("BigInt(5)|BigInt({})", committed[0].snapshot_id)]
+    );
+}
+
+/// A replace of no rows writes no data file, so an encrypted catalog, which refuses every
+/// Parquet write here, takes it (#26 review); one with rows to write in Parquet is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_encrypted_catalog_takes_an_empty_replace() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let catalog = temp.path().join("c.sqlite");
+    duckdb(&catalog, &data, 0)
+        .execute_batch(NOT_NULL_BIGINT)
+        .unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", catalog.display()))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ducklake_metadata SET value = 'true' WHERE key = 'encrypted'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let writer = table_writer(metadata_writer(&catalog, 0, false).await);
+    let refused = writer
+        .create_or_replace_table("main", "t", &[bigint_and_varchar(1, "a")])
+        .await
+        .expect_err("rows to write in Parquet");
+    assert!(refused.to_string().contains("encrypted"), "{refused:?}");
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    writer
+        .create_or_replace_table("main", "t", &[RecordBatch::new_empty(schema)])
+        .await
+        .unwrap();
+}

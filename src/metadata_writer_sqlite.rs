@@ -3596,7 +3596,9 @@ async fn end_table(
 /// `snapshot_id` as `DROP TABLE` ends it, and its id returned for the snapshot's
 /// `dropped_table`. Refused with a conflict, as DuckDB refuses it, when a commit since
 /// `base_snapshot` created a table of the name, or dropped or altered the one the write
-/// replaces (the one live at `base_snapshot`).
+/// replaces (the one live at `base_snapshot`), or when the table live under the name now is
+/// not the one live at `base_snapshot` however it came there (a rename records only
+/// `altered_table` of the renamed table): a replace ends only the table its write saw.
 async fn end_replaced_table(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: i64,
@@ -3653,6 +3655,12 @@ async fn end_replaced_table(
         }
     }
     let replaced = other_table(None).fetch_optional(&mut **tx).await?;
+    if replaced != replaced_at_base {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "Transaction conflict - attempting to replace table \"{table_name}\" in schema \
+             \"{schema_name}\" - but another transaction has changed the table of this name"
+        )));
+    }
     if let Some(replaced) = replaced {
         end_table(tx, replaced, snapshot_id).await?;
     }
