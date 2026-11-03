@@ -186,6 +186,7 @@ async fn a_table_dropped_and_replaced_by_a_view_during_a_write_is_a_typed_confli
 
             // A write begins on the live table, then DuckDB drops it and makes a view of its
             // name before the write commits.
+            let files_before = files(&data);
             let mut late = writer.begin_write("main", "t", &schema(), mode).unwrap();
             late.write_batch(&batch(3)).unwrap();
             duckdb(&catalog, &data)
@@ -205,6 +206,13 @@ async fn a_table_dropped_and_replaced_by_a_view_during_a_write_is_a_typed_confli
                 dump(&catalog),
                 catalog_before,
                 "{mode:?} inlining {inlining}: the refused commit changed the catalog"
+            );
+            // The refused write removed what it staged: DuckDB's drop ends the table's files
+            // but leaves them on disk, so the data path is as the write found it.
+            assert_eq!(
+                files(&data),
+                files_before,
+                "{mode:?} inlining {inlining}: the refused write left its Parquet"
             );
             // DuckDB reads the view it made.
             assert_eq!(
@@ -228,6 +236,7 @@ async fn a_table_dropped_during_a_write_is_a_typed_conflict() {
     let temp = TempDir::new().unwrap();
     let (catalog, data) = lake(&temp);
     let writer = table_writer(&catalog, 0).await;
+    let files_before = files(&data);
     let mut late = writer
         .begin_write("main", "t", &schema(), WriteMode::Append)
         .unwrap();
@@ -241,6 +250,11 @@ async fn a_table_dropped_during_a_write_is_a_typed_conflict() {
         "a table dropped under a write is a conflict: {error:?}"
     );
     assert_eq!(
+        files(&data),
+        files_before,
+        "the refused write left its Parquet"
+    );
+    assert_eq!(
         duckdb_rows(
             &catalog,
             &data,
@@ -248,4 +262,59 @@ async fn a_table_dropped_during_a_write_is_a_typed_conflict() {
         ),
         ["BigInt(0)"]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replace_of_an_empty_table_dropped_during_it_is_a_typed_conflict() {
+    // A table with no data leaves the commit's conflict checks nothing to find: the commit's own
+    // read of the table's live row is what refuses it, where it committed into the dropped
+    // table before.
+    for inlining in [0, 10] {
+        let temp = TempDir::new().unwrap();
+        let (catalog, data) = lake(&temp);
+        duckdb(&catalog, &data)
+            .execute_batch("CREATE TABLE lake.main.e (id INT, name VARCHAR);")
+            .unwrap();
+        let writer = table_writer(&catalog, inlining).await;
+        let files_before = files(&data);
+        let mut late = writer
+            .begin_write("main", "e", &schema(), WriteMode::Replace)
+            .unwrap();
+        late.write_batch(&batch(3)).unwrap();
+        duckdb(&catalog, &data)
+            .execute_batch("DROP TABLE lake.main.e;")
+            .unwrap();
+        let catalog_before = dump(&catalog);
+        let error = late
+            .finish()
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("inlining {inlining}: committed into a dropped table"));
+        assert!(
+            matches!(error, DuckLakeError::Conflict(_)),
+            "inlining {inlining}: {error:?}"
+        );
+        assert_eq!(dump(&catalog), catalog_before, "inlining {inlining}");
+        assert_eq!(files(&data), files_before, "inlining {inlining}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drop_of_a_missing_name_in_a_catalog_from_before_views_drops_nothing() {
+    // `ducklake_view` came with a later format: a catalog without it has no view, so a drop of
+    // a name nothing holds is `false`, not "no such table: ducklake_view".
+    let temp = TempDir::new().unwrap();
+    let url = format!(
+        "sqlite:{}?mode=rwc",
+        temp.path().join("old.sqlite").display()
+    );
+    let writer = SqliteMetadataWriter::new_with_init(&url).await.unwrap();
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query("DROP TABLE ducklake_view")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert!(!writer.drop_table("main", "missing").unwrap());
+    assert!(!writer.drop_view("main", "missing").unwrap());
 }

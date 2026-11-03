@@ -909,7 +909,9 @@ Known edges:
   removes its file, on every write backend, also when a view of the table's name was created
   after the drop. A write that would make a table where a live view has the name is refused
   `ViewExists` at its start, before any file is written, and again at its commit. Names are
-  compared exactly; DuckDB folds their case (#17 item 1).
+  compared exactly on SQLite, DuckDB and PostgreSQL; on MySQL every catalog name lookup (schemas,
+  tables and views alike) follows the columns' collation, case- and accent-insensitive under
+  MySQL 8's default. DuckDB folds case (#17 item 1).
 - Every commit path is fenced on the table's live partition generation, so a file inconsistent
   with the live spec is never committed — never one stamped with a retired `partition_id`, and
   never a `partition_id`-less file in a partitioned table.

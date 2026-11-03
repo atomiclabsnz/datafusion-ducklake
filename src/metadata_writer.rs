@@ -109,8 +109,9 @@ pub(crate) fn makes_table(mode: WriteMode, has_live_columns: bool) -> bool {
     mode == WriteMode::Create || !has_live_columns
 }
 
-/// The refusal of a write that would make a table where a live view has its name, checked
-/// inside the commit, in every mode.
+/// The refusal of a write that would make a table where a live view has its name
+/// ([`makes_table`]), in every mode: checked at the write's start, before any file is
+/// written, and again inside its commit, for a view made since.
 pub(crate) fn view_exists_error(table: impl std::fmt::Display) -> DuckLakeError {
     DuckLakeError::ViewExists(format!(
         "{table}: a write does not create a table where a view has that name"
@@ -149,15 +150,6 @@ macro_rules! live_view_named_sql {
         )
     };
 }
-macro_rules! live_table_rows_sql {
-    ($table_id:literal) => {
-        concat!(
-            "SELECT COUNT(*) FROM ducklake_table WHERE table_id = ",
-            $table_id,
-            " AND end_snapshot IS NULL"
-        )
-    };
-}
 
 /// The commit's view check: the live view named as the live table `table_id` (bound once).
 /// Read inside the commit, so a view another writer created since the write began is found.
@@ -170,9 +162,6 @@ pub(crate) const LIVE_VIEW_OF_TABLE_SQL_PG: &str = live_view_of_table_sql!("$1")
 pub(crate) const LIVE_VIEW_NAMED_SQL: &str = live_view_named_sql!("?", "?");
 /// [`LIVE_VIEW_NAMED_SQL`] with Postgres placeholders.
 pub(crate) const LIVE_VIEW_NAMED_SQL_PG: &str = live_view_named_sql!("$1", "$2");
-/// How many live rows the table `table_id` has (bound once): none once another writer has
-/// dropped the table a write began on.
-pub(crate) const LIVE_TABLE_ROWS_SQL: &str = live_table_rows_sql!("?");
 
 /// The refusal [`makes_table`] asks for, from a view check's result: a live view of the
 /// table's name, named as the catalog names it.
@@ -186,23 +175,22 @@ pub(crate) fn refuse_live_view(view: Option<(String, String)>) -> Result<()> {
 }
 
 /// The refusal of a commit whose table another writer dropped after the write began (and
-/// perhaps replaced with a view of the same name): a concurrent change, so
-/// [`DuckLakeError::Conflict`], with official's words. A retry begins on the catalog as it
-/// now is, where a view of the name is refused [`DuckLakeError::ViewExists`] at the start.
+/// perhaps replaced with a view of the same name): [`DuckLakeError::Conflict`], with the words
+/// official's commit refuses it with, as every backend's conflict check already does for a
+/// drop since the write's base. Each backend raises it where its commit reads the table's live
+/// row and finds none.
+///
+/// What a retry does is the retried call's: a SQL `INSERT` plans against the catalog as it now
+/// is and fails "table not found", as DuckDB's does; a view of the name is refused
+/// [`DuckLakeError::ViewExists`] at any write's start; and [`DuckLakeTableWriter::append_table`]
+/// and `write_table`, which create a table that is absent, create it again.
+///
+/// [`DuckLakeTableWriter::append_table`]: crate::DuckLakeTableWriter::append_table
 pub(crate) fn table_dropped_error(table_id: i64) -> DuckLakeError {
     DuckLakeError::Conflict(format!(
         "Transaction conflict - attempting to insert into table with index \"{table_id}\" \
          - but another transaction has dropped it"
     ))
-}
-
-/// [`table_dropped_error`] unless the table still has its live row
-/// ([`LIVE_TABLE_ROWS_SQL`]'s count).
-pub(crate) fn refuse_dropped_table(live_rows: i64, table_id: i64) -> Result<()> {
-    if live_rows == 0 {
-        return Err(table_dropped_error(table_id));
-    }
-    Ok(())
 }
 
 /// The refusal of a standalone DDL statement on a backend that does not implement it yet

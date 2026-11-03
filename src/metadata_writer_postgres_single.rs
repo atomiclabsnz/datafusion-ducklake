@@ -975,19 +975,36 @@ async fn finalize_table_snapshot(
     {
         Some(id) => id,
         None => {
-            // The write began on a table another writer has since dropped (and perhaps
-            // replaced with a view): its id is taken, so this is a conflict, as on the
-            // multi-catalog writer, not an insert that collides with the dropped row. A new
+            // The write began on a table another writer has since dropped (perhaps making a
+            // view of its name) or renamed: its id is taken, so this is a conflict, as on the
+            // multi-catalog writer, not an insert that collides with the taken id. A new
             // table's id was reserved (or, in a catalog the extension created, is a negative
             // stand-in), and so is in no row.
-            let dropped: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM ducklake_table WHERE table_id = $1)",
+            let (rows, live): (i64, i64) = sqlx::query_as(
+                "SELECT COUNT(*), COUNT(*) FILTER (WHERE end_snapshot IS NULL)
+                 FROM ducklake_table WHERE table_id = $1",
             )
             .bind(table_id_hint)
             .fetch_one(&mut **tx)
             .await?;
-            if dropped {
-                return Err(crate::metadata_writer::table_dropped_error(table_id_hint));
+            if rows > 0 {
+                // Official's words for the change, read off the snapshots since the base
+                // (a rename is an alter); failing that, by what is left of the table.
+                crate::metadata_writer_postgres::check_table_conflicts(
+                    tx,
+                    table_id_hint,
+                    base_snapshot,
+                    crate::metadata_writer::TableChanges::append(),
+                )
+                .await?;
+                return Err(if live > 0 {
+                    crate::DuckLakeError::Conflict(format!(
+                        "Transaction conflict - attempting to insert into table with index \
+                         \"{table_id_hint}\" - but another transaction has altered it"
+                    ))
+                } else {
+                    crate::metadata_writer::table_dropped_error(table_id_hint)
+                });
             }
             // In a catalog the DuckDB extension created there is no sequence to have
             // reserved from: the id is allocated here, under the snapshot's lock.

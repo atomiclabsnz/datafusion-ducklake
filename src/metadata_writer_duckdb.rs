@@ -2279,16 +2279,8 @@ fn refuse_view_at_start(tx: &Transaction<'_>, schema_id: i64, table_name: &str) 
 }
 
 /// A write that makes its table, at its commit: refused a live view of the table's name, read
-/// here so one another writer created since the write began is refused too. A table another
-/// writer dropped since the write began (and perhaps replaced with a view) has no live row to
-/// name it by, and is a conflict.
+/// here so one another writer created since the write began is refused too.
 fn refuse_view_at_commit(tx: &Transaction<'_>, table_id: i64) -> Result<()> {
-    let live_rows: i64 = tx.query_row(
-        crate::metadata_writer::LIVE_TABLE_ROWS_SQL,
-        params![table_id],
-        |row| row.get(0),
-    )?;
-    crate::metadata_writer::refuse_dropped_table(live_rows, table_id)?;
     if !has_view_table(tx)? {
         return Ok(());
     }
@@ -2389,13 +2381,18 @@ fn finalize_table_snapshot(
     // Read once from the table's live row (a renamed table has ended versions under the same
     // id), and updated only when pending, so an append to a committed table pays nothing.
     let pending = crate::metadata_writer::PENDING_SNAPSHOT;
-    let (schema_id, schema_begin, table_begin): (i64, i64, i64) = tx.query_row(
-        "SELECT t.schema_id, s.begin_snapshot, t.begin_snapshot
-         FROM ducklake_table t JOIN ducklake_schema s ON s.schema_id = t.schema_id
-         WHERE t.table_id = ? AND t.end_snapshot IS NULL AND s.end_snapshot IS NULL",
-        params![table_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
+    // None when another writer dropped the table since this write began (and perhaps made a
+    // view of its name): a conflict.
+    let (schema_id, schema_begin, table_begin): (i64, i64, i64) = tx
+        .query_row(
+            "SELECT t.schema_id, s.begin_snapshot, t.begin_snapshot
+             FROM ducklake_table t JOIN ducklake_schema s ON s.schema_id = t.schema_id
+             WHERE t.table_id = ? AND t.end_snapshot IS NULL AND s.end_snapshot IS NULL",
+            params![table_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .ok_or_else(|| crate::metadata_writer::table_dropped_error(table_id))?;
     if schema_begin == pending {
         tx.execute(
             "UPDATE ducklake_schema SET begin_snapshot = ? WHERE schema_id = ? AND begin_snapshot = ?",

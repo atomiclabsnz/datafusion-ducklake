@@ -2188,18 +2188,11 @@ async fn refuse_view_at_start(
 }
 
 /// A write that makes its table, at its commit: refused a live view of the table's name, read
-/// here so one another writer created since the write began is refused too. A table another
-/// writer dropped since the write began (and perhaps replaced with a view) has no live row to
-/// name it by, and is a conflict.
+/// here so one another writer created since the write began is refused too.
 async fn refuse_view_at_commit(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     table_id: i64,
 ) -> Result<()> {
-    let live_rows: i64 = sqlx::query_scalar(crate::metadata_writer::LIVE_TABLE_ROWS_SQL)
-        .bind(table_id)
-        .fetch_one(&mut **tx)
-        .await?;
-    crate::metadata_writer::refuse_dropped_table(live_rows, table_id)?;
     if !has_view_table(tx).await? {
         return Ok(());
     }
@@ -2298,8 +2291,11 @@ async fn finalize_table_snapshot(
          WHERE t.table_id = ? AND t.end_snapshot IS NULL AND s.end_snapshot IS NULL",
     )
     .bind(table_id)
-    .fetch_one(&mut **tx)
-    .await?;
+    .fetch_optional(&mut **tx)
+    .await?
+    // None when another writer dropped the table since this write began (and perhaps made a
+    // view of its name): a conflict.
+    .ok_or_else(|| crate::metadata_writer::table_dropped_error(table_id))?;
     if schema_begin == pending {
         sqlx::query(
             "UPDATE ducklake_schema SET begin_snapshot = ? WHERE schema_id = ? AND begin_snapshot = ?",
