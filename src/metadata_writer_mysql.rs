@@ -2168,6 +2168,7 @@ async fn finalize_table_snapshot(
     base_snapshot: i64,
     inserts: bool,
 ) -> Result<i64> {
+    crate::metadata_writer::refuse_create_or_replace(mode)?;
     // Allocate the snapshot FIRST (carrying schema_version forward): this takes
     // the counter lock up front, serializing concurrent commits. schema_version is
     // corrected to a DDL bump below once we've classified the commit.
@@ -6433,6 +6434,7 @@ impl MetadataWriter for MySqlMetadataWriter {
         columns: &[ColumnDef],
         mode: WriteMode,
     ) -> Result<WriteSetupResult> {
+        crate::metadata_writer::refuse_create_or_replace(mode)?;
         validate_name(schema_name, "Schema")?;
         validate_name(table_name, "Table")?;
         if columns.is_empty() {
@@ -6571,7 +6573,9 @@ impl MetadataWriter for MySqlMetadataWriter {
                             return Err(crate::error::DuckLakeError::UnsupportedTypeChange {
                                 operation: TypeChangeOperation::DataWrite {
                                     mode: match mode {
-                                        WriteMode::Replace => TypeChangeWriteMode::Replace,
+                                        WriteMode::Replace | WriteMode::CreateOrReplace => {
+                                        TypeChangeWriteMode::Replace
+                                    },
                                         WriteMode::Append | WriteMode::Create => {
                                             TypeChangeWriteMode::Append
                                         }

@@ -1089,40 +1089,7 @@ impl SqliteMetadataWriter {
             };
 
             bump_schema_version(&mut tx, drop_snapshot).await?;
-
-            // Everything of the table official ends with it (DuckDB 1.5.6's DROP TABLE,
-            // read off the catalog): its sort and partition specs too.
-            for child in [
-                "ducklake_table",
-                "ducklake_column",
-                "ducklake_column_tag",
-                "ducklake_data_file",
-                "ducklake_delete_file",
-                "ducklake_sort_info",
-                "ducklake_partition_info",
-            ] {
-                sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {child} SET end_snapshot = ?
-                     WHERE table_id = ? AND end_snapshot IS NULL"
-                )))
-                .bind(drop_snapshot)
-                .bind(table_id)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            // Its own tags (`COMMENT ON TABLE`), keyed by its id: only where schemas, tables and
-            // views draw ids from one counter, as `drop_view` and `drop_schema` end theirs.
-            if has_allocator_watermarks(&mut tx).await? {
-                sqlx::query(
-                    "UPDATE ducklake_tag SET end_snapshot = ?
-                     WHERE object_id = ? AND end_snapshot IS NULL",
-                )
-                .bind(drop_snapshot)
-                .bind(table_id)
-                .execute(&mut *tx)
-                .await?;
-            }
+            end_table(&mut tx, table_id, drop_snapshot).await?;
 
             record_snapshot_changes(
                 &mut tx,
@@ -3334,6 +3301,21 @@ async fn finalize_table_snapshot(
             )));
         }
     }
+    // CREATE OR REPLACE: the live table of the name ends here, in the snapshot that creates
+    // this one (whose start made it a new table, with no columns yet).
+    let replaced = if mode == WriteMode::CreateOrReplace {
+        end_replaced_table(
+            tx,
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            base_snapshot,
+        )
+        .await?
+    } else {
+        None
+    };
     let committed_ids = assign_column_ids(&proposed, &existing_catalog_columns, column_ids)?;
     if committed_ids != column_ids {
         return Err(crate::DuckLakeError::Conflict(
@@ -3520,6 +3502,10 @@ async fn finalize_table_snapshot(
         create_eager_inlined_table(tx, table_id, *schema_version).await?;
     }
     let mut ddl_changes = Vec::new();
+    // Official records the drop first: `dropped_table:1,created_table:"main"."t",…`.
+    if let Some(replaced) = replaced {
+        ddl_changes.push(format!("dropped_table:{replaced}"));
+    }
     if table_was_created {
         if schema_begin_snapshot == table_begin_snapshot {
             // A multi-table commit finalizes each staged table in turn; two
@@ -3560,6 +3546,117 @@ async fn finalize_table_snapshot(
         .await?;
     }
     Ok(())
+}
+
+/// End table `table_id` at `snapshot_id` as `DROP TABLE` ends it: everything of the table
+/// official ends with it (DuckDB 1.5.6's DROP TABLE, read off the catalog), its sort and
+/// partition specs and its tags too. Its statistics stay. The caller records the change and
+/// bumps the schema version.
+async fn end_table(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    snapshot_id: i64,
+) -> Result<()> {
+    for child in [
+        "ducklake_table",
+        "ducklake_column",
+        "ducklake_column_tag",
+        "ducklake_data_file",
+        "ducklake_delete_file",
+        "ducklake_sort_info",
+        "ducklake_partition_info",
+    ] {
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE {child} SET end_snapshot = ?
+             WHERE table_id = ? AND end_snapshot IS NULL"
+        )))
+        .bind(snapshot_id)
+        .bind(table_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    // Its own tags (`COMMENT ON TABLE`), keyed by its id: only where schemas, tables and
+    // views draw ids from one counter, as `drop_view` and `drop_schema` end theirs.
+    if has_allocator_watermarks(tx).await? {
+        sqlx::query(
+            "UPDATE ducklake_tag SET end_snapshot = ?
+             WHERE object_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(snapshot_id)
+        .bind(table_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// [`WriteMode::CreateOrReplace`]'s drop, inside the commit that creates `table_id`, the new
+/// table: the live table of the same name in its schema, if there is one, is ended at
+/// `snapshot_id` as `DROP TABLE` ends it, and its id returned for the snapshot's
+/// `dropped_table`. Refused with a conflict, as DuckDB refuses it, when a commit since
+/// `base_snapshot` created a table of the name, or dropped or altered the one the write
+/// replaces (the one live at `base_snapshot`).
+async fn end_replaced_table(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    schema_name: &str,
+    table_name: &str,
+    snapshot_id: i64,
+    base_snapshot: i64,
+) -> Result<Option<i64>> {
+    // Another table of the name and schema as `table_id`, published and live at `at`
+    // (`NULL`: now).
+    let other_table = |at: Option<i64>| {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT old.table_id FROM ducklake_table old
+             JOIN ducklake_table new ON new.schema_id = old.schema_id
+             WHERE new.table_id = ?1 AND old.table_id <> new.table_id
+               AND old.table_name = new.table_name
+               AND old.begin_snapshot <> 9223372036854775807
+               AND (?2 IS NULL AND old.end_snapshot IS NULL
+                    OR old.begin_snapshot <= ?2
+                       AND (old.end_snapshot IS NULL OR old.end_snapshot > ?2))",
+        )
+        .bind(table_id)
+        .bind(at)
+    };
+    let replaced_at_base = other_table(Some(base_snapshot))
+        .fetch_optional(&mut **tx)
+        .await?;
+    let created = format!(
+        "created_table:{}",
+        crate::metadata_writer::quote_snapshot_table(schema_name, table_name)
+    );
+    for changes in changes_between(tx, base_snapshot, snapshot_id)
+        .await?
+        .iter()
+        .flatten()
+    {
+        if snapshot_has_change(changes, &created) {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "Transaction conflict - attempting to create table \"{table_name}\" in schema \
+                 \"{schema_name}\" - but another transaction has created a table with this name"
+            )));
+        }
+        if let Some(replaced) = replaced_at_base {
+            for (kind, described) in
+                [("dropped_table", "dropped it"), ("altered_table", "altered it")]
+            {
+                if snapshot_has_change(changes, &format!("{kind}:{replaced}")) {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "Transaction conflict - attempting to drop table with index \
+                         \"{replaced}\" - but another transaction has {described}"
+                    )));
+                }
+            }
+        }
+    }
+    let replaced = other_table(None).fetch_optional(&mut **tx).await?;
+    if let Some(replaced) = replaced {
+        end_table(tx, replaced, snapshot_id).await?;
+    }
+    Ok(replaced)
 }
 
 /// The live view `schema_name.view_name`, if there is one.
@@ -4641,6 +4738,16 @@ impl MetadataWriter for SqliteMetadataWriter {
         let _scope =
             crate::metadata_writer::WriterInliningLimitScope::enter(self.data_inlining_row_limit);
         crate::metadata_writer::effective_inlining_limit_of(&settings, schema_id, table_id)
+    }
+
+    fn new_table_data_inlining_row_limit(&self, schema_name: &str) -> Result<usize> {
+        // The schema's id as `table_data_inlining_row_limit` reads it; the table's own
+        // setting is the old table's, under its id, and not the new one's.
+        let (settings, schema_id, _) =
+            self.scoped_setting_rows(schema_name, "", "data_inlining_row_limit")?;
+        let _scope =
+            crate::metadata_writer::WriterInliningLimitScope::enter(self.data_inlining_row_limit);
+        crate::metadata_writer::effective_inlining_limit_of(&settings, schema_id, None)
     }
 
     fn table_setting(
@@ -8139,7 +8246,12 @@ impl MetadataWriter for SqliteMetadataWriter {
             )
             .await?;
             let replaced_existing_data = replaced_storage(&mut tx, table_id, snapshot_id).await?;
-            let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
+            // CREATE OR REPLACE of no rows inserts nothing, and official records no insert.
+            let changes_made = if mode == WriteMode::CreateOrReplace {
+                String::new()
+            } else {
+                table_write_changes(table_id, mode, false, replaced_existing_data)
+            };
             record_snapshot_changes(
                 &mut tx,
                 snapshot_id,
@@ -8415,14 +8527,33 @@ impl MetadataWriter for SqliteMetadataWriter {
                 }
             };
 
+            // CREATE OR REPLACE makes a new table beside the live one of the name, which its
+            // commit ends: a table no commit has published yet (one a failed write left, taken
+            // up as every write takes it up), else a new row. A view of the name is refused
+            // here, before anything is written, and again at the commit.
+            let replacing = mode == WriteMode::CreateOrReplace;
+            if replacing {
+                let views: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ducklake_view'",
+                )
+                .fetch_one(&mut *tx)
+                .await?;
+                if views > 0 && live_view_id(&mut tx, schema_name, table_name).await?.is_some() {
+                    return Err(crate::metadata_writer::view_exists_error(format!(
+                        "{schema_name}.{table_name}"
+                    )));
+                }
+            }
             let table_id: i64 = {
                 let existing = sqlx::query(
                     "SELECT table_id FROM ducklake_table
                      WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL
+                       AND (? = 0 OR begin_snapshot = 9223372036854775807)
                      ORDER BY begin_snapshot LIMIT 1",
                 )
                 .bind(schema_id)
                 .bind(table_name)
+                .bind(replacing)
                 .fetch_optional(&mut *tx)
                 .await?;
 
@@ -8503,7 +8634,9 @@ impl MetadataWriter for SqliteMetadataWriter {
                             return Err(crate::error::DuckLakeError::UnsupportedTypeChange {
                                 operation: TypeChangeOperation::DataWrite {
                                     mode: match mode {
-                                        WriteMode::Replace => TypeChangeWriteMode::Replace,
+                                        WriteMode::Replace | WriteMode::CreateOrReplace => {
+                                            TypeChangeWriteMode::Replace
+                                        },
                                         WriteMode::Append | WriteMode::Create => {
                                             TypeChangeWriteMode::Append
                                         }

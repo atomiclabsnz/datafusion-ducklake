@@ -929,6 +929,7 @@ impl DuckLakeTableWriter {
         schema_name: &str,
         table_name: &str,
         columns: &[ColumnDef],
+        mode: WriteMode,
     ) -> Result<()> {
         let names = columns
             .iter()
@@ -938,10 +939,14 @@ impl DuckLakeTableWriter {
         if self.metadata.reserved_inlining_column(&names)?.is_none() {
             return Ok(());
         }
-        let existing = self
-            .metadata
-            .get_table_column_nullability(schema_name, table_name)?
-            .unwrap_or_default();
+        // Every column of the table CREATE OR REPLACE makes is new.
+        let existing = if mode == WriteMode::CreateOrReplace {
+            Vec::new()
+        } else {
+            self.metadata
+                .get_table_column_nullability(schema_name, table_name)?
+                .unwrap_or_default()
+        };
         let new_columns = names
             .into_iter()
             .filter(|name| {
@@ -953,7 +958,7 @@ impl DuckLakeTableWriter {
         let Some(column) = self.metadata.reserved_inlining_column(&new_columns)? else {
             return Ok(());
         };
-        if self.table_data_inlining_row_limit(schema_name, table_name)? == 0 {
+        if self.write_inlining_limit(schema_name, table_name, mode)? == 0 {
             return Ok(());
         }
         Err(crate::metadata_writer::reserved_inlining_column_error(
@@ -970,7 +975,7 @@ impl DuckLakeTableWriter {
         columns: &[ColumnDef],
         mode: WriteMode,
     ) -> Result<WriteSetupResult> {
-        self.refuse_new_reserved_columns(schema_name, table_name, columns)?;
+        self.refuse_new_reserved_columns(schema_name, table_name, columns, mode)?;
         let mut setup = self.with_inlining_limit(|| {
             self.metadata
                 .begin_write_transaction(schema_name, table_name, columns, mode)
@@ -1228,19 +1233,16 @@ impl DuckLakeTableWriter {
     ) -> Result<TableWriteSession> {
         self.refuse_encrypted_parquet("write a data file")?;
         let validation_schema =
-            Arc::new(self.validation_schema(schema_name, table_name, arrow_schema)?);
+            Arc::new(self.validation_schema(schema_name, table_name, arrow_schema, mode)?);
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
         let setup = self.begin_write_transaction(schema_name, table_name, &columns, mode)?;
         // A session buffers its first rows while they number at most the
         // table's limit, as official's insert does, and commits them inlined
         // when the write ends there.
         let inline_limit = if inline && self.metadata.supports_data_inlining(arrow_schema) {
-            let limit = self.table_data_inlining_row_limit(schema_name, table_name)?;
-            (limit > 0
-                && self
-                    .metadata
-                    .table_types_support_inlining(schema_name, table_name)?)
-            .then_some(limit)
+            let limit = self.write_inlining_limit(schema_name, table_name, mode)?;
+            (limit > 0 && self.write_types_inline(schema_name, table_name, mode, &columns)?)
+                .then_some(limit)
         } else {
             None
         };
@@ -1440,6 +1442,27 @@ impl DuckLakeTableWriter {
         batches: &[RecordBatch],
     ) -> Result<WriteResult> {
         self.write_all(schema_name, table_name, batches, WriteMode::Create)
+            .await
+    }
+
+    /// Replace the table with a new one holding these rows, in one snapshot, as DuckDB's
+    /// `CREATE OR REPLACE TABLE … AS` does ([`WriteMode::CreateOrReplace`]): the live table of
+    /// the name, if any, is dropped and a new table, with a new id and the batches' columns,
+    /// is created with the rows. Its columns' types and nullability are the batches', not the
+    /// old table's. Batches with no rows create the table empty, with no data file, as
+    /// DuckDB's does. Refused with
+    /// [`DuckLakeError::ViewExists`](crate::DuckLakeError::ViewExists) when a view has the
+    /// name, and with [`DuckLakeError::Unsupported`](crate::DuckLakeError::Unsupported) on a
+    /// catalog backend other than SQLite (or a host's SQLite).
+    ///
+    /// [`Self::write_table`] is `INSERT OVERWRITE`: it keeps the table and its columns.
+    pub async fn create_or_replace_table(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        batches: &[RecordBatch],
+    ) -> Result<WriteResult> {
+        self.write_all(schema_name, table_name, batches, WriteMode::CreateOrReplace)
             .await
     }
 
@@ -1644,12 +1667,20 @@ impl DuckLakeTableWriter {
         Ok(())
     }
 
+    /// `incoming_schema` with the nullability of the table's live columns of the same
+    /// names, which a write may not weaken. The table [`WriteMode::CreateOrReplace`] makes
+    /// takes the incoming columns as they are: the live table of the name is replaced, not
+    /// written into.
     fn validation_schema(
         &self,
         schema_name: &str,
         table_name: &str,
         incoming_schema: &Schema,
+        mode: WriteMode,
     ) -> Result<Schema> {
+        if mode == WriteMode::CreateOrReplace {
+            return Ok(incoming_schema.clone());
+        }
         let existing = self
             .metadata
             .get_table_column_nullability(schema_name, table_name)?;
@@ -2252,7 +2283,8 @@ impl DuckLakeTableWriter {
                 "write_partitioned: no partition groups".to_string(),
             ));
         }
-        let validation_schema = self.validation_schema(schema_name, table_name, arrow_schema)?;
+        let validation_schema =
+            self.validation_schema(schema_name, table_name, arrow_schema, mode)?;
         for (_, batches) in &groups {
             validate_not_null_batches(&validation_schema, batches)?;
         }
@@ -2273,6 +2305,7 @@ impl DuckLakeTableWriter {
             records_written,
             arrow_schema,
             &all_batches,
+            mode,
         )?;
         let inline = decision.inline;
         if !inline {
@@ -2516,7 +2549,8 @@ impl DuckLakeTableWriter {
         resolve_layout: bool,
         plan: InsertSortPlan,
     ) -> Result<WriteResult> {
-        let validation_schema = self.validation_schema(schema_name, table_name, arrow_schema)?;
+        let validation_schema =
+            self.validation_schema(schema_name, table_name, arrow_schema, mode)?;
         validate_not_null_batches(&validation_schema, batches)?;
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
         let records_written: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -2527,6 +2561,7 @@ impl DuckLakeTableWriter {
             records_written,
             arrow_schema,
             batches,
+            mode,
         )?;
         let inline = decision.inline;
         if !inline {
@@ -2675,7 +2710,8 @@ impl DuckLakeTableWriter {
         batches: &[RecordBatch],
         resolve_layout: bool,
     ) -> Result<PreparedTableWrite> {
-        let validation_schema = self.validation_schema(schema_name, table_name, arrow_schema)?;
+        let validation_schema =
+            self.validation_schema(schema_name, table_name, arrow_schema, mode)?;
         validate_not_null_batches(&validation_schema, batches)?;
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
         let records_written: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -2686,6 +2722,7 @@ impl DuckLakeTableWriter {
             records_written,
             arrow_schema,
             batches,
+            mode,
         )?;
         let inline = decision.inline;
         if records_written > 0 && !inline {
@@ -2988,7 +3025,14 @@ impl DuckLakeTableWriter {
         batches: &[RecordBatch],
     ) -> Result<bool> {
         Ok(self
-            .inline_decision(schema_name, table_name, rows, arrow_schema, batches)?
+            .inline_decision(
+                schema_name,
+                table_name,
+                rows,
+                arrow_schema,
+                batches,
+                WriteMode::Append,
+            )?
             .inline)
     }
 
@@ -3001,6 +3045,7 @@ impl DuckLakeTableWriter {
         rows: usize,
         arrow_schema: &Schema,
         batches: &[RecordBatch],
+        mode: WriteMode,
     ) -> Result<InlineDecision> {
         let mut decision = InlineDecision {
             inline: false,
@@ -3011,14 +3056,54 @@ impl DuckLakeTableWriter {
         {
             return Ok(decision);
         }
-        let limit = self.table_data_inlining_row_limit(schema_name, table_name)?;
+        let limit = self.write_inlining_limit(schema_name, table_name, mode)?;
         decision.limit = Some(limit);
         decision.inline = rows <= limit
             && self.metadata.supports_data_inlining_values(batches)
-            && self
-                .metadata
-                .table_types_support_inlining(schema_name, table_name)?;
+            && self.write_types_inline(
+                schema_name,
+                table_name,
+                mode,
+                &arrow_schema_to_column_defs(arrow_schema)?,
+            )?;
         Ok(decision)
+    }
+
+    /// The `data_inlining_row_limit` of the table a write of `mode` lands in:
+    /// [`Self::table_data_inlining_row_limit`], or for [`WriteMode::CreateOrReplace`] that
+    /// of the new table it makes, which has no table-scoped setting
+    /// ([`MetadataWriter::new_table_data_inlining_row_limit`]).
+    fn write_inlining_limit(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        mode: WriteMode,
+    ) -> Result<usize> {
+        if mode == WriteMode::CreateOrReplace {
+            return self.with_inlining_limit(|| {
+                self.metadata.new_table_data_inlining_row_limit(schema_name)
+            });
+        }
+        self.table_data_inlining_row_limit(schema_name, table_name)
+    }
+
+    /// Whether the columns of the table a write of `mode` lands in are all of types official
+    /// inlines: the live table's ([`MetadataWriter::table_types_support_inlining`]), or for
+    /// [`WriteMode::CreateOrReplace`] `columns`, the new table's.
+    fn write_types_inline(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        mode: WriteMode,
+        columns: &[ColumnDef],
+    ) -> Result<bool> {
+        if mode == WriteMode::CreateOrReplace {
+            return Ok(!columns
+                .iter()
+                .any(|column| crate::types::refuses_inlining(column.ducklake_type())));
+        }
+        self.metadata
+            .table_types_support_inlining(schema_name, table_name)
     }
 
     /// Whether inlining is enabled for `schema_name.table_name`, as official's
@@ -3501,9 +3586,12 @@ impl DuckLakeWriteTransaction<'_> {
         if positional_deletes.is_empty() && inlined_deletes.is_empty() {
             return Ok(());
         }
-        let validation_schema =
-            self.writer
-                .validation_schema(schema_name, table_name, arrow_schema)?;
+        let validation_schema = self.writer.validation_schema(
+            schema_name,
+            table_name,
+            arrow_schema,
+            WriteMode::Append,
+        )?;
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
         let setup = self.writer.begin_write_transaction(
             schema_name,
@@ -3652,9 +3740,12 @@ impl DuckLakeWriteTransaction<'_> {
             .into_iter()
             .map(|rewritten| (rewritten.entry, rewritten.source))
             .unzip();
-        let validation_schema =
-            self.writer
-                .validation_schema(schema_name, table_name, arrow_schema)?;
+        let validation_schema = self.writer.validation_schema(
+            schema_name,
+            table_name,
+            arrow_schema,
+            WriteMode::Append,
+        )?;
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
         let catalog_columns = crate::metadata_writer::catalog_column_defs(&columns)?;
         if catalog_columns.len() != column_ids.len() {
@@ -5292,6 +5383,11 @@ impl TableWriteSession {
             let batches = self.inline_order(batches)?;
             return self.commit_inlined(batches);
         }
+        // CREATE OR REPLACE of no rows creates the table empty, with no data file, as
+        // official's does: there is no prior generation of the new table to retire.
+        if self.mode == WriteMode::CreateOrReplace && self.row_count == 0 {
+            return self.finish_without_rows().await;
+        }
         // Rolling: finish the in-progress file, upload every file this session
         // produced, and commit them in ONE snapshot.
         if let Some(mut roller) = self.roller.take() {
@@ -5474,6 +5570,32 @@ impl TableWriteSession {
 
     /// Commit this session's single staged file (the unpartitioned path, and the
     /// 0-row truncate marker of a partitioned Replace).
+    /// Commit the session's table with no rows and no data file, removing whatever it
+    /// started to upload.
+    async fn finish_without_rows(self) -> Result<WriteResult> {
+        let committed = self.with_inlining_limit(|| {
+            self.metadata.publish_snapshot(
+                self.table_id,
+                &self.schema_name,
+                &self.table_name,
+                self.snapshot_id,
+                self.mode,
+                self.base_snapshot_id,
+                &self.columns,
+                &self.field_ids,
+            )
+        });
+        self.abort().await?;
+        let committed = committed?;
+        Ok(WriteResult {
+            snapshot_id: committed.snapshot_id,
+            table_id: committed.table_id,
+            schema_id: committed.schema_id,
+            files_written: 0,
+            records_written: 0,
+        })
+    }
+
     async fn finish_single_file(mut self) -> Result<WriteResult> {
         let (file_info, object) = self.upload_staged().await?;
         // register_data_file returns the ids actually committed (snapshot id
