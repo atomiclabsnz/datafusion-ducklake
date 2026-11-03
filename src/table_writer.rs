@@ -5532,8 +5532,13 @@ impl TableWriteSession {
         }
         // CREATE OR REPLACE of no rows creates the table empty, with no data file, as
         // official's does: there is no prior generation of the new table to retire.
+        //
+        // This tail call and `finish_single_file`'s are boxed: each moves the session (several
+        // KB) into a future of its own, and inline every one of them would add that to this
+        // future's state, which callers hold on their stacks (#26: an unboxed one overflowed a
+        // test's tokio worker stack).
         if self.mode == WriteMode::CreateOrReplace && self.row_count == 0 {
-            return self.finish_without_rows().await;
+            return Box::pin(self.finish_without_rows()).await;
         }
         // Rolling: finish the in-progress file, upload every file this session
         // produced, and commit them in ONE snapshot.
@@ -5546,7 +5551,7 @@ impl TableWriteSession {
                 // No rows arrived. Fall through to the single-file path, which
                 // registers the 0-row marker a Replace needs to retire the prior
                 // generation.
-                return self.finish_single_file().await;
+                return Box::pin(self.finish_single_file()).await;
             }
             let file_infos = uploaded.infos;
             let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
@@ -5591,7 +5596,7 @@ impl TableWriteSession {
                 // No rows reached any partition. Fall through to the single-file
                 // path, which registers the 0-row marker that carries a Replace
                 // truncation (and is exempt from the partition fence).
-                return self.finish_single_file().await;
+                return Box::pin(self.finish_single_file()).await;
             }
             let file_infos = uploaded.infos;
             let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
@@ -5628,7 +5633,7 @@ impl TableWriteSession {
                 records_written,
             });
         }
-        self.finish_single_file().await
+        Box::pin(self.finish_single_file()).await
     }
 
     /// Commit the session's rows inlined, in one snapshot, as

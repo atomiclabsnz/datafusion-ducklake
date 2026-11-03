@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `WriteMode` has a `CreateOrReplace` variant; exhaustive matches need its arm.
 - DuckDB 1.5.6 is the bundled engine (`duckdb ~1.10506.1`) and the oracle (CI's CLI,
   the `ducklake` extension `ac7595b0`); 1.5.5 before. DuckDB 2.0 / format 1.1 is #22.
 - Table statistics as official reads them from 1.5.6: a `ducklake_table_column_stats` row with
@@ -34,17 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `WriteMode::CreateOrReplace` and `DuckLakeTableWriter::create_or_replace_table`: DuckDB's
-  `CREATE OR REPLACE TABLE`, as DuckDB 1.5.6 writes it (ferrion#611). In one snapshot the live
-  table of the name is ended as `DROP TABLE` ends it and a new table, with a new id and the
-  rows' columns, types and nullability, is created with the rows; the snapshot records
-  `dropped_table`, `created_table`, then `inserted_into_table` or `inlined_insert` (none for no
-  rows, which write no data file). The old table's table-scoped settings stay with it. A live
-  view of the name is `ViewExists`, refused before anything is written; a table of the name
-  created, dropped or altered by another commit since the write began is a `Conflict`.
-  `WriteMode::Replace` (`INSERT OVERWRITE`) is unchanged. The SQLite catalog (and a host's
-  SQLite) implements it; the other backends refuse it as `Unsupported`.
-  `MetadataWriter::new_table_data_inlining_row_limit` is the limit such a new table has.
-  **Breaking** for exhaustive matches on `WriteMode`.
+  `CREATE OR REPLACE TABLE`, a new table in one snapshot, on SQLite (ferrion#611).
 - Standalone DDL as its own snapshot, as DuckDB 1.5.6 writes it (#18): `MetadataWriter::{create_schema,
   drop_table, drop_view, drop_schema}`. `CREATE SCHEMA` is also reached from SQL
   (`DuckLakeCatalog::register_schema`); the drops are the writer's to call (a host's executor),
