@@ -73,6 +73,7 @@
 //! worth knowing if you are counting them.
 
 pub mod catalog;
+pub(crate) mod catalog_name;
 mod catalog_read_memo;
 pub mod change_detection;
 pub mod column_rename;
@@ -235,7 +236,8 @@ pub use metadata_writer::{
     DeleteFileEntry, DeleteFileInfo, ImportedFile, InlinedFlushDeleteFile, InlinedFlushFile,
     InlinedFlushFileDelete, InlinedFlushTable, InlinedRowRef, MetadataWriter, MultiTableCommit,
     PromoteLayout, PromotedFile, RowIdStart, SnapshotCommitMetadata, SourceRetirement,
-    StagedTableData, StagedTableWrite, WriteMode, WriteResult, WriteSetupResult,
+    StagedTableData, StagedTableWrite, StoredLocation, StoredPath, WriteMode, WriteResult,
+    WriteSetupResult,
 };
 #[cfg(feature = "write-duckdb")]
 pub use metadata_writer_duckdb::DuckdbMetadataWriter;

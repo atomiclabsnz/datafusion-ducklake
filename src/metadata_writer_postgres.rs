@@ -1868,7 +1868,7 @@ impl PostgresMetadataWriter {
                 .await?
                 .flatten();
                 let recorded = recorded.unwrap_or_default();
-                if !snapshot_has_change(&recorded, &created)
+                if !crate::metadata_writer::snapshot_has_named_change(&recorded, &created)
                     && !snapshot_has_change(&recorded, &altered)
                 {
                     record_snapshot_changes(
@@ -2067,13 +2067,17 @@ pub(crate) async fn live_named_table_columns(
     table_name: &str,
     connection: &mut sqlx::PgConnection,
 ) -> Result<Option<(i64, Vec<ExistingCatalogColumn>)>> {
-    let table_id: Option<i64> = sqlx::query_scalar(
+    let table_id: Option<i64> = sqlx::query_scalar(concat!(
         "SELECT t.table_id FROM ducklake_table t
          JOIN ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
          JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
-         WHERE m.catalog_id = $1 AND s.schema_name = $2 AND t.table_name = $3
-           AND t.end_snapshot IS NULL",
-    )
+         WHERE m.catalog_id = $1 AND ",
+        crate::catalog_name::name_eq!(postgres, "s.schema_name", "$2"),
+        " AND ",
+        crate::catalog_name::name_eq!(postgres, "t.table_name", "$3"),
+        "
+           AND t.end_snapshot IS NULL"
+    ))
     .bind(catalog_id)
     .bind(schema_name)
     .bind(table_name)
@@ -3328,11 +3332,13 @@ async fn finalize_table_snapshot(
     //    reserve a fresh id from the sequence (the row is inserted in step 4 once
     //    the snapshot id exists for begin_snapshot).
     let (schema_id, schema_was_created): (i64, bool) = {
-        let existing = sqlx::query(
+        let existing = sqlx::query(concat!(
             "SELECT s.schema_id FROM ducklake_schema s
              JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
-             WHERE m.catalog_id = $1 AND s.schema_name = $2 AND s.end_snapshot IS NULL",
-        )
+             WHERE m.catalog_id = $1 AND ",
+            crate::catalog_name::name_eq!(postgres, "s.schema_name", "$2"),
+            " AND s.end_snapshot IS NULL"
+        ))
         .bind(catalog_id)
         .bind(schema_name)
         .fetch_optional(&mut **tx)
@@ -3349,10 +3355,12 @@ async fn finalize_table_snapshot(
     //    Resolve the table id first; a brand-new table has no prior generation to
     //    conflict with, so skip the check (base == head, no rows exist yet).
     if mode == WriteMode::Replace && !schema_was_created {
-        let existing_table_id: Option<i64> = sqlx::query(
+        let existing_table_id: Option<i64> = sqlx::query(concat!(
             "SELECT table_id FROM ducklake_table
-             WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
-        )
+             WHERE schema_id = $1 AND ",
+            crate::catalog_name::name_eq!(postgres, "table_name", "$2"),
+            " AND end_snapshot IS NULL"
+        ))
         .bind(schema_id)
         .bind(table_name)
         .fetch_optional(&mut **tx)
@@ -3396,10 +3404,12 @@ async fn finalize_table_snapshot(
 
     // 4. Get or create the table under the lock.
     let (table_id, table_was_created): (i64, bool) = {
-        let existing = sqlx::query(
+        let existing = sqlx::query(concat!(
             "SELECT table_id FROM ducklake_table
-             WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
-        )
+             WHERE schema_id = $1 AND ",
+            crate::catalog_name::name_eq!(postgres, "table_name", "$2"),
+            " AND end_snapshot IS NULL"
+        ))
         .bind(schema_id)
         .bind(table_name)
         .fetch_optional(&mut **tx)
@@ -3707,6 +3717,16 @@ async fn finalize_table_snapshot(
     }
 
     let mut ddl_changes = Vec::new();
+    // The names as the catalog spells them, as DuckDB records them.
+    let stored: Option<(String, String)> =
+        sqlx::query_as(crate::metadata_writer::STORED_NAMES_OF_TABLE_SQL_PG)
+            .bind(table_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let (schema_name, table_name) = match &stored {
+        Some((schema, table)) => (schema.as_str(), table.as_str()),
+        None => (schema_name, table_name),
+    };
     if schema_was_created {
         let schema_entry = format!(
             "created_schema:{}",
@@ -4994,21 +5014,25 @@ async fn postgres_scoped_setting_rows(
 )> {
     let schema_id: Option<i64> = match catalog_id {
         Some(catalog_id) => {
-            sqlx::query_scalar(
+            sqlx::query_scalar(concat!(
                 "SELECT s.schema_id FROM ducklake_schema s
                  JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
-                 WHERE m.catalog_id = $1 AND s.schema_name = $2 AND s.end_snapshot IS NULL",
-            )
+                 WHERE m.catalog_id = $1 AND ",
+                crate::catalog_name::name_eq!(postgres, "s.schema_name", "$2"),
+                " AND s.end_snapshot IS NULL"
+            ))
             .bind(catalog_id)
             .bind(schema_name)
             .fetch_optional(pool)
             .await?
         },
         None => {
-            sqlx::query_scalar(
+            sqlx::query_scalar(concat!(
                 "SELECT schema_id FROM ducklake_schema
-                 WHERE schema_name = $1 AND end_snapshot IS NULL",
-            )
+                 WHERE ",
+                crate::catalog_name::name_eq!(postgres, "schema_name", "$1"),
+                " AND end_snapshot IS NULL"
+            ))
             .bind(schema_name)
             .fetch_optional(pool)
             .await?
@@ -5016,10 +5040,12 @@ async fn postgres_scoped_setting_rows(
     };
     let table_id: Option<i64> = match schema_id {
         Some(schema_id) => {
-            sqlx::query_scalar(
+            sqlx::query_scalar(concat!(
                 "SELECT table_id FROM ducklake_table
-                 WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
-            )
+                 WHERE schema_id = $1 AND ",
+                crate::catalog_name::name_eq!(postgres, "table_name", "$2"),
+                " AND end_snapshot IS NULL"
+            ))
             .bind(schema_id)
             .bind(table_name)
             .fetch_optional(pool)
@@ -5840,11 +5866,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
 
-            let existing = sqlx::query(
+            let existing = sqlx::query(concat!(
                 "SELECT s.schema_id FROM ducklake_schema s
                  JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
-                 WHERE m.catalog_id = $1 AND s.schema_name = $2 AND s.end_snapshot IS NULL",
-            )
+                 WHERE m.catalog_id = $1 AND ",
+                crate::catalog_name::name_eq!(postgres, "s.schema_name", "$2"),
+                " AND s.end_snapshot IS NULL"
+            ))
             .bind(self.catalog_id)
             .bind(name)
             .fetch_optional(&mut *tx)
@@ -5911,8 +5939,8 @@ impl MetadataWriter for PostgresMetadataWriter {
             assert_schema_in_catalog(self.catalog_id, schema_id, &mut tx).await?;
 
             let existing = sqlx::query(
-                "SELECT table_id FROM ducklake_table
-                 WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
+                concat!("SELECT table_id FROM ducklake_table
+                 WHERE schema_id = $1 AND ", crate::catalog_name::name_eq!(postgres, "table_name", "$2"), " AND end_snapshot IS NULL"),
             )
             .bind(schema_id)
             .bind(name)
@@ -6426,14 +6454,20 @@ impl MetadataWriter for PostgresMetadataWriter {
     fn table_types_support_inlining(&self, schema_name: &str, table_name: &str) -> Result<bool> {
         self.block_on(async {
             let refused: bool = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT EXISTS(
+                concat!(
+                    "SELECT EXISTS(
                      SELECT 1 FROM ducklake_column c
                      JOIN ducklake_table t ON t.table_id = c.table_id
                      JOIN ducklake_schema s ON s.schema_id = t.schema_id
                      JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
-                     WHERE m.catalog_id = $1 AND s.schema_name = $2 AND s.end_snapshot IS NULL
-                       AND t.table_name = $3 AND t.end_snapshot IS NULL
-                       AND c.end_snapshot IS NULL AND LOWER(c.column_type) IN ({}))",
+                     WHERE m.catalog_id = $1 AND ",
+                    crate::catalog_name::name_eq!(postgres, "s.schema_name", "$2"),
+                    " AND s.end_snapshot IS NULL
+                       AND ",
+                    crate::catalog_name::name_eq!(postgres, "t.table_name", "$3"),
+                    " AND t.end_snapshot IS NULL
+                       AND c.end_snapshot IS NULL AND LOWER(c.column_type) IN ({}))"
+                ),
                 crate::types::sql_uninlinable_types()
             )))
             .bind(self.catalog_id)
@@ -8952,23 +8986,73 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
+    /// [`MetadataWriter::stored_location`] among this catalog's schemas only.
+    fn stored_location(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<Option<crate::metadata_writer::StoredLocation>> {
+        self.block_on(async {
+            let found = sqlx::query_as(concat!(
+                "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+                 FROM (SELECT s.schema_id, s.path, s.path_is_relative, s.begin_snapshot
+                       FROM ducklake_schema s
+                       JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
+                       WHERE m.catalog_id = $1 AND s.end_snapshot IS NULL
+                         AND s.begin_snapshot <> $2 AND ",
+                crate::catalog_name::name_eq!(postgres, "s.schema_name", "$3"),
+                ") s
+                 LEFT JOIN ducklake_table t ON t.schema_id = s.schema_id
+                   AND t.end_snapshot IS NULL AND t.begin_snapshot <> $2 AND ",
+                crate::catalog_name::name_eq!(postgres, "t.table_name", "$4"),
+                "
+                 ORDER BY s.begin_snapshot, t.begin_snapshot
+                 LIMIT 1"
+            ))
+            .bind(self.catalog_id)
+            .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+            .bind(schema_name)
+            .bind(table_name)
+            .fetch_optional(&self.pool)
+            .await?;
+            Ok(crate::metadata_writer::stored_location(found))
+        })
+    }
+
+    fn location_of_table(
+        &self,
+        table_id: i64,
+    ) -> Result<Option<crate::metadata_writer::StoredLocation>> {
+        self.block_on(async {
+            let found = sqlx::query_as(crate::metadata_writer::LOCATION_OF_TABLE_SQL_PG)
+                .bind(table_id)
+                .fetch_optional(&self.pool)
+                .await?;
+            Ok(crate::metadata_writer::stored_location(found))
+        })
+    }
+
     fn get_table_column_nullability(
         &self,
         schema_name: &str,
         table_name: &str,
     ) -> Result<Option<Vec<(String, bool)>>> {
         self.block_on(async {
-            let rows = sqlx::query(
+            let rows = sqlx::query(concat!(
                 "SELECT c.column_name, c.nulls_allowed
                  FROM ducklake_column c
                  JOIN ducklake_table t ON t.table_id = c.table_id
                  JOIN ducklake_schema s ON s.schema_id = t.schema_id
                  JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
-                 WHERE m.catalog_id = $1 AND s.schema_name = $2 AND s.end_snapshot IS NULL
-                   AND t.table_name = $3 AND t.end_snapshot IS NULL
+                 WHERE m.catalog_id = $1 AND ",
+                crate::catalog_name::name_eq!(postgres, "s.schema_name", "$2"),
+                " AND s.end_snapshot IS NULL
+                   AND ",
+                crate::catalog_name::name_eq!(postgres, "t.table_name", "$3"),
+                " AND t.end_snapshot IS NULL
                    AND c.end_snapshot IS NULL AND c.parent_column IS NULL
-                 ORDER BY c.column_order",
-            )
+                 ORDER BY c.column_order"
+            ))
             .bind(self.catalog_id)
             .bind(schema_name)
             .bind(table_name)
@@ -9102,9 +9186,9 @@ impl MetadataWriter for PostgresMetadataWriter {
             // expected and harmless).
             let schema_id: i64 = {
                 let existing = sqlx::query(
-                    "SELECT s.schema_id FROM ducklake_schema s
+                    concat!("SELECT s.schema_id FROM ducklake_schema s
                      JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
-                     WHERE m.catalog_id = $1 AND s.schema_name = $2 AND s.end_snapshot IS NULL",
+                     WHERE m.catalog_id = $1 AND ", crate::catalog_name::name_eq!(postgres, "s.schema_name", "$2"), " AND s.end_snapshot IS NULL"),
                 )
                 .bind(catalog_id)
                 .bind(schema_name)
@@ -9120,8 +9204,8 @@ impl MetadataWriter for PostgresMetadataWriter {
             // reserved id IS used (threaded to finalize as table_id_hint).
             let table_id: i64 = {
                 let existing = sqlx::query(
-                    "SELECT table_id FROM ducklake_table
-                     WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
+                    concat!("SELECT table_id FROM ducklake_table
+                     WHERE schema_id = $1 AND ", crate::catalog_name::name_eq!(postgres, "table_name", "$2"), " AND end_snapshot IS NULL"),
                 )
                 .bind(schema_id)
                 .bind(table_name)

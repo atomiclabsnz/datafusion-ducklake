@@ -196,6 +196,15 @@ The `DuckLakeTable` provider handles URL resolution by:
 
 ## Key Implementation Details
 
+### Catalog Names
+- Schema, table and view names follow DuckDB: stored as written, found in any ASCII case
+  (`src/catalog_name.rs`, pinned against DuckDB in `tests/it/name_case_tests.rs`)
+- Every SQL lookup or comparison of such a name is `name_eq!(dialect, left, right)`, never a bare
+  `=`; a Rust comparison is `names_match`. A write keys a table's files by the `path`
+  columns of the row its start chose (`MetadataWriter::location_of_table`; else the live,
+  published row, `stored_location`), never by a name: a rename keeps the path. No write
+  renames a row, pending or not: another write in flight may own it
+
 ### Snapshot Isolation
 - DuckLake uses snapshot IDs for temporal consistency
 - `new()` and `with_writer()` catalogs read the latest snapshot at each lookup; `with_snapshot()` and `with_snapshot_at()` stay fixed

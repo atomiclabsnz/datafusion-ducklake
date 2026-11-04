@@ -71,12 +71,16 @@ pub const SQL_LIST_VIEWS: &str =
        AND ? >= begin_snapshot
        AND (? < end_snapshot OR end_snapshot IS NULL)";
 
-pub const SQL_GET_VIEW_BY_NAME: &str =
+/// The live view named `?` in any ASCII case, DuckDB's rule (`catalog_name.rs`).
+pub const SQL_GET_VIEW_BY_NAME: &str = concat!(
     "SELECT view_id, schema_id, begin_snapshot, view_name, dialect, sql, column_aliases FROM ducklake_view
      WHERE schema_id = ?
-       AND view_name = ?
+       AND ",
+    crate::catalog_name::name_eq!(duckdb, "view_name", "?"),
+    "
        AND ? >= begin_snapshot
-       AND (? < end_snapshot OR end_snapshot IS NULL)";
+       AND (? < end_snapshot OR end_snapshot IS NULL)"
+);
 
 pub const SQL_GET_TABLE_COLUMNS: &str =
     "SELECT column_id, column_name, column_type, nulls_allowed, parent_column,
@@ -207,26 +211,39 @@ pub const SQL_GET_FILE_COLUMN_STATS: &str = "
 pub const SQL_GET_DATA_PATH: &str =
     "SELECT value FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL";
 
-pub const SQL_GET_SCHEMA_BY_NAME: &str =
+/// The schema named `?` in any ASCII case, DuckDB's rule (`catalog_name.rs`).
+pub const SQL_GET_SCHEMA_BY_NAME: &str = concat!(
     "SELECT schema_id, schema_name, path, path_is_relative FROM ducklake_schema
-     WHERE schema_name = ?
+     WHERE ",
+    crate::catalog_name::name_eq!(duckdb, "schema_name", "?"),
+    "
        AND ? >= begin_snapshot
-       AND (? < end_snapshot OR end_snapshot IS NULL)";
+       AND (? < end_snapshot OR end_snapshot IS NULL)"
+);
 
-pub const SQL_GET_TABLE_BY_NAME: &str =
+/// The table named `?` in any ASCII case, DuckDB's rule (`catalog_name.rs`).
+pub const SQL_GET_TABLE_BY_NAME: &str = concat!(
     "SELECT table_id, table_name, path, path_is_relative FROM ducklake_table
      WHERE schema_id = ?
-       AND table_name = ?
+       AND ",
+    crate::catalog_name::name_eq!(duckdb, "table_name", "?"),
+    "
        AND ? >= begin_snapshot
-       AND (? < end_snapshot OR end_snapshot IS NULL)";
+       AND (? < end_snapshot OR end_snapshot IS NULL)"
+);
 
-pub const SQL_TABLE_EXISTS: &str = "SELECT EXISTS(
+/// Whether a table is named `?` in any ASCII case, DuckDB's rule (`catalog_name.rs`).
+pub const SQL_TABLE_EXISTS: &str = concat!(
+    "SELECT EXISTS(
        SELECT 1 FROM ducklake_table
        WHERE schema_id = ?
-         AND table_name = ?
+         AND ",
+    crate::catalog_name::name_eq!(duckdb, "table_name", "?"),
+    "
          AND ? >= begin_snapshot
          AND (? < end_snapshot OR end_snapshot IS NULL)
-     )";
+     )"
+);
 
 pub const SQL_GET_OBJECT_TAGS: &str = "SELECT begin_snapshot, end_snapshot, \"key\", \"value\"
      FROM ducklake_tag

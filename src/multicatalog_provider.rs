@@ -2239,15 +2239,17 @@ impl MetadataProvider for MulticatalogProvider {
         block_on(async {
             let row = self
                 .read_optional(
-                    sqlx::query(
+                    sqlx::query(concat!(
                         "SELECT s.schema_id, s.schema_name, s.path, s.path_is_relative
                  FROM ducklake_schema s
                  JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
                  WHERE m.catalog_id = $1
-                   AND s.schema_name = $2
+                   AND ",
+                        crate::catalog_name::name_eq!(postgres, "s.schema_name", "$2"),
+                        "
                    AND $3 >= s.begin_snapshot
-                   AND ($4 < s.end_snapshot OR s.end_snapshot IS NULL)",
-                    )
+                   AND ($4 < s.end_snapshot OR s.end_snapshot IS NULL)"
+                    ))
                     .bind(self.catalog_id)
                     .bind(name)
                     .bind(snapshot_id)
@@ -2277,14 +2279,16 @@ impl MetadataProvider for MulticatalogProvider {
         block_on(async {
             let row = self
                 .read_optional(
-                    sqlx::query(
+                    sqlx::query(concat!(
                         "SELECT table_id, table_name, path, path_is_relative
                  FROM ducklake_table
                  WHERE schema_id = $1
-                   AND table_name = $2
+                   AND ",
+                        crate::catalog_name::name_eq!(postgres, "table_name", "$2"),
+                        "
                    AND $3 >= begin_snapshot
-                   AND ($4 < end_snapshot OR end_snapshot IS NULL)",
-                    )
+                   AND ($4 < end_snapshot OR end_snapshot IS NULL)"
+                    ))
                     .bind(schema_id)
                     .bind(name)
                     .bind(snapshot_id)
@@ -2315,12 +2319,12 @@ impl MetadataProvider for MulticatalogProvider {
                 return Ok(None);
             }
             let row = self.read_optional(sqlx::query(
-                "SELECT view_id, schema_id, begin_snapshot, view_name, dialect, sql, column_aliases
+                concat!("SELECT view_id, schema_id, begin_snapshot, view_name, dialect, sql, column_aliases
                  FROM ducklake_view
                  WHERE schema_id = $1
-                   AND view_name = $2
+                   AND ", crate::catalog_name::name_eq!(postgres, "view_name", "$2"), "
                    AND $3 >= begin_snapshot
-                   AND ($4 < end_snapshot OR end_snapshot IS NULL)",
+                   AND ($4 < end_snapshot OR end_snapshot IS NULL)"),
             )
             .bind(schema_id)
             .bind(name)
@@ -2336,15 +2340,17 @@ impl MetadataProvider for MulticatalogProvider {
         block_on(async {
             let row = self
                 .read_one(
-                    sqlx::query(
+                    sqlx::query(concat!(
                         "SELECT EXISTS(
                     SELECT 1 FROM ducklake_table
                     WHERE schema_id = $1
-                      AND table_name = $2
+                      AND ",
+                        crate::catalog_name::name_eq!(postgres, "table_name", "$2"),
+                        "
                       AND $3 >= begin_snapshot
                       AND ($4 < end_snapshot OR end_snapshot IS NULL)
-                 )",
-                    )
+                 )"
+                    ))
                     .bind(schema_id)
                     .bind(name)
                     .bind(snapshot_id)
@@ -2418,13 +2424,15 @@ impl MetadataProvider for MulticatalogProvider {
         block_on(async {
             let result = self
                 .read_optional(
-                    sqlx::query(
+                    sqlx::query(concat!(
                         "SELECT v.view_id FROM ducklake_view v
                  JOIN ducklake_catalog_schema_map m ON m.schema_id = v.schema_id
-                 WHERE m.catalog_id = $1 AND v.schema_id = $2 AND v.view_name = $3
+                 WHERE m.catalog_id = $1 AND v.schema_id = $2 AND ",
+                        crate::catalog_name::name_eq!(postgres, "v.view_name", "$3"),
+                        "
                    AND $4 >= v.begin_snapshot
-                   AND ($5 < v.end_snapshot OR v.end_snapshot IS NULL)",
-                    )
+                   AND ($5 < v.end_snapshot OR v.end_snapshot IS NULL)"
+                    ))
                     .bind(self.catalog_id)
                     .bind(schema_id)
                     .bind(name)

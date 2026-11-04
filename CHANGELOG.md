@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `MetadataWriter::stored_location` and `location_of_table`: where a schema and table keep their files.
 - `WriteMode::CreateOrReplace` and `DuckLakeTableWriter::create_or_replace_table`: DuckDB's
   `CREATE OR REPLACE TABLE`, a new table in one snapshot, on SQLite (ferrion#611).
 - Standalone DDL as its own snapshot, as DuckDB 1.5.6 writes it (#18): `MetadataWriter::{create_schema,
@@ -247,6 +248,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Schema, table and view names are found in any ASCII case on every backend, as DuckDB finds
+  them (#17, ferrion#708).
+- A write into a table DuckDB renamed puts its files under the table's `path`, not its new name.
 - A write onto a view's name is refused `ViewExists` before any file is written (#17).
 - A write whose table another writer drops before it commits is refused `Conflict` (#17).
 - `drop_table` / `drop_view` of a missing name return `false` in a catalog with no views (#17).

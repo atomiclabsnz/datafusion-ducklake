@@ -2545,12 +2545,14 @@ impl MetadataProvider for PostgresMetadataProvider {
 
     fn get_schema_by_name(&self, name: &str, snapshot_id: i64) -> Result<Option<SchemaMetadata>> {
         block_on(async {
-            let row = sqlx::query(
+            let row = sqlx::query(concat!(
                 "SELECT schema_id, schema_name, path, path_is_relative FROM ducklake_schema
-                 WHERE schema_name = $1
+                 WHERE ",
+                crate::catalog_name::name_eq!(postgres, "schema_name", "$1"),
+                "
                    AND $2 >= begin_snapshot
-                   AND ($3 < end_snapshot OR end_snapshot IS NULL)",
-            )
+                   AND ($3 < end_snapshot OR end_snapshot IS NULL)"
+            ))
             .bind(name)
             .bind(snapshot_id)
             .bind(snapshot_id)
@@ -2576,13 +2578,15 @@ impl MetadataProvider for PostgresMetadataProvider {
         snapshot_id: i64,
     ) -> Result<Option<TableMetadata>> {
         block_on(async {
-            let row = sqlx::query(
+            let row = sqlx::query(concat!(
                 "SELECT table_id, table_name, path, path_is_relative FROM ducklake_table
                  WHERE schema_id = $1
-                   AND table_name = $2
+                   AND ",
+                crate::catalog_name::name_eq!(postgres, "table_name", "$2"),
+                "
                    AND $3 >= begin_snapshot
-                   AND ($4 < end_snapshot OR end_snapshot IS NULL)",
-            )
+                   AND ($4 < end_snapshot OR end_snapshot IS NULL)"
+            ))
             .bind(schema_id)
             .bind(name)
             .bind(snapshot_id)
@@ -2612,14 +2616,16 @@ impl MetadataProvider for PostgresMetadataProvider {
             if !self.schema_capabilities().await?.views {
                 return Ok(None);
             }
-            let row = sqlx::query(
+            let row = sqlx::query(concat!(
                 "SELECT view_id, schema_id, begin_snapshot, view_name, dialect, sql, column_aliases
                  FROM ducklake_view
                  WHERE schema_id = $1
-                   AND view_name = $2
+                   AND ",
+                crate::catalog_name::name_eq!(postgres, "view_name", "$2"),
+                "
                    AND $3 >= begin_snapshot
-                   AND ($4 < end_snapshot OR end_snapshot IS NULL)",
-            )
+                   AND ($4 < end_snapshot OR end_snapshot IS NULL)"
+            ))
             .bind(schema_id)
             .bind(name)
             .bind(snapshot_id)
@@ -2633,15 +2639,17 @@ impl MetadataProvider for PostgresMetadataProvider {
 
     fn table_exists(&self, schema_id: i64, name: &str, snapshot_id: i64) -> Result<bool> {
         block_on(async {
-            let row = sqlx::query(
+            let row = sqlx::query(concat!(
                 "SELECT EXISTS(
                     SELECT 1 FROM ducklake_table
                     WHERE schema_id = $1
-                      AND table_name = $2
+                      AND ",
+                crate::catalog_name::name_eq!(postgres, "table_name", "$2"),
+                "
                       AND $3 >= begin_snapshot
                       AND ($4 < end_snapshot OR end_snapshot IS NULL)
-                )",
-            )
+                )"
+            ))
             .bind(schema_id)
             .bind(name)
             .bind(snapshot_id)
@@ -2714,11 +2722,13 @@ impl MetadataProvider for PostgresMetadataProvider {
         snapshot_id: i64,
     ) -> Result<Option<i64>> {
         block_on(async {
-            let result = sqlx::query(
+            let result = sqlx::query(concat!(
                 "SELECT view_id FROM ducklake_view
-                 WHERE schema_id = $1 AND view_name = $2 AND $3 >= begin_snapshot
-                   AND ($4 < end_snapshot OR end_snapshot IS NULL)",
-            )
+                 WHERE schema_id = $1 AND ",
+                crate::catalog_name::name_eq!(postgres, "view_name", "$2"),
+                " AND $3 >= begin_snapshot
+                   AND ($4 < end_snapshot OR end_snapshot IS NULL)"
+            ))
             .bind(schema_id)
             .bind(name)
             .bind(snapshot_id)

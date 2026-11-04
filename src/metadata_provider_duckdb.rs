@@ -2590,12 +2590,14 @@ impl MetadataProvider for DuckdbMetadataProvider {
         snapshot_id: i64,
     ) -> crate::Result<Option<i64>> {
         let conn = self.connection();
-        let mut stmt = match conn.prepare(
+        let mut stmt = match conn.prepare(concat!(
             "SELECT view_id FROM ducklake_view
-             WHERE schema_id = ? AND view_name = ?
+             WHERE schema_id = ? AND ",
+            crate::catalog_name::name_eq!(duckdb, "view_name", "?"),
+            "
                AND ? >= begin_snapshot
-               AND (? < end_snapshot OR end_snapshot IS NULL)",
-        ) {
+               AND (? < end_snapshot OR end_snapshot IS NULL)"
+        )) {
             Ok(stmt) => stmt,
             Err(error) if is_missing_statistics_table(&error) => return Ok(None),
             Err(error) => return Err(error.into()),

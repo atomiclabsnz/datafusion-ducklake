@@ -136,11 +136,12 @@ pub(crate) fn view_exists_error(table: impl std::fmt::Display) -> DuckLakeError 
     ))
 }
 
-/// The view checks' SQL, one text per check, spelled once for each placeholder style:
-/// `?` (SQLite, DuckDB, MySQL) and `$n` (Postgres). Each finds the live view that holds a
-/// table's name, as `(schema_name, view_name)`, for [`refuse_live_view`].
+/// The view checks' SQL, one text per check, spelled once for each SQL dialect (its
+/// placeholder style and its name comparison, [`crate::catalog_name`]). Each finds the live view
+/// that holds a table's name in any ASCII case, as `(schema_name, view_name)`, for
+/// [`refuse_live_view`].
 macro_rules! live_view_of_table_sql {
-    ($table_id:literal) => {
+    ($dialect:ident, $table_id:literal) => {
         concat!(
             "SELECT schema_meta.schema_name, view_meta.view_name FROM ducklake_view view_meta
              JOIN ducklake_table table_meta ON table_meta.schema_id = view_meta.schema_id
@@ -148,38 +149,172 @@ macro_rules! live_view_of_table_sql {
              WHERE table_meta.table_id = ",
             $table_id,
             " AND table_meta.end_snapshot IS NULL
-               AND view_meta.view_name = table_meta.table_name
+               AND ",
+            crate::catalog_name::name_eq!($dialect, "view_meta.view_name", "table_meta.table_name"),
+            "
                AND view_meta.end_snapshot IS NULL
              LIMIT 1"
         )
     };
 }
+#[cfg(any(feature = "write-duckdb", feature = "write-mysql", feature = "write-postgres"))]
 macro_rules! live_view_named_sql {
-    ($schema_id:literal, $name:literal) => {
+    ($dialect:ident, $schema_id:literal, $name:literal) => {
         concat!(
             "SELECT schema_meta.schema_name, view_meta.view_name FROM ducklake_view view_meta
              JOIN ducklake_schema schema_meta ON schema_meta.schema_id = view_meta.schema_id
              WHERE view_meta.schema_id = ",
             $schema_id,
-            " AND view_meta.view_name = ",
-            $name,
+            " AND ",
+            crate::catalog_name::name_eq!($dialect, "view_meta.view_name", $name),
             " AND view_meta.end_snapshot IS NULL
              LIMIT 1"
         )
     };
 }
 
+/// [`MetadataWriter::location_of_table`]'s SQL: the `path` and `path_is_relative` of the
+/// live table row `table_id`, published or pending, and of its schema row. Bound: the id.
+pub(crate) const LOCATION_OF_TABLE_SQL: &str =
+    "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+     FROM ducklake_table t
+     JOIN ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
+     WHERE t.table_id = ? AND t.end_snapshot IS NULL
+     ORDER BY s.begin_snapshot
+     LIMIT 1";
+/// [`LOCATION_OF_TABLE_SQL`] with a Postgres placeholder.
+#[cfg(feature = "write-postgres")]
+pub(crate) const LOCATION_OF_TABLE_SQL_PG: &str =
+    "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+     FROM ducklake_table t
+     JOIN ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
+     WHERE t.table_id = $1 AND t.end_snapshot IS NULL
+     ORDER BY s.begin_snapshot
+     LIMIT 1";
+
+/// The live table `table_id`'s name and its schema's, as the catalog spells them: what a
+/// `created_table` / `created_schema` change records, as DuckDB records the schema as it is
+/// stored and the table as its create spelled it (which its row holds). Bound: the table id.
+pub(crate) const STORED_NAMES_OF_TABLE_SQL: &str = "SELECT s.schema_name, t.table_name
+     FROM ducklake_table t
+     JOIN ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
+     WHERE t.table_id = ? AND t.end_snapshot IS NULL";
+/// [`STORED_NAMES_OF_TABLE_SQL`] with a Postgres placeholder.
+#[cfg(feature = "write-postgres")]
+pub(crate) const STORED_NAMES_OF_TABLE_SQL_PG: &str = "SELECT s.schema_name, t.table_name
+     FROM ducklake_table t
+     JOIN ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
+     WHERE t.table_id = $1 AND t.end_snapshot IS NULL";
+
+/// [`MetadataWriter::stored_location`]'s SQL, spelled once per dialect: the `path` and
+/// `path_is_relative` of the live, published schema named by the schema parameter and of its
+/// live, published table named by the table parameter, each found in any ASCII case; the
+/// table's `NULL` when there is none, and no row when there is no schema. A row still pending
+/// ([`PENDING_SNAPSHOT`], bound as both pending parameters) is not chosen: it is some write's
+/// own, unpublished, and may be the leftover of one that failed.
+macro_rules! stored_location_sql {
+    ($dialect:ident, $pending:literal, $schema:literal, $pending_again:literal, $table:literal) => {
+        concat!(
+            "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+             FROM (SELECT schema_id, path, path_is_relative, begin_snapshot FROM ducklake_schema
+                   WHERE end_snapshot IS NULL AND begin_snapshot <> ",
+            $pending,
+            " AND ",
+            crate::catalog_name::name_eq!($dialect, "schema_name", $schema),
+            ") s
+             LEFT JOIN ducklake_table t ON t.schema_id = s.schema_id AND t.end_snapshot IS NULL
+               AND t.begin_snapshot <> ",
+            $pending_again,
+            " AND ",
+            crate::catalog_name::name_eq!($dialect, "t.table_name", $table),
+            "
+             ORDER BY s.begin_snapshot, t.begin_snapshot
+             LIMIT 1"
+        )
+    };
+}
+/// Bound: [`PENDING_SNAPSHOT`], the schema name, [`PENDING_SNAPSHOT`], the table name.
+#[cfg(any(feature = "write-sqlite", feature = "host-sqlite"))]
+pub(crate) const STORED_LOCATION_SQL_SQLITE: &str =
+    stored_location_sql!(sqlite, "?", "?", "?", "?");
+/// Bound as [`STORED_LOCATION_SQL_SQLITE`].
+#[cfg(feature = "write-duckdb")]
+pub(crate) const STORED_LOCATION_SQL_DUCKDB: &str =
+    stored_location_sql!(duckdb, "?", "?", "?", "?");
+/// Bound as [`STORED_LOCATION_SQL_SQLITE`].
+#[cfg(feature = "write-mysql")]
+pub(crate) const STORED_LOCATION_SQL_MYSQL: &str = stored_location_sql!(mysql, "?", "?", "?", "?");
+/// Bound: [`PENDING_SNAPSHOT`], the schema name, the table name.
+#[cfg(feature = "write-postgres")]
+pub(crate) const STORED_LOCATION_SQL_PG: &str =
+    stored_location_sql!(postgres, "$1", "$2", "$1", "$3");
+
+/// Where a live, published schema and its table keep their files, as the catalog records it
+/// ([`MetadataWriter::stored_location`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPath {
+    /// The `path` column.
+    pub path: String,
+    /// The `path_is_relative` column: relative to the data path (a schema) or to its schema's
+    /// directory (a table).
+    pub path_is_relative: bool,
+}
+
+/// The schema's and the table's [`StoredPath`], from [`MetadataWriter::stored_location`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredLocation {
+    /// The schema's directory; `None` when its `path` is NULL.
+    pub schema: Option<StoredPath>,
+    /// Whether a live, published table of the name is there, and its directory: `None` when
+    /// there is none (or its `path` is NULL).
+    pub table: Option<StoredPath>,
+}
+
+/// A row of the `STORED_LOCATION_SQL_*` queries: the schema's `path` and `path_is_relative`,
+/// then the table's.
+pub(crate) type StoredLocationRow = (Option<String>, Option<bool>, Option<String>, Option<bool>);
+
+/// [`MetadataWriter::stored_location`] from its query's row.
+pub(crate) fn stored_location(found: Option<StoredLocationRow>) -> Option<StoredLocation> {
+    let path = |path: Option<String>, relative: Option<bool>| {
+        path.map(|path| StoredPath {
+            path,
+            path_is_relative: relative.unwrap_or(true),
+        })
+    };
+    found.map(
+        |(schema, schema_relative, table, table_relative)| StoredLocation {
+            schema: path(schema, schema_relative),
+            table: path(table, table_relative),
+        },
+    )
+}
+
 /// The commit's view check: the live view named as the live table `table_id` (bound once).
 /// Read inside the commit, so a view another writer created since the write began is found.
-pub(crate) const LIVE_VIEW_OF_TABLE_SQL: &str = live_view_of_table_sql!("?");
-/// [`LIVE_VIEW_OF_TABLE_SQL`] with Postgres placeholders.
-pub(crate) const LIVE_VIEW_OF_TABLE_SQL_PG: &str = live_view_of_table_sql!("$1");
+#[cfg(any(feature = "write-sqlite", feature = "host-sqlite"))]
+pub(crate) const LIVE_VIEW_OF_TABLE_SQL_SQLITE: &str = live_view_of_table_sql!(sqlite, "?");
+/// [`LIVE_VIEW_OF_TABLE_SQL_SQLITE`] for a DuckDB catalog.
+#[cfg(feature = "write-duckdb")]
+pub(crate) const LIVE_VIEW_OF_TABLE_SQL_DUCKDB: &str = live_view_of_table_sql!(duckdb, "?");
+/// [`LIVE_VIEW_OF_TABLE_SQL_SQLITE`] for a MySQL catalog.
+#[cfg(feature = "write-mysql")]
+pub(crate) const LIVE_VIEW_OF_TABLE_SQL_MYSQL: &str = live_view_of_table_sql!(mysql, "?");
+/// [`LIVE_VIEW_OF_TABLE_SQL_SQLITE`] for a Postgres catalog.
+#[cfg(feature = "write-postgres")]
+pub(crate) const LIVE_VIEW_OF_TABLE_SQL_PG: &str = live_view_of_table_sql!(postgres, "$1");
 /// The start's view check: the live view named `table_name` in schema `schema_id` (bound in
 /// that order). The start may not have a table row yet (Postgres reserves an id only), so it
 /// asks by name, not by table id.
-pub(crate) const LIVE_VIEW_NAMED_SQL: &str = live_view_named_sql!("?", "?");
-/// [`LIVE_VIEW_NAMED_SQL`] with Postgres placeholders.
-pub(crate) const LIVE_VIEW_NAMED_SQL_PG: &str = live_view_named_sql!("$1", "$2");
+/// (The SQLite writer asks by name through its own `live_view_id`.)
+#[cfg(feature = "write-duckdb")]
+pub(crate) const LIVE_VIEW_NAMED_SQL_DUCKDB: &str = live_view_named_sql!(duckdb, "?", "?");
+/// [`LIVE_VIEW_NAMED_SQL_DUCKDB`] for a MySQL catalog.
+#[cfg(feature = "write-mysql")]
+pub(crate) const LIVE_VIEW_NAMED_SQL_MYSQL: &str = live_view_named_sql!(mysql, "?", "?");
+/// [`LIVE_VIEW_NAMED_SQL_DUCKDB`] for a Postgres catalog.
+#[cfg(feature = "write-postgres")]
+pub(crate) const LIVE_VIEW_NAMED_SQL_PG: &str = live_view_named_sql!(postgres, "$1", "$2");
 
 /// The refusal [`makes_table`] asks for, from a view check's result: a live view of the
 /// table's name, named as the catalog names it.
@@ -772,6 +907,14 @@ pub(crate) fn table_storage_changes(
 
 pub(crate) fn snapshot_has_change(changes: &str, expected: &str) -> bool {
     snapshot_change_tokens(changes).any(|change| change == expected)
+}
+
+/// [`snapshot_has_change`] for a change that names a schema or table
+/// (`created_table:"main"."t"`): the names compared as DuckDB compares them, in any ASCII
+/// case (`catalog_name.rs`). A change records the names as their writer spelled them, which
+/// need not be this caller's spelling.
+pub(crate) fn snapshot_has_named_change(changes: &str, expected: &str) -> bool {
+    snapshot_change_tokens(changes).any(|change| crate::catalog_name::names_match(change, expected))
 }
 
 pub(crate) fn inlined_delete_groups(rows: &[InlinedRowRef]) -> BTreeMap<&str, BTreeSet<i64>> {
@@ -4973,6 +5116,39 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Get the data path from catalog metadata.
     fn get_data_path(&self) -> Result<String>;
 
+    /// Where the live, published schema `schema_name` and its live, published table
+    /// `table_name` keep their files: their `path` columns, each found by name as DuckDB finds a
+    /// name, in any ASCII case (`catalog_name.rs`). `None`: no such schema. A write puts a
+    /// table's files where its readers look for them, which is its `path`, not its name: DuckDB
+    /// keeps a renamed table's `path`, so `ALTER TABLE orders RENAME TO "Orders"` leaves its files
+    /// under `orders/`. A row no commit has published yet is never chosen.
+    ///
+    /// The default answers `None`, and a write then keys its files by the names as given: right
+    /// only for a backend whose paths are always its names. Every backend in this crate
+    /// overrides it.
+    fn stored_location(
+        &self,
+        _schema_name: &str,
+        _table_name: &str,
+    ) -> Result<Option<StoredLocation>> {
+        Ok(None)
+    }
+
+    /// Where the live table row `table_id` and its schema keep their files: their `path`
+    /// columns, whether a commit has published the row or not. A write asks this of the row
+    /// its start chose ([`WriteSetupResult::table_id`]): a row its start made, one another
+    /// write's start made and has not committed (names are found in any ASCII case, so
+    /// `"NewT"` and `newt` are one row), or one an abandoned write left. Its files go where
+    /// that row says, never where the name the write was given would put them, and the row
+    /// is never renamed: another write may own it. `None`: no such row yet (a backend that
+    /// reserves the id and inserts the row at the commit, as the multi-catalog Postgres layout
+    /// does), and the write keys its files by [`Self::stored_location`] and the names.
+    ///
+    /// The default answers `None`.
+    fn location_of_table(&self, _table_id: i64) -> Result<Option<StoredLocation>> {
+        Ok(None)
+    }
+
     /// Return the live top-level column nullability for an existing table.
     ///
     /// `None` means the table does not exist. Writers use this read-only lookup
@@ -5343,6 +5519,28 @@ mod tests {
             error.contains("attempting to delete from table with index \"7\""),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_named_change_matches_in_any_ascii_case() {
+        let recorded =
+            r#"created_schema:"Staging",created_table:"Staging"."Orders",altered_table:3"#;
+        assert!(snapshot_has_named_change(
+            recorded,
+            r#"created_table:"staging"."ORDERS""#
+        ));
+        assert!(!snapshot_has_change(
+            recorded,
+            r#"created_table:"staging"."ORDERS""#
+        ));
+        assert!(!snapshot_has_named_change(
+            recorded,
+            r#"created_table:"Staging"."Order""#
+        ));
+        assert!(!snapshot_has_named_change(
+            r#"created_table:"main"."Ärger""#,
+            r#"created_table:"main"."ärger""#
+        ));
     }
 
     #[test]
