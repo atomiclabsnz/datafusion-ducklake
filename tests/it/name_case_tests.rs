@@ -556,6 +556,17 @@ async fn a_lake_written_here_in_mixed_case_is_found_by_duckdb_in_any_case() {
         rows(&lake, "SELECT id FROM lake.fin.ledger ORDER BY id"),
         ["1", "2", "3"]
     );
+    // Its creation is recorded as DuckDB records one: the schema as stored, the table as its
+    // create spelled it.
+    let created = rows(
+        &lake,
+        "SELECT changes_made FROM __ducklake_metadata_lake.ducklake_snapshot_changes
+          WHERE changes_made LIKE '%created_table%' ORDER BY snapshot_id",
+    );
+    assert!(
+        created[0].contains(r#"created_table:"Fin"."Ledger""#),
+        "{created:?}"
+    );
     assert_eq!(
         rows(&lake, r#"SELECT count(*) FROM lake.main."ärger""#),
         ["2"]

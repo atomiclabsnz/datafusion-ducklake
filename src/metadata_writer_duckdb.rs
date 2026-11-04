@@ -1511,6 +1511,18 @@ fn record_table_changes(
         params![table_id, snapshot_id],
         |row| row.get(0),
     )?;
+    // The names as the catalog spells them, as DuckDB records them.
+    let stored: Option<(String, String)> = tx
+        .query_row(
+            crate::metadata_writer::STORED_NAMES_OF_TABLE_SQL,
+            params![table_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (schema_name, table_name) = match &stored {
+        Some((schema, table)) => (schema.as_str(), table.as_str()),
+        None => (schema_name, table_name),
+    };
     let mut changes = Vec::new();
     if schema_begin_snapshot == snapshot_id {
         let entry = format!("created_schema:{}", quote_snapshot_name(schema_name));

@@ -3487,6 +3487,16 @@ async fn finalize_table_snapshot(
         record_schema_version(tx, snapshot_id, *schema_version, table_id).await?;
         create_eager_inlined_table(tx, table_id, *schema_version).await?;
     }
+    // The names as the catalog spells them, as DuckDB records them.
+    let stored: Option<(String, String)> =
+        sqlx::query_as(crate::metadata_writer::STORED_NAMES_OF_TABLE_SQL)
+            .bind(table_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let (schema_name, table_name) = match &stored {
+        Some((schema, table)) => (schema.as_str(), table.as_str()),
+        None => (schema_name, table_name),
+    };
     let mut ddl_changes = Vec::new();
     // Official records the drop first: `dropped_table:1,created_table:"main"."t",…`.
     if let Some(replaced) = replaced {

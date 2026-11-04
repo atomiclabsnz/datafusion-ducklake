@@ -195,6 +195,20 @@ pub(crate) const TAKE_UP_PENDING_SCHEMA_SQL: &str = "UPDATE ducklake_schema SET 
 pub(crate) const TAKE_UP_PENDING_TABLE_SQL: &str =
     "UPDATE ducklake_table SET table_name = ?, path = ? WHERE table_id = ? AND begin_snapshot = ?";
 
+/// The live table `table_id`'s name and its schema's, as the catalog spells them: what a
+/// `created_table` / `created_schema` change records, as DuckDB records the schema as it is
+/// stored and the table as its create spelled it (which its row holds). Bound: the table id.
+pub(crate) const STORED_NAMES_OF_TABLE_SQL: &str = "SELECT s.schema_name, t.table_name
+     FROM ducklake_table t
+     JOIN ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
+     WHERE t.table_id = ? AND t.end_snapshot IS NULL";
+/// [`STORED_NAMES_OF_TABLE_SQL`] with a Postgres placeholder.
+#[cfg(feature = "write-postgres")]
+pub(crate) const STORED_NAMES_OF_TABLE_SQL_PG: &str = "SELECT s.schema_name, t.table_name
+     FROM ducklake_table t
+     JOIN ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
+     WHERE t.table_id = $1 AND t.end_snapshot IS NULL";
+
 /// [`MetadataWriter::stored_location`]'s SQL, spelled once per dialect: the `path` and
 /// `path_is_relative` of the live, published schema named by the schema parameter and of its
 /// live, published table named by the table parameter, each found in any ASCII case; the
