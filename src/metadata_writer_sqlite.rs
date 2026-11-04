@@ -3641,13 +3641,14 @@ async fn end_replaced_table(
                AND ",
             crate::catalog_name::name_eq!(sqlite, "old.table_name", "new.table_name"),
             "
-               AND old.begin_snapshot <> 9223372036854775807
+               AND old.begin_snapshot <> ?3
                AND (?2 IS NULL AND old.end_snapshot IS NULL
                     OR old.begin_snapshot <= ?2
                        AND (old.end_snapshot IS NULL OR old.end_snapshot > ?2))"
         ))
         .bind(table_id)
         .bind(at)
+        .bind(crate::metadata_writer::PENDING_SNAPSHOT)
     };
     let replaced_at_base = other_table(Some(base_snapshot))
         .fetch_optional(&mut **tx)
@@ -8629,12 +8630,13 @@ impl MetadataWriter for SqliteMetadataWriter {
                 let existing = sqlx::query(
                     concat!("SELECT table_id FROM ducklake_table
                      WHERE schema_id = ? AND ", crate::catalog_name::name_eq!(sqlite, "table_name", "?"), " AND end_snapshot IS NULL
-                       AND (? = 0 OR begin_snapshot = 9223372036854775807)
+                       AND (? = 0 OR begin_snapshot = ?)
                      ORDER BY begin_snapshot LIMIT 1"),
                 )
                 .bind(schema_id)
                 .bind(table_name)
                 .bind(replacing)
+                .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                 .fetch_optional(&mut *tx)
                 .await?;
 
