@@ -3323,6 +3323,7 @@ async fn finalize_table_snapshot(
     inserts: bool,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(i64, i64)> {
+    crate::metadata_writer::refuse_create_or_replace(mode)?;
     // 1. Resolve the live schema id under the lock. Reuse it if present; else
     //    reserve a fresh id from the sequence (the row is inserted in step 4 once
     //    the snapshot id exists for begin_snapshot).
@@ -9064,6 +9065,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         columns: &[ColumnDef],
         mode: WriteMode,
     ) -> Result<WriteSetupResult> {
+        crate::metadata_writer::refuse_create_or_replace(mode)?;
         validate_name(schema_name, "Schema")?;
         validate_name(table_name, "Table")?;
         if columns.is_empty() {
@@ -9195,7 +9197,9 @@ impl MetadataWriter for PostgresMetadataWriter {
                             return Err(crate::error::DuckLakeError::UnsupportedTypeChange {
                                 operation: TypeChangeOperation::DataWrite {
                                     mode: match mode {
-                                        WriteMode::Replace => TypeChangeWriteMode::Replace,
+                                        WriteMode::Replace | WriteMode::CreateOrReplace => {
+                                        TypeChangeWriteMode::Replace
+                                    },
                                         WriteMode::Append | WriteMode::Create => {
                                             TypeChangeWriteMode::Append
                                         }

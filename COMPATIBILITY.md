@@ -227,6 +227,7 @@ projection occurs in DataFusion. Index declarations remain optional.
 | `INSERT INTO` (table must already exist on the PostgreSQL path)                                                                                                                                                                                                                                                                  | ✅        |
 | Non-empty `CREATE TABLE AS SELECT`                                                                                                                                                                                                                                                                                               | Rejected |
 | `DROP TABLE` (via `MetadataWriter`)                                                                                                                                                                                                                                                                                              | ✅        |
+| `CREATE OR REPLACE TABLE` (via `DuckLakeTableWriter::create_or_replace_table` / `WriteMode::CreateOrReplace`: one snapshot drops the table and creates a new one; SQLite and a host's SQLite)                                                                                                                                    | ✅        |
 | Row-level deletes (Merge-On-Read delete files, read)                                                                                                                                                                                                                                                                             | ✅        |
 | SQL `DELETE FROM t [WHERE ...]` (positional deletes, inlined deletions of Parquet rows under the scoped `data_inlining_row_limit`, and inlined-row deletes, mixed in one snapshot; metadata-only truncate; SQLite, DuckDB, MySQL, multi-catalog PostgreSQL)                                                                      | ✅        |
 | SQL `UPDATE t SET c = e [, ...] [WHERE p]` (Parquet and inlined rows; new versions keep their row ids, inlined under the scoped `data_inlining_row_limit`; one snapshot; SQLite, DuckDB, MySQL, multi-catalog PostgreSQL)                                                                                                        | ✅        |
@@ -259,6 +260,16 @@ DuckDB sessions see it.
 
 Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` module and
 `MetadataWriter`), not SQL DDL.
+
+`CREATE OR REPLACE TABLE` is a write mode, `WriteMode::CreateOrReplace`, as DuckDB writes the
+statement: in one snapshot the live table of the name ends as `DROP TABLE` ends it and a new
+table, with a new id and the new columns' types and nullability, is created with the rows
+(`dropped_table:<old>,created_table:"s"."t",inserted_into_table:<new>`). Nothing of the old
+table carries over, its table-scoped settings included. `WriteMode::Replace` is `INSERT
+OVERWRITE`: the table keeps its id and columns. DataFusion's own `CREATE OR REPLACE TABLE`
+still does not reach the lake (it deregisters the table first, which the lake's schema
+refuses); a host's executor calls the writer. Only the SQLite catalog (and a host's SQLite)
+implements the mode; the other backends refuse it as `Unsupported`.
 
 ### Parquet writer defaults
 

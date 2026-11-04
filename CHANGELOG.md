@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `WriteMode` has a `CreateOrReplace` variant; exhaustive matches need its arm.
 - DuckDB 1.5.6 is the bundled engine (`duckdb ~1.10506.1`) and the oracle (CI's CLI,
   the `ducklake` extension `ac7595b0`); 1.5.5 before. DuckDB 2.0 / format 1.1 is #22.
 - Table statistics as official reads them from 1.5.6: a `ducklake_table_column_stats` row with
@@ -33,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `WriteMode::CreateOrReplace` and `DuckLakeTableWriter::create_or_replace_table`: DuckDB's
+  `CREATE OR REPLACE TABLE`, a new table in one snapshot, on SQLite (ferrion#611).
 - Standalone DDL as its own snapshot, as DuckDB 1.5.6 writes it (#18): `MetadataWriter::{create_schema,
   drop_table, drop_view, drop_schema}`. `CREATE SCHEMA` is also reached from SQL
   (`DuckLakeCatalog::register_schema`); the drops are the writer's to call (a host's executor),

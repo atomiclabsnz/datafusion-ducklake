@@ -2305,6 +2305,7 @@ fn finalize_table_snapshot(
     base_snapshot: i64,
     inserts: bool,
 ) -> Result<i64> {
+    crate::metadata_writer::refuse_create_or_replace(mode)?;
     use std::collections::{HashMap, HashSet};
     let proposed = catalog_column_defs(columns)?;
     if proposed.len() != column_ids.len() {
@@ -5779,6 +5780,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
         columns: &[ColumnDef],
         mode: WriteMode,
     ) -> Result<WriteSetupResult> {
+        crate::metadata_writer::refuse_create_or_replace(mode)?;
         validate_name(schema_name, "Schema")?;
         validate_name(table_name, "Table")?;
         if columns.is_empty() {
@@ -5908,7 +5910,9 @@ impl MetadataWriter for DuckdbMetadataWriter {
                         return Err(crate::error::DuckLakeError::UnsupportedTypeChange {
                             operation: TypeChangeOperation::DataWrite {
                                 mode: match mode {
-                                    WriteMode::Replace => TypeChangeWriteMode::Replace,
+                                    WriteMode::Replace | WriteMode::CreateOrReplace => {
+                                        TypeChangeWriteMode::Replace
+                                    },
                                     WriteMode::Append | WriteMode::Create => {
                                         TypeChangeWriteMode::Append
                                     },

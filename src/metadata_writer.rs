@@ -69,6 +69,24 @@ pub enum WriteMode {
     /// table's name, with [`DuckLakeError::ViewExists`] (as is any write that would
     /// make the table there).
     Create,
+    /// Create the table with these records as DuckDB's `CREATE OR REPLACE TABLE` does: in one
+    /// snapshot, the live table of the name (if any) is ended as `DROP TABLE` ends it
+    /// ([`MetadataWriter::drop_table`]: its columns, data and delete files, sort and partition
+    /// specs and tags end at the snapshot; its statistics stay) and a new table, with a new
+    /// table id, is created with the given columns; the rows go into the new table. Nothing
+    /// of the old table carries over — not its columns' types or nullability, not its
+    /// table-scoped settings — and the snapshot records `dropped_table:<old id>`, then
+    /// `created_table:"schema"."table"`, then the insert into the new id, as DuckDB does.
+    /// Without a live table of the name it is [`WriteMode::Create`] without the exists
+    /// refusal. A live view of the name is refused with [`DuckLakeError::ViewExists`]; a
+    /// table another writer created, dropped or altered under the name since this write
+    /// began is refused with [`DuckLakeError::Conflict`].
+    ///
+    /// [`WriteMode::Replace`] is a different statement (`INSERT OVERWRITE`): the same table
+    /// keeps its id and columns and only its rows are replaced. Only the SQLite catalog (and
+    /// a host's SQLite) implements this mode; the other backends refuse it with
+    /// [`DuckLakeError::Unsupported`].
+    CreateOrReplace,
 }
 
 /// The `begin_snapshot` of a schema or table row a write's start creates, until its commit
@@ -106,7 +124,7 @@ pub(crate) fn refuse_create_into(
 /// into a table that has columns is not asked, so a catalog another writer left with a table
 /// and a view of one name keeps both.
 pub(crate) fn makes_table(mode: WriteMode, has_live_columns: bool) -> bool {
-    mode == WriteMode::Create || !has_live_columns
+    matches!(mode, WriteMode::Create | WriteMode::CreateOrReplace) || !has_live_columns
 }
 
 /// The refusal of a write that would make a table where a live view has its name
@@ -200,6 +218,20 @@ pub(crate) fn standalone_ddl_unsupported(statement: &str) -> DuckLakeError {
         "{statement} as its own snapshot is not implemented for this metadata backend yet; \
          the SQLite catalog (and a host's SQLite) has it"
     ))
+}
+
+/// The refusal of [`WriteMode::CreateOrReplace`] on a backend that does not implement it
+/// yet (the SQLite catalog, and a host's SQLite, do): checked where a write begins and where
+/// it commits, so no backend silently writes it as another mode.
+pub(crate) fn refuse_create_or_replace(mode: WriteMode) -> Result<()> {
+    if mode == WriteMode::CreateOrReplace {
+        return Err(DuckLakeError::Unsupported(
+            "CREATE OR REPLACE TABLE (WriteMode::CreateOrReplace) is not implemented for this \
+             metadata backend yet; the SQLite catalog (and a host's SQLite) has it"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// [`WriteMode::Create`]'s refusal: `table` already exists, or another writer
@@ -3533,6 +3565,18 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
             .unwrap_or(crate::table_writer::DEFAULT_DATA_INLINING_ROW_LIMIT))
     }
 
+    /// The `data_inlining_row_limit` a table [`WriteMode::CreateOrReplace`] creates in
+    /// `schema_name` has: [`Self::table_data_inlining_row_limit`] of a table that has no
+    /// stored setting of its own, since the table it replaces does not pass its settings on
+    /// (DuckDB 1.5.6 keeps the old table's setting under the old id).
+    ///
+    /// Default: [`Self::data_inlining_row_limit`], else `10`, reading no stored setting.
+    fn new_table_data_inlining_row_limit(&self, _schema_name: &str) -> Result<usize> {
+        Ok(inlining_limit_override()
+            .or(self.data_inlining_row_limit())
+            .unwrap_or(crate::table_writer::DEFAULT_DATA_INLINING_ROW_LIMIT))
+    }
+
     /// The stored value of option `key` (lowercase, as official stores it)
     /// in effect for `table_name` in `schema_name`: the table's setting, else
     /// its schema's, else the catalog-wide one (on multi-catalog PostgreSQL,
@@ -4951,7 +4995,9 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
 
     /// Atomically set up catalog metadata for a write operation.
     /// Creates snapshot, schema, table, columns in a single transaction.
-    /// If mode is `WriteMode::Replace`, ends existing data files.
+    /// If mode is `WriteMode::Replace`, ends existing data files. With
+    /// [`WriteMode::CreateOrReplace`] the table it sets up is a new one, beside the live
+    /// table of the name, which the commit ends.
     fn begin_write_transaction(
         &self,
         schema_name: &str,
