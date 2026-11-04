@@ -5035,7 +5035,7 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     fn get_data_path(&self) -> Result<String>;
 
     /// How the catalog spells the live schema `schema_name` and its live table `table_name`,
-    /// each found as DuckDB finds a name, in any ASCII case ([`crate::catalog_name`]); a name
+    /// each found as DuckDB finds a name, in any ASCII case (`catalog_name.rs`); a name
     /// no live object has is kept as given. A write keys its files by these, so a table DuckDB
     /// created as `"Orders"` is written under `Orders/` whichever spelling names it.
     ///

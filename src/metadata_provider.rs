@@ -71,7 +71,7 @@ pub const SQL_LIST_VIEWS: &str =
        AND ? >= begin_snapshot
        AND (? < end_snapshot OR end_snapshot IS NULL)";
 
-/// The live view named `?` in any ASCII case, DuckDB's rule ([`crate::catalog_name`]).
+/// The live view named `?` in any ASCII case, DuckDB's rule (`catalog_name.rs`).
 pub const SQL_GET_VIEW_BY_NAME: &str = concat!(
     "SELECT view_id, schema_id, begin_snapshot, view_name, dialect, sql, column_aliases FROM ducklake_view
      WHERE schema_id = ?
@@ -211,7 +211,7 @@ pub const SQL_GET_FILE_COLUMN_STATS: &str = "
 pub const SQL_GET_DATA_PATH: &str =
     "SELECT value FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL";
 
-/// The schema named `?` in any ASCII case, DuckDB's rule ([`crate::catalog_name`]).
+/// The schema named `?` in any ASCII case, DuckDB's rule (`catalog_name.rs`).
 pub const SQL_GET_SCHEMA_BY_NAME: &str = concat!(
     "SELECT schema_id, schema_name, path, path_is_relative FROM ducklake_schema
      WHERE ",
@@ -221,7 +221,7 @@ pub const SQL_GET_SCHEMA_BY_NAME: &str = concat!(
        AND (? < end_snapshot OR end_snapshot IS NULL)"
 );
 
-/// The table named `?` in any ASCII case, DuckDB's rule ([`crate::catalog_name`]).
+/// The table named `?` in any ASCII case, DuckDB's rule (`catalog_name.rs`).
 pub const SQL_GET_TABLE_BY_NAME: &str = concat!(
     "SELECT table_id, table_name, path, path_is_relative FROM ducklake_table
      WHERE schema_id = ?
@@ -232,7 +232,7 @@ pub const SQL_GET_TABLE_BY_NAME: &str = concat!(
        AND (? < end_snapshot OR end_snapshot IS NULL)"
 );
 
-/// Whether a table is named `?` in any ASCII case, DuckDB's rule ([`crate::catalog_name`]).
+/// Whether a table is named `?` in any ASCII case, DuckDB's rule (`catalog_name.rs`).
 pub const SQL_TABLE_EXISTS: &str = concat!(
     "SELECT EXISTS(
        SELECT 1 FROM ducklake_table
