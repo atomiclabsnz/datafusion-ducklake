@@ -3378,16 +3378,6 @@ async fn finalize_table_snapshot(
     //    resolution chain (`data_path + schema.path + table.path + file.path`) then
     //    puts files under `cat_{id}/{schema}/{table}/…`, matching the upload
     //    location.
-    // The names as the catalog spells them, as DuckDB records them.
-    let stored: Option<(String, String)> =
-        sqlx::query_as(crate::metadata_writer::STORED_NAMES_OF_TABLE_SQL_PG)
-            .bind(table_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    let (schema_name, table_name) = match &stored {
-        Some((schema, table)) => (schema.as_str(), table.as_str()),
-        None => (schema_name, table_name),
-    };
     if schema_was_created {
         let scoped_schema_path = format!("cat_{catalog_id}/{schema_name}");
         sqlx::query(
@@ -3727,6 +3717,16 @@ async fn finalize_table_snapshot(
     }
 
     let mut ddl_changes = Vec::new();
+    // The names as the catalog spells them, as DuckDB records them.
+    let stored: Option<(String, String)> =
+        sqlx::query_as(crate::metadata_writer::STORED_NAMES_OF_TABLE_SQL_PG)
+            .bind(table_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let (schema_name, table_name) = match &stored {
+        Some((schema, table)) => (schema.as_str(), table.as_str()),
+        None => (schema_name, table_name),
+    };
     if schema_was_created {
         let schema_entry = format!(
             "created_schema:{}",

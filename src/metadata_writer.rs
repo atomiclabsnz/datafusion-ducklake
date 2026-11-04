@@ -273,10 +273,12 @@ pub struct StoredLocation {
     pub table: Option<StoredPath>,
 }
 
+/// A row of the `STORED_LOCATION_SQL_*` queries: the schema's `path` and `path_is_relative`,
+/// then the table's.
+pub(crate) type StoredLocationRow = (Option<String>, Option<bool>, Option<String>, Option<bool>);
+
 /// [`MetadataWriter::stored_location`] from its query's row.
-pub(crate) fn stored_location(
-    found: Option<(Option<String>, Option<bool>, Option<String>, Option<bool>)>,
-) -> Option<StoredLocation> {
+pub(crate) fn stored_location(found: Option<StoredLocationRow>) -> Option<StoredLocation> {
     let path = |path: Option<String>, relative: Option<bool>| {
         path.map(|path| StoredPath {
             path,
