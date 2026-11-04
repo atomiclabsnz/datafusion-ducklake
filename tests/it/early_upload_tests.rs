@@ -1269,6 +1269,14 @@ impl MetadataWriter for CommitFaultWriter {
         self.inner.get_data_path()
     }
 
+    fn stored_location(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> datafusion_ducklake::Result<Option<datafusion_ducklake::StoredLocation>> {
+        self.inner.stored_location(schema_name, table_name)
+    }
+
     fn get_table_column_nullability(
         &self,
         schema_name: &str,

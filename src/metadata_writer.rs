@@ -173,47 +173,108 @@ macro_rules! live_view_named_sql {
     };
 }
 
-/// [`MetadataWriter::stored_spelling`]'s SQL, spelled once per dialect: the live schema named
-/// by the first parameter and its live table named by the second, each in any ASCII case, as
-/// `(schema_name, table_name)` with the table `NULL` when there is none. No row: no schema.
-/// The newest table row first: a `CREATE OR REPLACE` under way has made its pending table, of
-/// the spelling it was given, beside the live one it replaces.
-macro_rules! stored_spelling_sql {
-    ($dialect:ident, $schema:literal, $table:literal) => {
+/// A write's start takes up a schema row no commit has published yet, of the name in any ASCII
+/// case (one a failed write left, perhaps spelled otherwise), and makes it this write's: its
+/// name as this write spells it and its `path` that name's directory, as a new row would have
+/// them, which is where the write keys its files. Bound: the name, its directory path, the
+/// schema id, [`PENDING_SNAPSHOT`]. A published row is not touched.
+#[cfg(any(
+    feature = "write-sqlite",
+    feature = "host-sqlite",
+    feature = "write-duckdb",
+    feature = "write-mysql"
+))]
+pub(crate) const TAKE_UP_PENDING_SCHEMA_SQL: &str = "UPDATE ducklake_schema SET schema_name = ?, path = ? WHERE schema_id = ? AND begin_snapshot = ?";
+/// [`TAKE_UP_PENDING_SCHEMA_SQL`] for a table row (bound with the table id).
+#[cfg(any(
+    feature = "write-sqlite",
+    feature = "host-sqlite",
+    feature = "write-duckdb",
+    feature = "write-mysql"
+))]
+pub(crate) const TAKE_UP_PENDING_TABLE_SQL: &str =
+    "UPDATE ducklake_table SET table_name = ?, path = ? WHERE table_id = ? AND begin_snapshot = ?";
+
+/// [`MetadataWriter::stored_location`]'s SQL, spelled once per dialect: the `path` and
+/// `path_is_relative` of the live, published schema named by the schema parameter and of its
+/// live, published table named by the table parameter, each found in any ASCII case; the
+/// table's `NULL` when there is none, and no row when there is no schema. A row still pending
+/// ([`PENDING_SNAPSHOT`], bound as both pending parameters) is not chosen: it is some write's
+/// own, unpublished, and may be the leftover of one that failed.
+macro_rules! stored_location_sql {
+    ($dialect:ident, $pending:literal, $schema:literal, $pending_again:literal, $table:literal) => {
         concat!(
-            "SELECT s.schema_name, t.table_name
-             FROM (SELECT schema_id, schema_name, begin_snapshot FROM ducklake_schema
-                   WHERE end_snapshot IS NULL AND ",
+            "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+             FROM (SELECT schema_id, path, path_is_relative, begin_snapshot FROM ducklake_schema
+                   WHERE end_snapshot IS NULL AND begin_snapshot <> ",
+            $pending,
+            " AND ",
             crate::catalog_name::name_eq!($dialect, "schema_name", $schema),
             ") s
              LEFT JOIN ducklake_table t ON t.schema_id = s.schema_id AND t.end_snapshot IS NULL
-               AND ",
+               AND t.begin_snapshot <> ",
+            $pending_again,
+            " AND ",
             crate::catalog_name::name_eq!($dialect, "t.table_name", $table),
             "
-             ORDER BY s.begin_snapshot, t.begin_snapshot DESC
+             ORDER BY s.begin_snapshot, t.begin_snapshot
              LIMIT 1"
         )
     };
 }
+/// Bound: [`PENDING_SNAPSHOT`], the schema name, [`PENDING_SNAPSHOT`], the table name.
 #[cfg(any(feature = "write-sqlite", feature = "host-sqlite"))]
-pub(crate) const STORED_SPELLING_SQL_SQLITE: &str = stored_spelling_sql!(sqlite, "?", "?");
+pub(crate) const STORED_LOCATION_SQL_SQLITE: &str =
+    stored_location_sql!(sqlite, "?", "?", "?", "?");
+/// Bound as [`STORED_LOCATION_SQL_SQLITE`].
 #[cfg(feature = "write-duckdb")]
-pub(crate) const STORED_SPELLING_SQL_DUCKDB: &str = stored_spelling_sql!(duckdb, "?", "?");
+pub(crate) const STORED_LOCATION_SQL_DUCKDB: &str =
+    stored_location_sql!(duckdb, "?", "?", "?", "?");
+/// Bound as [`STORED_LOCATION_SQL_SQLITE`].
 #[cfg(feature = "write-mysql")]
-pub(crate) const STORED_SPELLING_SQL_MYSQL: &str = stored_spelling_sql!(mysql, "?", "?");
+pub(crate) const STORED_LOCATION_SQL_MYSQL: &str = stored_location_sql!(mysql, "?", "?", "?", "?");
+/// Bound: [`PENDING_SNAPSHOT`], the schema name, the table name.
 #[cfg(feature = "write-postgres")]
-pub(crate) const STORED_SPELLING_SQL_PG: &str = stored_spelling_sql!(postgres, "$1", "$2");
+pub(crate) const STORED_LOCATION_SQL_PG: &str =
+    stored_location_sql!(postgres, "$1", "$2", "$1", "$3");
 
-/// [`MetadataWriter::stored_spelling`] from its query's row.
-pub(crate) fn stored_spelling(
-    found: Option<(String, Option<String>)>,
-    schema_name: &str,
-    table_name: &str,
-) -> (String, String) {
-    match found {
-        Some((schema, table)) => (schema, table.unwrap_or_else(|| table_name.to_string())),
-        None => (schema_name.to_string(), table_name.to_string()),
-    }
+/// Where a live, published schema and its table keep their files, as the catalog records it
+/// ([`MetadataWriter::stored_location`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPath {
+    /// The `path` column.
+    pub path: String,
+    /// The `path_is_relative` column: relative to the data path (a schema) or to its schema's
+    /// directory (a table).
+    pub path_is_relative: bool,
+}
+
+/// The schema's and the table's [`StoredPath`], from [`MetadataWriter::stored_location`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredLocation {
+    /// The schema's directory; `None` when its `path` is NULL.
+    pub schema: Option<StoredPath>,
+    /// Whether a live, published table of the name is there, and its directory: `None` when
+    /// there is none (or its `path` is NULL).
+    pub table: Option<StoredPath>,
+}
+
+/// [`MetadataWriter::stored_location`] from its query's row.
+pub(crate) fn stored_location(
+    found: Option<(Option<String>, Option<bool>, Option<String>, Option<bool>)>,
+) -> Option<StoredLocation> {
+    let path = |path: Option<String>, relative: Option<bool>| {
+        path.map(|path| StoredPath {
+            path,
+            path_is_relative: relative.unwrap_or(true),
+        })
+    };
+    found.map(
+        |(schema, schema_relative, table, table_relative)| StoredLocation {
+            schema: path(schema, schema_relative),
+            table: path(table, table_relative),
+        },
+    )
 }
 
 /// The commit's view check: the live view named as the live table `table_id` (bound once).
@@ -5034,18 +5095,22 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Get the data path from catalog metadata.
     fn get_data_path(&self) -> Result<String>;
 
-    /// How the catalog spells the live schema `schema_name` and its live table `table_name`,
-    /// each found as DuckDB finds a name, in any ASCII case (`catalog_name.rs`); a name
-    /// no live object has is kept as given. A write keys its files by these, so a table DuckDB
-    /// created as `"Orders"` is written under `Orders/` whichever spelling names it.
+    /// Where the live, published schema `schema_name` and its live, published table
+    /// `table_name` keep their files: their `path` columns, each found by name as DuckDB finds a
+    /// name, in any ASCII case (`catalog_name.rs`). `None`: no such schema. A write puts a
+    /// table's files where its readers look for them, which is its `path`, not its name: DuckDB
+    /// keeps a renamed table's `path`, so `ALTER TABLE orders RENAME TO "Orders"` leaves its files
+    /// under `orders/`. A row no commit has published yet is never chosen.
     ///
-    /// While a `CREATE OR REPLACE` is under way, the table is the pending one it makes, which
-    /// takes the spelling it was given, as DuckDB's replace does.
-    ///
-    /// The default keeps both names as given: right for a backend whose names are compared
-    /// exactly. Every backend in this crate overrides it.
-    fn stored_spelling(&self, schema_name: &str, table_name: &str) -> Result<(String, String)> {
-        Ok((schema_name.to_string(), table_name.to_string()))
+    /// The default answers `None`, and a write then keys its files by the names as given: right
+    /// only for a backend whose paths are always its names. Every backend in this crate
+    /// overrides it.
+    fn stored_location(
+        &self,
+        _schema_name: &str,
+        _table_name: &str,
+    ) -> Result<Option<StoredLocation>> {
+        Ok(None)
     }
 
     /// Return the live top-level column nullability for an existing table.

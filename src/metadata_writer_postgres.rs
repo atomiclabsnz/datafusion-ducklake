@@ -8976,33 +8976,36 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
-    /// [`MetadataWriter::stored_spelling`] among this catalog's schemas only.
-    fn stored_spelling(&self, schema_name: &str, table_name: &str) -> Result<(String, String)> {
+    /// [`MetadataWriter::stored_location`] among this catalog's schemas only.
+    fn stored_location(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<Option<crate::metadata_writer::StoredLocation>> {
         self.block_on(async {
             let found = sqlx::query_as(concat!(
-                "SELECT s.schema_name, t.table_name
-                 FROM (SELECT s.schema_id, s.schema_name, s.begin_snapshot FROM ducklake_schema s
+                "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+                 FROM (SELECT s.schema_id, s.path, s.path_is_relative, s.begin_snapshot
+                       FROM ducklake_schema s
                        JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
-                       WHERE m.catalog_id = $1 AND s.end_snapshot IS NULL AND ",
-                crate::catalog_name::name_eq!(postgres, "s.schema_name", "$2"),
+                       WHERE m.catalog_id = $1 AND s.end_snapshot IS NULL
+                         AND s.begin_snapshot <> $2 AND ",
+                crate::catalog_name::name_eq!(postgres, "s.schema_name", "$3"),
                 ") s
                  LEFT JOIN ducklake_table t ON t.schema_id = s.schema_id
-                   AND t.end_snapshot IS NULL AND ",
-                crate::catalog_name::name_eq!(postgres, "t.table_name", "$3"),
+                   AND t.end_snapshot IS NULL AND t.begin_snapshot <> $2 AND ",
+                crate::catalog_name::name_eq!(postgres, "t.table_name", "$4"),
                 "
-                 ORDER BY s.begin_snapshot, t.begin_snapshot DESC
+                 ORDER BY s.begin_snapshot, t.begin_snapshot
                  LIMIT 1"
             ))
             .bind(self.catalog_id)
+            .bind(crate::metadata_writer::PENDING_SNAPSHOT)
             .bind(schema_name)
             .bind(table_name)
             .fetch_optional(&self.pool)
             .await?;
-            Ok(crate::metadata_writer::stored_spelling(
-                found,
-                schema_name,
-                table_name,
-            ))
+            Ok(crate::metadata_writer::stored_location(found))
         })
     }
 

@@ -3756,11 +3756,12 @@ impl MetadataWriter for MySqlMetadataWriter {
                     // Only while it is still pending: one a commit stamped since is returned as
                     // found.
                     let taken = sqlx::query(
-                        "UPDATE ducklake_schema SET begin_snapshot = ?, path = ?
+                        "UPDATE ducklake_schema SET begin_snapshot = ?, path = ?, schema_name = ?
                          WHERE schema_id = ? AND begin_snapshot = ?",
                     )
                     .bind(snapshot_id)
                     .bind(&schema_path)
+                    .bind(name)
                     .bind(schema_id)
                     .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                     .execute(&mut *tx)
@@ -3839,11 +3840,12 @@ impl MetadataWriter for MySqlMetadataWriter {
                 Some(table_id) => {
                     // As for the schema: only while it is still pending.
                     let taken = sqlx::query(
-                        "UPDATE ducklake_table SET begin_snapshot = ?, path = ?
+                        "UPDATE ducklake_table SET begin_snapshot = ?, path = ?, table_name = ?
                          WHERE table_id = ? AND begin_snapshot = ?",
                     )
                     .bind(snapshot_id)
                     .bind(&table_path)
+                    .bind(name)
                     .bind(table_id)
                     .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                     .execute(&mut *tx)
@@ -6182,18 +6184,20 @@ impl MetadataWriter for MySqlMetadataWriter {
         })
     }
 
-    fn stored_spelling(&self, schema_name: &str, table_name: &str) -> Result<(String, String)> {
+    fn stored_location(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<Option<crate::metadata_writer::StoredLocation>> {
         self.block_on(async {
-            let found = sqlx::query_as(crate::metadata_writer::STORED_SPELLING_SQL_MYSQL)
+            let found = sqlx::query_as(crate::metadata_writer::STORED_LOCATION_SQL_MYSQL)
+                .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                 .bind(schema_name)
+                .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                 .bind(table_name)
                 .fetch_optional(&self.pool)
                 .await?;
-            Ok(crate::metadata_writer::stored_spelling(
-                found,
-                schema_name,
-                table_name,
-            ))
+            Ok(crate::metadata_writer::stored_location(found))
         })
     }
 
@@ -6568,6 +6572,20 @@ impl MetadataWriter for MySqlMetadataWriter {
                     result.last_insert_id() as i64
                 }
             };
+
+            // A row no commit published yet is this write's now, spelled as this write spells it.
+            for (sql, name, id) in [
+                (crate::metadata_writer::TAKE_UP_PENDING_SCHEMA_SQL, schema_name, schema_id),
+                (crate::metadata_writer::TAKE_UP_PENDING_TABLE_SQL, table_name, table_id),
+            ] {
+                sqlx::query(sql)
+                    .bind(name)
+                    .bind(directory_path(name))
+                    .bind(id)
+                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+                    .execute(&mut *tx)
+                    .await?;
+            }
 
             // Get existing columns to (a) check schema compatibility for appends
             // and (b) REUSE each column's id (column_id == parquet field_id; an

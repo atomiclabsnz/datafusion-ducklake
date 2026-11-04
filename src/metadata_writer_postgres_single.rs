@@ -2609,18 +2609,19 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         })
     }
 
-    fn stored_spelling(&self, schema_name: &str, table_name: &str) -> Result<(String, String)> {
+    fn stored_location(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<Option<crate::metadata_writer::StoredLocation>> {
         self.block_on(async {
-            let found = sqlx::query_as(crate::metadata_writer::STORED_SPELLING_SQL_PG)
+            let found = sqlx::query_as(crate::metadata_writer::STORED_LOCATION_SQL_PG)
+                .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                 .bind(schema_name)
                 .bind(table_name)
                 .fetch_optional(&self.pool)
                 .await?;
-            Ok(crate::metadata_writer::stored_spelling(
-                found,
-                schema_name,
-                table_name,
-            ))
+            Ok(crate::metadata_writer::stored_location(found))
         })
     }
 

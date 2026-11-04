@@ -569,3 +569,181 @@ async fn a_lake_written_here_in_mixed_case_is_found_by_duckdb_in_any_case() {
     rows(&lake, "INSERT INTO lake.fin.LEDGER VALUES (4, 'four')");
     assert_eq!(rows(&lake, "SELECT count(*) FROM lake.Fin.Ledger"), ["4"]);
 }
+
+/// Every Parquet file under `dir`, relative to it.
+fn parquet_files(dir: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, found: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, found);
+            } else if path.extension().is_some_and(|e| e == "parquet") {
+                let relative = path.strip_prefix(root).unwrap().parent().unwrap();
+                found.push(relative.display().to_string());
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(dir, dir, &mut found);
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// The directories DuckDB 1.5.6 gives a schema and table: its name as written, then kept by a
+/// rename. Pinned here, as the writer's keys follow them.
+#[test]
+fn duckdb_keeps_a_renamed_tables_path() {
+    let temp = TempDir::new().unwrap();
+    let (catalog, data) = new_lake(&temp);
+    let lake = duckdb(&catalog, &data);
+    lake.execute_batch(
+        r#"CREATE SCHEMA lake."Staging";
+           CREATE TABLE lake."Staging"."Orders" (id INT);
+           CREATE TABLE lake.main.orders (id INT);
+           INSERT INTO lake.main.orders VALUES (1);
+           ALTER TABLE lake.main.orders RENAME TO "Orders";
+           INSERT INTO lake.main.orders VALUES (2);
+           CREATE TABLE lake.main.a (id INT);
+           ALTER TABLE lake.main.a RENAME TO b;
+           INSERT INTO lake.main.b VALUES (3);"#,
+    )
+    .unwrap();
+    assert_eq!(
+        rows(
+            &lake,
+            "SELECT s.schema_name || '|' || s.path || '|' || t.table_name || '|' || t.path
+               FROM __ducklake_metadata_lake.ducklake_table t
+               JOIN __ducklake_metadata_lake.ducklake_schema s USING (schema_id)
+              WHERE t.end_snapshot IS NULL ORDER BY t.table_id"
+        ),
+        ["Staging|Staging/|Orders|Orders/", "main|main/|Orders|orders/", "main|main/|b|a/"]
+    );
+    // DuckDB's own inserts after the renames go to the kept paths.
+    assert_eq!(parquet_files(&data), ["main/a", "main/orders"]);
+}
+
+/// A table DuckDB renamed keeps its `path`; a write here, by any spelling, puts its files
+/// there, where DuckDB and this crate read them (#29 review: keyed by the name, they landed
+/// under `main/Orders/` and `main/b/`, which no reader looks in).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_into_a_renamed_table_lands_under_its_path() {
+    let temp = TempDir::new().unwrap();
+    let (catalog, data) = new_lake(&temp);
+    duckdb(&catalog, &data)
+        .execute_batch(
+            r#"CREATE TABLE lake.main.orders (id INT, name VARCHAR);
+               INSERT INTO lake.main.orders VALUES (1, 'one');
+               ALTER TABLE lake.main.orders RENAME TO "Orders";
+               CREATE TABLE lake.main.a (id INT, name VARCHAR);
+               INSERT INTO lake.main.a VALUES (10, 'ten');
+               ALTER TABLE lake.main.a RENAME TO b;"#,
+        )
+        .unwrap();
+    let writer = table_writer(&catalog).await;
+    writer
+        .append_table("main", "orders", &[batch(&[2])])
+        .await
+        .unwrap();
+    writer
+        .append_table("main", "ORDERS", &[batch(&[3])])
+        .await
+        .unwrap();
+    writer
+        .append_table("main", "B", &[batch(&[11])])
+        .await
+        .unwrap();
+    assert_eq!(parquet_files(&data), ["main/a", "main/orders"]);
+
+    let lake = duckdb(&catalog, &data);
+    assert_eq!(
+        rows(&lake, "SELECT id FROM lake.main.orders ORDER BY id"),
+        ["1", "2", "3"]
+    );
+    assert_eq!(
+        rows(&lake, "SELECT id FROM lake.main.b ORDER BY id"),
+        ["10", "11"]
+    );
+    let (ctx, _) = crate_context(&catalog).await;
+    assert_eq!(
+        crate_answer(&ctx, "SELECT count(*) FROM lake.main.orders").await,
+        Ok(vec!["3".to_string()])
+    );
+    assert_eq!(
+        crate_answer(&ctx, "SELECT count(*) FROM lake.main.b").await,
+        Ok(vec!["2".to_string()])
+    );
+}
+
+/// A replace abandoned before its commit leaves its pending table row, spelled as it was
+/// spelled. That row is no table's: a later write into the live table keys its files by the
+/// live table's `path`, and a later write that takes the pending row up gives it its own
+/// spelling and `path` (#29 review).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_row_an_abandoned_write_left_steers_no_later_write() {
+    let temp = TempDir::new().unwrap();
+    let (catalog, data) = new_lake(&temp);
+    duckdb(&catalog, &data)
+        .execute_batch(
+            "CREATE TABLE lake.main.orders (id INT, name VARCHAR);
+             INSERT INTO lake.main.orders VALUES (1, 'one');",
+        )
+        .unwrap();
+    let writer = table_writer(&catalog).await;
+    let pending_rows = |catalog: &Path| {
+        rows(
+            &duckdb(catalog, &data),
+            "SELECT table_name || '|' || path FROM __ducklake_metadata_lake.ducklake_table
+              WHERE begin_snapshot = 9223372036854775807 ORDER BY table_id",
+        )
+    };
+
+    // A replace with a new spelling, abandoned; and a new table's create, abandoned.
+    for (table, mode) in [("ORDERS", WriteMode::CreateOrReplace), ("NewT", WriteMode::Create)] {
+        let mut session = writer
+            .begin_write("main", table, &batch(&[]).schema(), mode)
+            .unwrap();
+        session.write_batch(&batch(&[7])).unwrap();
+        drop(session);
+    }
+    assert_eq!(pending_rows(&catalog), ["ORDERS|ORDERS/", "NewT|NewT/"]);
+
+    // The live table is written where it lives, not where the pending row would put it.
+    writer
+        .append_table("main", "Orders", &[batch(&[2])])
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(
+            &duckdb(&catalog, &data),
+            "SELECT id FROM lake.main.orders ORDER BY id"
+        ),
+        ["1", "2"]
+    );
+    // A write that takes a pending row up makes it its own: spelling and path.
+    writer
+        .append_table("main", "newt", &[batch(&[20])])
+        .await
+        .unwrap();
+    writer
+        .create_or_replace_table("main", "OrDeRs", &[batch(&[5, 6])])
+        .await
+        .unwrap();
+
+    let lake = duckdb(&catalog, &data);
+    assert_eq!(
+        live_names(&lake),
+        ["schema main", "table OrDeRs", "table newt"],
+        "the replace took the pending row up with its own spelling"
+    );
+    assert_eq!(rows(&lake, "SELECT id FROM lake.main.newt"), ["20"]);
+    assert_eq!(
+        rows(&lake, "SELECT id FROM lake.main.orders ORDER BY id"),
+        ["5", "6"]
+    );
+    assert_eq!(
+        parquet_files(&data),
+        ["main/OrDeRs", "main/newt", "main/orders"],
+        "nothing written under the abandoned spellings that a reader would not look in"
+    );
+}

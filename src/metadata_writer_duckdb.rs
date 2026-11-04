@@ -3613,11 +3613,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
             Some((schema_id, _)) => {
                 // Only while it is still pending: one a commit stamped since is returned as found.
                 let taken = tx.execute(
-                    "UPDATE ducklake_schema SET begin_snapshot = ?, path = ?
+                    "UPDATE ducklake_schema SET begin_snapshot = ?, path = ?, schema_name = ?
                      WHERE schema_id = ? AND begin_snapshot = ?",
                     params![
                         snapshot_id,
                         schema_path,
+                        name,
                         schema_id,
                         crate::metadata_writer::PENDING_SNAPSHOT
                     ],
@@ -3690,11 +3691,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
             Some(table_id) => {
                 // As for the schema: only while it is still pending.
                 let taken = tx.execute(
-                    "UPDATE ducklake_table SET begin_snapshot = ?, path = ?
+                    "UPDATE ducklake_table SET begin_snapshot = ?, path = ?, table_name = ?
                      WHERE table_id = ? AND begin_snapshot = ?",
                     params![
                         snapshot_id,
                         table_path,
+                        name,
                         table_id,
                         crate::metadata_writer::PENDING_SNAPSHOT
                     ],
@@ -5684,20 +5686,21 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
     }
 
-    fn stored_spelling(&self, schema_name: &str, table_name: &str) -> Result<(String, String)> {
+    fn stored_location(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<Option<crate::metadata_writer::StoredLocation>> {
+        let pending = crate::metadata_writer::PENDING_SNAPSHOT;
         let conn = self.connection();
         let found = conn
             .query_row(
-                crate::metadata_writer::STORED_SPELLING_SQL_DUCKDB,
-                params![schema_name, table_name],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                crate::metadata_writer::STORED_LOCATION_SQL_DUCKDB,
+                params![pending, schema_name, pending, table_name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        Ok(crate::metadata_writer::stored_spelling(
-            found,
-            schema_name,
-            table_name,
-        ))
+        Ok(crate::metadata_writer::stored_location(found))
     }
 
     fn get_table_column_nullability(
@@ -5901,6 +5904,25 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 )?,
             }
         };
+
+        // A row no commit published yet is this write's now, spelled as this write spells it.
+        for (sql, name, id) in [
+            (
+                crate::metadata_writer::TAKE_UP_PENDING_SCHEMA_SQL,
+                schema_name,
+                schema_id,
+            ),
+            (
+                crate::metadata_writer::TAKE_UP_PENDING_TABLE_SQL,
+                table_name,
+                table_id,
+            ),
+        ] {
+            tx.execute(
+                sql,
+                params![name, directory_path(name), id, crate::metadata_writer::PENDING_SNAPSHOT],
+            )?;
+        }
 
         // Existing columns to (a) check schema compatibility and (b) REUSE each
         // column's id (column_id == parquet field_id == a column's stable

@@ -1293,7 +1293,7 @@ impl DuckLakeTableWriter {
         // single-file writer above is still created: with zero rows the sink
         // produces no file, and a Replace then needs that 0-row marker to retire the
         // prior generation.
-        let table_key = self.table_key(schema_name, table_name)?;
+        let table_key = self.write_table_key(schema_name, table_name, mode)?;
         let partition_sink =
             match self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)? {
                 None => None,
@@ -2399,7 +2399,7 @@ impl DuckLakeTableWriter {
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
 
-        let table_key = self.table_key(schema_name, table_name)?;
+        let table_key = self.write_table_key(schema_name, table_name, mode)?;
 
         let groups = match &sort_spec {
             Some(spec) => groups
@@ -2445,9 +2445,7 @@ impl DuckLakeTableWriter {
         }) {
             Ok(committed) => committed,
             Err(e) => {
-                return Err(self
-                    .release_written_files(schema_name, table_name, e, &file_infos)
-                    .await);
+                return Err(self.release_written_files(&table_key, e, &file_infos).await);
             },
         };
 
@@ -2638,7 +2636,7 @@ impl DuckLakeTableWriter {
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
 
-        let table_key = self.table_key(schema_name, table_name)?;
+        let table_key = self.write_table_key(schema_name, table_name, mode)?;
 
         let partition = if resolve_layout {
             self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
@@ -2694,9 +2692,7 @@ impl DuckLakeTableWriter {
         }) {
             Ok(committed) => committed,
             Err(e) => {
-                return Err(self
-                    .release_written_files(schema_name, table_name, e, &file_infos)
-                    .await);
+                return Err(self.release_written_files(&table_key, e, &file_infos).await);
             },
         };
 
@@ -2797,7 +2793,7 @@ impl DuckLakeTableWriter {
 
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
-        let table_key = self.table_key(schema_name, table_name)?;
+        let table_key = self.write_table_key(schema_name, table_name, mode)?;
         let partition = if resolve_layout {
             self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
         } else {
@@ -2862,27 +2858,33 @@ impl DuckLakeTableWriter {
         })
     }
 
-    /// Remove `file_infos`, written under `schema_name.table_name` for a commit
+    /// Remove `file_infos`, written under the table directory `table_key` for a commit
     /// that failed with `error`, when it definitely registered nothing (see
     /// [`commit_definitely_rolled_back`]), and return `error`.
     async fn release_written_files(
         &self,
-        schema_name: &str,
-        table_name: &str,
+        table_key: &str,
         error: crate::error::DuckLakeError,
         file_infos: &[DataFileInfo],
     ) -> crate::error::DuckLakeError {
-        let files = file_infos
+        if !commit_definitely_rolled_back(&error) {
+            return error;
+        }
+        let objects = file_infos
             .iter()
-            .map(|file| (file.path.as_str(), file.path_is_relative));
-        self.release_files_if(
-            schema_name,
-            table_name,
-            error,
-            files,
-            commit_definitely_rolled_back,
-        )
-        .await
+            .map(|file| object_key(table_key, &file.path, file.path_is_relative))
+            .collect::<Result<Vec<_>>>();
+        match objects {
+            Ok(objects) => {
+                for failure in remove_objects(&self.object_store, objects).await {
+                    tracing::warn!(error = %failure, "failed to remove a file of a rejected commit");
+                }
+            },
+            Err(path_error) => {
+                tracing::warn!(error = %path_error, "failed to resolve a file of a rejected commit");
+            },
+        }
+        error
     }
 
     /// Remove `files`, written under `schema_name.table_name` for a commit that
@@ -2968,36 +2970,53 @@ impl DuckLakeTableWriter {
         )
     }
 
-    /// [`Self::table_key`] for a write about to begin in `mode`: a `CREATE OR REPLACE` makes a
-    /// new table of the spelling it is given, so its files go under that spelling, not under
-    /// the spelling of the table it replaces.
+    /// [`Self::table_key`] for a write in `mode`: a `CREATE OR REPLACE` makes a new table, whose
+    /// `path` is its name as given (as DuckDB's replace writes it), in the live schema's
+    /// directory; it is not the replaced table's.
     fn write_table_key(
         &self,
         schema_name: &str,
         table_name: &str,
         mode: WriteMode,
     ) -> Result<String> {
-        if mode != WriteMode::CreateOrReplace {
-            return self.table_key(schema_name, table_name);
-        }
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
+        let location = self.metadata.stored_location(schema_name, table_name)?;
+        let schema_key = self.schema_key(location.as_ref(), schema_name)?;
+        let table = match mode {
+            WriteMode::CreateOrReplace => None,
+            _ => location.and_then(|location| location.table),
         };
-        let (schema_name, _) = self.metadata.stored_spelling(schema_name, table_name)?;
-        join_paths(&join_paths(&scoped_base, &schema_name)?, table_name)
+        directory_key(&schema_key, table.as_ref(), table_name)
     }
 
-    /// Object-store key of a table's directory: `{base}/[cat_{id}/]{schema}/{table}`, each
-    /// name as the catalog spells it ([`MetadataWriter::stored_spelling`]): a name is found in
-    /// any ASCII case, as DuckDB finds it, but its directory is the one its spelling made.
+    /// Object-store key of a table's directory, where its readers look for its files: the
+    /// live, published schema's and table's `path` columns, resolved as a reader resolves them
+    /// ([`MetadataWriter::stored_location`]); a name found in any ASCII case, as DuckDB finds
+    /// it, but never keyed by the name, which a rename changes and the `path` keeps. A schema or
+    /// table not yet published is keyed `{base}/[cat_{id}/]{schema}/{table}` by the names as
+    /// given, which is the `path` its write gives it.
     fn table_key(&self, schema_name: &str, table_name: &str) -> Result<String> {
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let (schema_name, table_name) = self.metadata.stored_spelling(schema_name, table_name)?;
-        join_paths(&join_paths(&scoped_base, &schema_name)?, &table_name)
+        self.write_table_key(schema_name, table_name, WriteMode::Append)
+    }
+
+    /// The key of the directory of the schema `location` found, else of a new schema
+    /// `schema_name`.
+    fn schema_key(
+        &self,
+        location: Option<&crate::metadata_writer::StoredLocation>,
+        schema_name: &str,
+    ) -> Result<String> {
+        match location.and_then(|location| location.schema.as_ref()) {
+            // A schema's relative path is relative to the data path; a multi-catalog schema's
+            // already starts with its `cat_{id}/`.
+            Some(schema) => directory_key(&self.base_key_path, Some(schema), schema_name),
+            None => {
+                let scoped_base = match self.metadata.catalog_id() {
+                    Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+                    None => self.base_key_path.clone(),
+                };
+                directory_key(&scoped_base, None, schema_name)
+            },
+        }
     }
 
     /// The id the catalog's next snapshot is expected to take, or `None` when
@@ -5090,6 +5109,21 @@ impl Drop for StagedUploads {
 
 /// The object-store key of a catalog file path: relative to `table_key`, or
 /// absolute.
+/// The object-store key of a directory under `parent`: `stored`, relative to `parent` or
+/// absolute (a URL, whose key part is taken), as a reader resolves it; else `name`.
+fn directory_key(
+    parent: &str,
+    stored: Option<&crate::metadata_writer::StoredPath>,
+    name: &str,
+) -> Result<String> {
+    let key = match stored {
+        Some(stored) if stored.path_is_relative => join_paths(parent, &stored.path)?,
+        Some(stored) => crate::path_resolver::parse_object_store_url(&stored.path)?.1,
+        None => join_paths(parent, name)?,
+    };
+    Ok(key.trim_end_matches('/').to_string())
+}
+
 fn object_key(table_key: &str, path: &str, path_is_relative: bool) -> Result<ObjectPath> {
     let path = if path_is_relative {
         join_paths(table_key, path)?
