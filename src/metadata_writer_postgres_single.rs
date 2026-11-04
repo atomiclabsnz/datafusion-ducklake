@@ -2635,6 +2635,19 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         })
     }
 
+    fn location_of_table(
+        &self,
+        table_id: i64,
+    ) -> Result<Option<crate::metadata_writer::StoredLocation>> {
+        self.block_on(async {
+            let found = sqlx::query_as(crate::metadata_writer::LOCATION_OF_TABLE_SQL_PG)
+                .bind(table_id)
+                .fetch_optional(&self.pool)
+                .await?;
+            Ok(crate::metadata_writer::stored_location(found))
+        })
+    }
+
     fn get_table_column_nullability(
         &self,
         schema_name: &str,

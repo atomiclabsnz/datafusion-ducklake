@@ -1065,13 +1065,12 @@ impl DuckLakeTableWriter {
         // skip the segment, preserving the historical `{schema}/{table}/…`
         // layout. `cat_` prefix + numeric id is rename-safe and needs no
         // sanitisation.
-        let table_key = self.write_table_key(schema_name, table_name, mode)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,
             table_name,
             arrow_schema,
-            table_key,
+            None,
             file_name.clone(),
             file_name,
             true,
@@ -1101,13 +1100,12 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         mode: WriteMode,
     ) -> Result<TableWriteSession> {
-        let table_key = self.write_table_key(schema_name, table_name, mode)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,
             table_name,
             arrow_schema,
-            table_key,
+            None,
             file_name.clone(),
             file_name,
             true,
@@ -1154,13 +1152,12 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         mode: WriteMode,
     ) -> Result<TableWriteSession> {
-        let table_key = self.write_table_key(schema_name, table_name, mode)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,
             table_name,
             arrow_schema,
-            table_key,
+            None,
             file_name.clone(),
             file_name,
             true,
@@ -1189,7 +1186,7 @@ impl DuckLakeTableWriter {
             schema_name,
             table_name,
             arrow_schema,
-            file_dir.to_string(),
+            Some(file_dir.to_string()),
             file_name,
             full_path,
             false,
@@ -1209,7 +1206,7 @@ impl DuckLakeTableWriter {
         schema_name: &str,
         table_name: &str,
         arrow_schema: &Schema,
-        file_dir: String,
+        file_dir: Option<String>,
         file_name: String,
         catalog_path: String,
         path_is_relative: bool,
@@ -1260,6 +1257,9 @@ impl DuckLakeTableWriter {
             Arc::new(schema)
         };
 
+        // The directory of the row this write's start chose, unless the caller named one.
+        let table_key = self.setup_table_key(setup.table_id, schema_name, table_name)?;
+        let file_dir = file_dir.unwrap_or_else(|| table_key.clone());
         let object_path_str = join_paths(&file_dir, &file_name)?;
         // Strip leading slash for object_store Path (it expects relative keys)
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
@@ -1293,7 +1293,6 @@ impl DuckLakeTableWriter {
         // single-file writer above is still created: with zero rows the sink
         // produces no file, and a Replace then needs that 0-row marker to retire the
         // prior generation.
-        let table_key = self.write_table_key(schema_name, table_name, mode)?;
         let partition_sink =
             match self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)? {
                 None => None,
@@ -2399,7 +2398,7 @@ impl DuckLakeTableWriter {
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
 
-        let table_key = self.write_table_key(schema_name, table_name, mode)?;
+        let table_key = self.setup_table_key(setup.table_id, schema_name, table_name)?;
 
         let groups = match &sort_spec {
             Some(spec) => groups
@@ -2636,7 +2635,7 @@ impl DuckLakeTableWriter {
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
 
-        let table_key = self.write_table_key(schema_name, table_name, mode)?;
+        let table_key = self.setup_table_key(setup.table_id, schema_name, table_name)?;
 
         let partition = if resolve_layout {
             self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
@@ -2793,7 +2792,7 @@ impl DuckLakeTableWriter {
 
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
-        let table_key = self.write_table_key(schema_name, table_name, mode)?;
+        let table_key = self.setup_table_key(setup.table_id, schema_name, table_name)?;
         let partition = if resolve_layout {
             self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
         } else {
@@ -2970,22 +2969,25 @@ impl DuckLakeTableWriter {
         )
     }
 
-    /// [`Self::table_key`] for a write in `mode`: a `CREATE OR REPLACE` makes a new table, whose
-    /// `path` is its name as given (as DuckDB's replace writes it), in the live schema's
-    /// directory; it is not the replaced table's.
-    fn write_table_key(
+    /// The directory a write keys its files under, once its start chose the table row
+    /// `table_id`: that row's `path` and its schema's ([`MetadataWriter::location_of_table`]),
+    /// whoever made the row and however it is spelled. Never the names the write was given,
+    /// which may spell the row otherwise (a name is found in any ASCII case), and never a
+    /// change to the row, which another write may own. A backend whose row does not exist yet
+    /// keys by [`Self::table_key`].
+    fn setup_table_key(
         &self,
+        table_id: i64,
         schema_name: &str,
         table_name: &str,
-        mode: WriteMode,
     ) -> Result<String> {
-        let location = self.metadata.stored_location(schema_name, table_name)?;
-        let schema_key = self.schema_key(location.as_ref(), schema_name)?;
-        let table = match mode {
-            WriteMode::CreateOrReplace => None,
-            _ => location.and_then(|location| location.table),
-        };
-        directory_key(&schema_key, table.as_ref(), table_name)
+        match self.metadata.location_of_table(table_id)? {
+            Some(location) if location.table.is_some() => {
+                let schema_key = self.schema_key(Some(&location), schema_name)?;
+                directory_key(&schema_key, location.table.as_ref(), table_name)
+            },
+            _ => self.table_key(schema_name, table_name),
+        }
     }
 
     /// Object-store key of a table's directory, where its readers look for its files: the
@@ -2995,7 +2997,10 @@ impl DuckLakeTableWriter {
     /// table not yet published is keyed `{base}/[cat_{id}/]{schema}/{table}` by the names as
     /// given, which is the `path` its write gives it.
     fn table_key(&self, schema_name: &str, table_name: &str) -> Result<String> {
-        self.write_table_key(schema_name, table_name, WriteMode::Append)
+        let location = self.metadata.stored_location(schema_name, table_name)?;
+        let schema_key = self.schema_key(location.as_ref(), schema_name)?;
+        let table = location.and_then(|location| location.table);
+        directory_key(&schema_key, table.as_ref(), table_name)
     }
 
     /// The key of the directory of the schema `location` found, else of a new schema
@@ -5107,8 +5112,6 @@ impl Drop for StagedUploads {
     }
 }
 
-/// The object-store key of a catalog file path: relative to `table_key`, or
-/// absolute.
 /// The object-store key of a directory under `parent`: `stored`, relative to `parent` or
 /// absolute (a URL, whose key part is taken), as a reader resolves it; else `name`.
 fn directory_key(
@@ -5124,6 +5127,8 @@ fn directory_key(
     Ok(key.trim_end_matches('/').to_string())
 }
 
+/// The object-store key of a catalog file path: relative to `table_key`, or
+/// absolute.
 fn object_key(table_key: &str, path: &str, path_is_relative: bool) -> Result<ObjectPath> {
     let path = if path_is_relative {
         join_paths(table_key, path)?

@@ -688,8 +688,8 @@ async fn a_write_into_a_renamed_table_lands_under_its_path() {
 
 /// A replace abandoned before its commit leaves its pending table row, spelled as it was
 /// spelled. That row is no table's: a later write into the live table keys its files by the
-/// live table's `path`, and a later write that takes the pending row up gives it its own
-/// spelling and `path` (#29 review).
+/// live table's `path`, and a later write that takes the pending row up writes under that
+/// row's `path` (#29 reviews 1 and 2).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pending_row_an_abandoned_write_left_steers_no_later_write() {
     let temp = TempDir::new().unwrap();
@@ -742,10 +742,14 @@ async fn a_pending_row_an_abandoned_write_left_steers_no_later_write() {
         .unwrap();
 
     let lake = duckdb(&catalog, &data);
+    // A pending row is taken up as it is, spelled and placed as the write that made it left
+    // it: nothing tells an abandoned row from one a write still in flight owns, and renaming
+    // that one would move its files out from under it. DuckDB, which has no pending rows, would
+    // store `OrDeRs` and `newt`; the spelling differs, every row is readable.
     assert_eq!(
         live_names(&lake),
-        ["schema main", "table OrDeRs", "table newt"],
-        "the replace took the pending row up with its own spelling"
+        ["schema main", "table NewT", "table ORDERS"],
+        "a pending row keeps its spelling"
     );
     assert_eq!(rows(&lake, "SELECT id FROM lake.main.newt"), ["20"]);
     assert_eq!(
@@ -754,7 +758,145 @@ async fn a_pending_row_an_abandoned_write_left_steers_no_later_write() {
     );
     assert_eq!(
         parquet_files(&data),
-        ["main/OrDeRs", "main/newt", "main/orders"],
+        ["main/NewT", "main/ORDERS", "main/orders"],
         "nothing written under the abandoned spellings that a reader would not look in"
     );
+}
+
+/// Two writes in one transaction name one new schema in two spellings: the second finds the
+/// first's pending row (in any ASCII case) and writes under its `path`, and nothing renames
+/// it (#29 review 2: the second renamed the row to `staging/`, and the first's files, under
+/// `Staging/a/`, were unreadable).
+#[tokio::test(flavor = "multi_thread")]
+async fn one_transaction_naming_a_new_schema_two_ways_writes_under_one_path() {
+    let temp = TempDir::new().unwrap();
+    let (catalog, data) = new_lake(&temp);
+    duckdb(&catalog, &data);
+    let writer = table_writer(&catalog).await;
+    let mut transaction = writer.transaction();
+    let schema = batch(&[]).schema();
+    transaction
+        .stage_write("Staging", "a", &schema, WriteMode::Create, &[batch(&[1])])
+        .await
+        .unwrap();
+    transaction
+        .stage_write("staging", "b", &schema, WriteMode::Create, &[batch(&[2])])
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let lake = duckdb(&catalog, &data);
+    assert_eq!(
+        live_names(&lake),
+        ["schema Staging", "schema main", "table a", "table b"]
+    );
+    assert_eq!(rows(&lake, "SELECT id FROM lake.staging.a"), ["1"]);
+    assert_eq!(rows(&lake, "SELECT id FROM lake.STAGING.b"), ["2"]);
+    assert_eq!(parquet_files(&data), ["Staging/a", "Staging/b"]);
+}
+
+/// Two writes in flight make one new table in two spellings: the second takes the first's
+/// pending row up, and both write under its `path`. Whichever commits, its rows are readable
+/// (#29 review 2: the second renamed the row to `newt/`, and the first's committed rows, under
+/// `main/NewT/`, were not).
+#[tokio::test(flavor = "multi_thread")]
+async fn two_writes_in_flight_on_one_new_table_in_two_spellings_stay_readable() {
+    let temp = TempDir::new().unwrap();
+    let (catalog, data) = new_lake(&temp);
+    duckdb(&catalog, &data);
+    let writer = table_writer(&catalog).await;
+    let schema = batch(&[]).schema();
+    let mut first = writer
+        .begin_write("main", "NewT", &schema, WriteMode::Append)
+        .unwrap();
+    first.write_batch(&batch(&[1])).unwrap();
+    let mut second = writer
+        .begin_write("main", "newt", &schema, WriteMode::Append)
+        .unwrap();
+    second.write_batch(&batch(&[2])).unwrap();
+    first.finish().await.unwrap();
+    assert_eq!(
+        rows(&duckdb(&catalog, &data), "SELECT id FROM lake.main.newt"),
+        ["1"],
+        "the first write's rows are readable"
+    );
+    // The second commits into the table the first published, or is refused; either way the
+    // lake stays readable.
+    let second = second.finish().await;
+    let lake = duckdb(&catalog, &data);
+    let expected: &[&str] = if second.is_ok() {
+        &["1", "2"]
+    } else {
+        &["1"]
+    };
+    assert_eq!(
+        rows(&lake, "SELECT id FROM lake.main.NEWT ORDER BY id"),
+        expected
+    );
+    assert_eq!(live_names(&lake), ["schema main", "table NewT"]);
+}
+
+/// A write in flight into a new schema, and a second write that names it otherwise, begins
+/// and is dropped: the first commits, and its rows are readable (#29 review 2: the dropped
+/// write had renamed the pending schema to `staging/`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_write_naming_a_pending_schema_otherwise_moves_nothing() {
+    let temp = TempDir::new().unwrap();
+    let (catalog, data) = new_lake(&temp);
+    duckdb(&catalog, &data);
+    let writer = table_writer(&catalog).await;
+    let schema = batch(&[]).schema();
+    let mut first = writer
+        .begin_write("Staging", "x", &schema, WriteMode::Create)
+        .unwrap();
+    first.write_batch(&batch(&[1])).unwrap();
+    let mut dropped = writer
+        .begin_write("staging", "y", &schema, WriteMode::Create)
+        .unwrap();
+    dropped.write_batch(&batch(&[2])).unwrap();
+    drop(dropped);
+    first.finish().await.unwrap();
+
+    let lake = duckdb(&catalog, &data);
+    assert_eq!(rows(&lake, "SELECT id FROM lake.staging.x"), ["1"]);
+    assert_eq!(rows(&lake, "SELECT id FROM lake.Staging.X"), ["1"]);
+    assert_eq!(parquet_files(&data), ["Staging/x"]);
+}
+
+/// A `CREATE OR REPLACE` refuses, as a conflict, a table of its name another writer created
+/// and dropped since it began, whatever spelling either used: DuckDB records the creation as
+/// `created_table:"Staging"."T"`, which names what the replace spelled `"STAGING"."t"` (#29
+/// review 2: compared exactly, the replace went ahead).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replace_conflicts_with_a_create_since_it_began_in_any_spelling() {
+    let temp = TempDir::new().unwrap();
+    let (catalog, data) = new_lake(&temp);
+    duckdb(&catalog, &data)
+        .execute_batch(r#"CREATE SCHEMA lake."Staging";"#)
+        .unwrap();
+    let writer = table_writer(&catalog).await;
+    let mut replace = writer
+        .begin_write(
+            "STAGING",
+            "t",
+            &batch(&[]).schema(),
+            WriteMode::CreateOrReplace,
+        )
+        .unwrap();
+    replace.write_batch(&batch(&[1])).unwrap();
+    duckdb(&catalog, &data)
+        .execute_batch(
+            r#"CREATE TABLE lake."Staging"."T" (id INT, name VARCHAR);
+               DROP TABLE lake.staging.t;"#,
+        )
+        .unwrap();
+    match replace.finish().await {
+        Err(DuckLakeError::Conflict(message)) => {
+            assert!(
+                message.contains("has created a table with this name"),
+                "{message}"
+            )
+        },
+        other => panic!("a replace committed past a create since it began: {other:?}"),
+    }
 }

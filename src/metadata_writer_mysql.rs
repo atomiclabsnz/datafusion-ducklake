@@ -3766,12 +3766,11 @@ impl MetadataWriter for MySqlMetadataWriter {
                     // Only while it is still pending: one a commit stamped since is returned as
                     // found.
                     let taken = sqlx::query(
-                        "UPDATE ducklake_schema SET begin_snapshot = ?, path = ?, schema_name = ?
+                        "UPDATE ducklake_schema SET begin_snapshot = ?, path = COALESCE(?, path)
                          WHERE schema_id = ? AND begin_snapshot = ?",
                     )
                     .bind(snapshot_id)
-                    .bind(&schema_path)
-                    .bind(name)
+                    .bind(path.map(directory_path))
                     .bind(schema_id)
                     .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                     .execute(&mut *tx)
@@ -3850,12 +3849,11 @@ impl MetadataWriter for MySqlMetadataWriter {
                 Some(table_id) => {
                     // As for the schema: only while it is still pending.
                     let taken = sqlx::query(
-                        "UPDATE ducklake_table SET begin_snapshot = ?, path = ?, table_name = ?
+                        "UPDATE ducklake_table SET begin_snapshot = ?, path = COALESCE(?, path)
                          WHERE table_id = ? AND begin_snapshot = ?",
                     )
                     .bind(snapshot_id)
-                    .bind(&table_path)
-                    .bind(name)
+                    .bind(path.map(directory_path))
                     .bind(table_id)
                     .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                     .execute(&mut *tx)
@@ -6211,6 +6209,19 @@ impl MetadataWriter for MySqlMetadataWriter {
         })
     }
 
+    fn location_of_table(
+        &self,
+        table_id: i64,
+    ) -> Result<Option<crate::metadata_writer::StoredLocation>> {
+        self.block_on(async {
+            let found = sqlx::query_as(crate::metadata_writer::LOCATION_OF_TABLE_SQL)
+                .bind(table_id)
+                .fetch_optional(&self.pool)
+                .await?;
+            Ok(crate::metadata_writer::stored_location(found))
+        })
+    }
+
     fn get_table_column_nullability(
         &self,
         schema_name: &str,
@@ -6582,20 +6593,6 @@ impl MetadataWriter for MySqlMetadataWriter {
                     result.last_insert_id() as i64
                 }
             };
-
-            // A row no commit published yet is this write's now, spelled as this write spells it.
-            for (sql, name, id) in [
-                (crate::metadata_writer::TAKE_UP_PENDING_SCHEMA_SQL, schema_name, schema_id),
-                (crate::metadata_writer::TAKE_UP_PENDING_TABLE_SQL, table_name, table_id),
-            ] {
-                sqlx::query(sql)
-                    .bind(name)
-                    .bind(directory_path(name))
-                    .bind(id)
-                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
-                    .execute(&mut *tx)
-                    .await?;
-            }
 
             // Get existing columns to (a) check schema compatibility for appends
             // and (b) REUSE each column's id (column_id == parquet field_id; an

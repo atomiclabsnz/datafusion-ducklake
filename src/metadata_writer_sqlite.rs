@@ -3662,7 +3662,7 @@ async fn end_replaced_table(
         .iter()
         .flatten()
     {
-        if snapshot_has_change(changes, &created) {
+        if crate::metadata_writer::snapshot_has_named_change(changes, &created) {
             return Err(crate::DuckLakeError::Conflict(format!(
                 "Transaction conflict - attempting to create table \"{table_name}\" in schema \
                  \"{schema_name}\" - but another transaction has created a table with this name"
@@ -4372,12 +4372,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 // snapshot, as `get_or_create_schema` takes it up, not made a second time.
                 Some((schema_id, _)) => {
                     let taken = sqlx::query(
-                        "UPDATE ducklake_schema SET begin_snapshot = ?, path = ?, schema_name = ?
+                        "UPDATE ducklake_schema SET begin_snapshot = ?
                          WHERE schema_id = ? AND begin_snapshot = ?",
                     )
                     .bind(snapshot_id)
-                    .bind(&schema_path)
-                    .bind(schema_name)
                     .bind(schema_id)
                     .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                     .execute(&mut *tx)
@@ -5046,12 +5044,11 @@ impl MetadataWriter for SqliteMetadataWriter {
                     // Only while it is still pending: a commit that stamped it since makes
                     // it committed, and it is returned as found.
                     let taken = sqlx::query(
-                        "UPDATE ducklake_schema SET begin_snapshot = ?, path = ?, schema_name = ?
+                        "UPDATE ducklake_schema SET begin_snapshot = ?, path = COALESCE(?, path)
                          WHERE schema_id = ? AND begin_snapshot = ?",
                     )
                     .bind(snapshot_id)
-                    .bind(directory_path(path.unwrap_or(name)))
-                    .bind(name)
+                    .bind(path.map(directory_path))
                     .bind(schema_id)
                     .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                     .execute(&mut *tx)
@@ -5114,12 +5111,11 @@ impl MetadataWriter for SqliteMetadataWriter {
                 Some((table_id, _)) => {
                     // As for the schema: only while it is still pending.
                     let taken = sqlx::query(
-                        "UPDATE ducklake_table SET begin_snapshot = ?, path = ?, table_name = ?
+                        "UPDATE ducklake_table SET begin_snapshot = ?, path = COALESCE(?, path)
                          WHERE table_id = ? AND begin_snapshot = ?",
                     )
                     .bind(snapshot_id)
-                    .bind(directory_path(path.unwrap_or(name)))
-                    .bind(name)
+                    .bind(path.map(directory_path))
                     .bind(table_id)
                     .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                     .execute(&mut *tx)
@@ -8395,6 +8391,19 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn location_of_table(
+        &self,
+        table_id: i64,
+    ) -> Result<Option<crate::metadata_writer::StoredLocation>> {
+        self.block_on(async {
+            let found = sqlx::query_as(crate::metadata_writer::LOCATION_OF_TABLE_SQL)
+                .bind(table_id)
+                .fetch_optional(&self.pool)
+                .await?;
+            Ok(crate::metadata_writer::stored_location(found))
+        })
+    }
+
     fn get_table_column_nullability(
         &self,
         schema_name: &str,
@@ -8657,20 +8666,6 @@ impl MetadataWriter for SqliteMetadataWriter {
                     row.try_get(0)?
                 }
             };
-
-            // A row no commit published yet is this write's now, spelled as this write spells it.
-            for (sql, name, id) in [
-                (crate::metadata_writer::TAKE_UP_PENDING_SCHEMA_SQL, schema_name, schema_id),
-                (crate::metadata_writer::TAKE_UP_PENDING_TABLE_SQL, table_name, table_id),
-            ] {
-                sqlx::query(sql)
-                    .bind(name)
-                    .bind(directory_path(name))
-                    .bind(id)
-                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
-                    .execute(&mut *tx)
-                    .await?;
-            }
 
             // Get existing columns to (a) check schema compatibility for appends
             // and (b) REUSE each column's id. column_id == parquet field_id == a

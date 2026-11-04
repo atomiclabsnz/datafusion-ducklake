@@ -173,27 +173,24 @@ macro_rules! live_view_named_sql {
     };
 }
 
-/// A write's start takes up a schema row no commit has published yet, of the name in any ASCII
-/// case (one a failed write left, perhaps spelled otherwise), and makes it this write's: its
-/// name as this write spells it and its `path` that name's directory, as a new row would have
-/// them, which is where the write keys its files. Bound: the name, its directory path, the
-/// schema id, [`PENDING_SNAPSHOT`]. A published row is not touched.
-#[cfg(any(
-    feature = "write-sqlite",
-    feature = "host-sqlite",
-    feature = "write-duckdb",
-    feature = "write-mysql"
-))]
-pub(crate) const TAKE_UP_PENDING_SCHEMA_SQL: &str = "UPDATE ducklake_schema SET schema_name = ?, path = ? WHERE schema_id = ? AND begin_snapshot = ?";
-/// [`TAKE_UP_PENDING_SCHEMA_SQL`] for a table row (bound with the table id).
-#[cfg(any(
-    feature = "write-sqlite",
-    feature = "host-sqlite",
-    feature = "write-duckdb",
-    feature = "write-mysql"
-))]
-pub(crate) const TAKE_UP_PENDING_TABLE_SQL: &str =
-    "UPDATE ducklake_table SET table_name = ?, path = ? WHERE table_id = ? AND begin_snapshot = ?";
+/// [`MetadataWriter::location_of_table`]'s SQL: the `path` and `path_is_relative` of the
+/// live table row `table_id`, published or pending, and of its schema row. Bound: the id.
+pub(crate) const LOCATION_OF_TABLE_SQL: &str =
+    "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+     FROM ducklake_table t
+     JOIN ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
+     WHERE t.table_id = ? AND t.end_snapshot IS NULL
+     ORDER BY s.begin_snapshot
+     LIMIT 1";
+/// [`LOCATION_OF_TABLE_SQL`] with a Postgres placeholder.
+#[cfg(feature = "write-postgres")]
+pub(crate) const LOCATION_OF_TABLE_SQL_PG: &str =
+    "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+     FROM ducklake_table t
+     JOIN ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
+     WHERE t.table_id = $1 AND t.end_snapshot IS NULL
+     ORDER BY s.begin_snapshot
+     LIMIT 1";
 
 /// The live table `table_id`'s name and its schema's, as the catalog spells them: what a
 /// `created_table` / `created_schema` change records, as DuckDB records the schema as it is
@@ -910,6 +907,14 @@ pub(crate) fn table_storage_changes(
 
 pub(crate) fn snapshot_has_change(changes: &str, expected: &str) -> bool {
     snapshot_change_tokens(changes).any(|change| change == expected)
+}
+
+/// [`snapshot_has_change`] for a change that names a schema or table
+/// (`created_table:"main"."t"`): the names compared as DuckDB compares them, in any ASCII
+/// case (`catalog_name.rs`). A change records the names as their writer spelled them, which
+/// need not be this caller's spelling.
+pub(crate) fn snapshot_has_named_change(changes: &str, expected: &str) -> bool {
+    snapshot_change_tokens(changes).any(|change| crate::catalog_name::names_match(change, expected))
 }
 
 pub(crate) fn inlined_delete_groups(rows: &[InlinedRowRef]) -> BTreeMap<&str, BTreeSet<i64>> {
@@ -5129,6 +5134,21 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
+    /// Where the live table row `table_id` and its schema keep their files: their `path`
+    /// columns, whether a commit has published the row or not. A write asks this of the row
+    /// its start chose ([`WriteSetupResult::table_id`]): a row its start made, one another
+    /// write's start made and has not committed (names are found in any ASCII case, so
+    /// `"NewT"` and `newt` are one row), or one an abandoned write left. Its files go where
+    /// that row says, never where the name the write was given would put them, and the row
+    /// is never renamed: another write may own it. `None`: no such row yet (a backend that
+    /// reserves the id and inserts the row at the commit, as the multi-catalog Postgres layout
+    /// does), and the write keys its files by [`Self::stored_location`] and the names.
+    ///
+    /// The default answers `None`.
+    fn location_of_table(&self, _table_id: i64) -> Result<Option<StoredLocation>> {
+        Ok(None)
+    }
+
     /// Return the live top-level column nullability for an existing table.
     ///
     /// `None` means the table does not exist. Writers use this read-only lookup
@@ -5499,6 +5519,28 @@ mod tests {
             error.contains("attempting to delete from table with index \"7\""),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_named_change_matches_in_any_ascii_case() {
+        let recorded =
+            r#"created_schema:"Staging",created_table:"Staging"."Orders",altered_table:3"#;
+        assert!(snapshot_has_named_change(
+            recorded,
+            r#"created_table:"staging"."ORDERS""#
+        ));
+        assert!(!snapshot_has_change(
+            recorded,
+            r#"created_table:"staging"."ORDERS""#
+        ));
+        assert!(!snapshot_has_named_change(
+            recorded,
+            r#"created_table:"Staging"."Order""#
+        ));
+        assert!(!snapshot_has_named_change(
+            r#"created_table:"main"."Ärger""#,
+            r#"created_table:"main"."ärger""#
+        ));
     }
 
     #[test]
