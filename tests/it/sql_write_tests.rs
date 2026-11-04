@@ -138,6 +138,70 @@ async fn test_create_table_as_select_rejects_rows_without_publishing_metadata() 
     );
 }
 
+/// A provider that is not a table with no rows — `CREATE VIEW`'s `ViewTable`, `CREATE EXTERNAL
+/// TABLE`'s `ListingTable` — is refused, not published as an empty table of its columns, and
+/// nothing is written (ferrion#611).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_view_or_external_table_is_refused_not_made_an_empty_table() {
+    let (ctx, temp_dir) = create_writable_catalog_with_main_schema().await;
+    let csv = temp_dir.path().join("rows.csv");
+    std::fs::write(&csv, "id\n1\n2\n").unwrap();
+    let connection = format!(
+        "sqlite:{}?mode=rwc",
+        temp_dir.path().join("test.db").display()
+    );
+    let provider = SqliteMetadataProvider::new(&connection).await.unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let schema = provider
+        .get_schema_by_name("main", snapshot)
+        .unwrap()
+        .unwrap();
+    for (name, sql, kind) in [
+        (
+            "v",
+            "CREATE VIEW ducklake.main.v AS SELECT 1 AS id".to_string(),
+            "a view",
+        ),
+        (
+            "e",
+            format!(
+                "CREATE EXTERNAL TABLE ducklake.main.e STORED AS CSV LOCATION '{}' \
+                 OPTIONS ('format.has_header' 'true')",
+                csv.display()
+            ),
+            "a table read from elsewhere",
+        ),
+    ] {
+        let error = match ctx.sql(&sql).await {
+            Ok(frame) => frame.collect().await.expect_err(&sql),
+            Err(e) => e,
+        };
+        assert!(error.to_string().contains(kind), "{sql}: {error}");
+        assert!(
+            !provider
+                .table_exists(
+                    schema.schema_id,
+                    name,
+                    provider.get_current_snapshot().unwrap()
+                )
+                .unwrap(),
+            "{sql}: no table published"
+        );
+    }
+    assert_eq!(
+        provider.get_current_snapshot().unwrap(),
+        snapshot,
+        "no snapshot written"
+    );
+    // An empty CREATE TABLE … AS still makes its table.
+    ctx.sql("CREATE TABLE ducklake.main.ok AS SELECT 1 AS id WHERE false")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_legacy_catalog_without_view_metadata_keeps_empty_ctas_working() {
     let (ctx, temp_dir) = create_writable_catalog_with_main_schema().await;
