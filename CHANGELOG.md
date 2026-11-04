@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `MetadataWriter::stored_location`: where a live schema and table keep their files (their `path`s).
+- `MetadataWriter::stored_location` and `location_of_table`: where a schema and table keep their files.
 - `WriteMode::CreateOrReplace` and `DuckLakeTableWriter::create_or_replace_table`: DuckDB's
   `CREATE OR REPLACE TABLE`, a new table in one snapshot, on SQLite (ferrion#611).
 - Standalone DDL as its own snapshot, as DuckDB 1.5.6 writes it (#18): `MetadataWriter::{create_schema,
