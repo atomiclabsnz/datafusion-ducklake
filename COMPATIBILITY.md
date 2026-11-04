@@ -923,7 +923,7 @@ Known edges:
   table and view names follow DuckDB on every backend (#17 item 1, ferrion#708): stored as
   written, found in any ASCII case (`Ä` does not fold, as it does not in DuckDB), and two live
   names of one schema may not differ only by case, whatever their kinds. A write's files go
-  under the name as the catalog spells it, and a `CREATE OR REPLACE` stores its own spelling.
+  under the table's `path`, which a rename keeps, and a `CREATE OR REPLACE` stores its own spelling.
   `tests/it/name_case_tests.rs` pins the rule against DuckDB 1.5.6.
 - Every commit path is fenced on the table's live partition generation, so a file inconsistent
   with the live spec is never committed — never one stamped with a retired `partition_id`, and

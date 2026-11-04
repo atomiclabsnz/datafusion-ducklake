@@ -200,8 +200,9 @@ The `DuckLakeTable` provider handles URL resolution by:
 - Schema, table and view names follow DuckDB: stored as written, found in any ASCII case
   (`src/catalog_name.rs`, pinned against DuckDB in `tests/it/name_case_tests.rs`)
 - Every SQL lookup or comparison of such a name is `name_eq!(dialect, left, right)`, never a bare
-  `=`; a Rust comparison is `names_match`. A table's object-store key uses the catalog's
-  spelling (`MetadataWriter::stored_spelling`), not the caller's
+  `=`; a Rust comparison is `names_match`. A table's object-store key is its live, published
+  schema's and table's `path` columns (`MetadataWriter::stored_location`), never a name: a
+  rename keeps the path, and a pending row is never chosen
 
 ### Snapshot Isolation
 - DuckLake uses snapshot IDs for temporal consistency
