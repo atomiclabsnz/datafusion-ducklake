@@ -387,7 +387,7 @@ fn canonical_schema<'a>(
 ) -> std::result::Result<&'a str, ()> {
     let mut creation_matches = creation_schemas
         .iter()
-        .filter(|schema| schema.schema_name.eq_ignore_ascii_case(&identifier.value));
+        .filter(|schema| crate::catalog_name::names_match(&schema.schema_name, &identifier.value));
     let created = creation_matches.next().ok_or(())?;
     if creation_matches.next().is_some() {
         return Err(());
@@ -399,9 +399,7 @@ fn canonical_schema<'a>(
     if visible_matches.next().is_some() {
         return Err(());
     }
-    visible
-        .schema_name
-        .eq_ignore_ascii_case(&identifier.value)
+    crate::catalog_name::names_match(&visible.schema_name, &identifier.value)
         .then_some(visible.schema_name.as_str())
         .ok_or(())
 }

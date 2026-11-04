@@ -1065,11 +1065,7 @@ impl DuckLakeTableWriter {
         // skip the segment, preserving the historical `{schema}/{table}/…`
         // layout. `cat_` prefix + numeric id is rename-safe and needs no
         // sanitisation.
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.write_table_key(schema_name, table_name, mode)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,
@@ -1105,11 +1101,7 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         mode: WriteMode,
     ) -> Result<TableWriteSession> {
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.write_table_key(schema_name, table_name, mode)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,
@@ -1162,11 +1154,7 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         mode: WriteMode,
     ) -> Result<TableWriteSession> {
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.write_table_key(schema_name, table_name, mode)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,
@@ -1808,11 +1796,7 @@ impl DuckLakeTableWriter {
         table_name: &str,
         file_name: &str,
     ) -> Result<ObjectPath> {
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
         let object_path_str = join_paths(&table_key, file_name)?;
         // Strip leading slash for object_store Path (it expects relative keys).
         Ok(ObjectPath::from(object_path_str.trim_start_matches('/')))
@@ -1962,11 +1946,7 @@ impl DuckLakeTableWriter {
         written: &mut Vec<ObjectPath>,
     ) -> Result<Vec<DataFileInfo>> {
         self.refuse_encrypted_parquet("write a data file")?;
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
         let schema_with_ids = {
             let base = build_schema_with_field_ids(data_schema, data_column_ids)?;
             let mut fields: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
@@ -2122,11 +2102,7 @@ impl DuckLakeTableWriter {
         partition_subpath: Option<&str>,
     ) -> Result<DataFileInfo> {
         self.refuse_encrypted_parquet("write a compacted data file")?;
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
         // A compacted file of a partitioned table lands in its partition's Hive
         // directory, like every other write of that partition; the returned
         // `DataFileInfo.path` is relative to the table dir either way.
@@ -2423,11 +2399,7 @@ impl DuckLakeTableWriter {
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
 
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
 
         let groups = match &sort_spec {
             Some(spec) => groups
@@ -2666,11 +2638,7 @@ impl DuckLakeTableWriter {
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
 
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
 
         let partition = if resolve_layout {
             self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
@@ -2829,11 +2797,7 @@ impl DuckLakeTableWriter {
 
         let schema_with_ids =
             Arc::new(build_schema_with_field_ids(arrow_schema, &setup.field_ids)?);
-        let scoped_base = match self.metadata.catalog_id() {
-            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
-            None => self.base_key_path.clone(),
-        };
-        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let table_key = self.table_key(schema_name, table_name)?;
         let partition = if resolve_layout {
             self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
         } else {
@@ -2867,9 +2831,7 @@ impl DuckLakeTableWriter {
         };
         let object_paths = file_infos
             .iter()
-            .map(|file| {
-                self.staged_object_path(schema_name, table_name, &file.path, file.path_is_relative)
-            })
+            .map(|file| object_key(&table_key, &file.path, file.path_is_relative))
             .collect::<Result<Vec<_>>>()?;
         let records_written = file_infos.iter().map(|file| file.record_count).sum();
         let files_written = file_infos.len();
@@ -2950,12 +2912,14 @@ impl DuckLakeTableWriter {
         if !rolled_back(&error) {
             return error;
         }
-        let objects = files
-            .into_iter()
-            .map(|(path, is_relative)| {
-                self.staged_object_path(schema_name, table_name, path, is_relative)
-            })
-            .collect::<Result<Vec<_>>>();
+        let objects = self
+            .table_key(schema_name, table_name)
+            .and_then(|table_key| {
+                files
+                    .into_iter()
+                    .map(|(path, is_relative)| object_key(&table_key, path, is_relative))
+                    .collect::<Result<Vec<_>>>()
+            });
         match objects {
             Ok(objects) => {
                 for failure in remove_objects(&self.object_store, objects).await {
@@ -2978,12 +2942,12 @@ impl DuckLakeTableWriter {
         table_name: &str,
         files: Vec<(String, bool)>,
     ) {
+        let Ok(table_key) = self.table_key(schema_name, table_name) else {
+            return;
+        };
         let paths = files
             .iter()
-            .filter_map(|(path, relative)| {
-                self.staged_object_path(schema_name, table_name, path, *relative)
-                    .ok()
-            })
+            .filter_map(|(path, relative)| object_key(&table_key, path, *relative).ok())
             .collect();
         for failure in remove_objects(&self.object_store, paths).await {
             tracing::warn!(error = %failure, "failed to remove an unstaged file");
@@ -3004,13 +2968,36 @@ impl DuckLakeTableWriter {
         )
     }
 
-    /// Object-store key of a table's directory: `{base}/[cat_{id}/]{schema}/{table}`.
+    /// [`Self::table_key`] for a write about to begin in `mode`: a `CREATE OR REPLACE` makes a
+    /// new table of the spelling it is given, so its files go under that spelling, not under
+    /// the spelling of the table it replaces.
+    fn write_table_key(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        mode: WriteMode,
+    ) -> Result<String> {
+        if mode != WriteMode::CreateOrReplace {
+            return self.table_key(schema_name, table_name);
+        }
+        let scoped_base = match self.metadata.catalog_id() {
+            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+            None => self.base_key_path.clone(),
+        };
+        let (schema_name, _) = self.metadata.stored_spelling(schema_name, table_name)?;
+        join_paths(&join_paths(&scoped_base, &schema_name)?, table_name)
+    }
+
+    /// Object-store key of a table's directory: `{base}/[cat_{id}/]{schema}/{table}`, each
+    /// name as the catalog spells it ([`MetadataWriter::stored_spelling`]): a name is found in
+    /// any ASCII case, as DuckDB finds it, but its directory is the one its spelling made.
     fn table_key(&self, schema_name: &str, table_name: &str) -> Result<String> {
         let scoped_base = match self.metadata.catalog_id() {
             Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
             None => self.base_key_path.clone(),
         };
-        join_paths(&join_paths(&scoped_base, schema_name)?, table_name)
+        let (schema_name, table_name) = self.metadata.stored_spelling(schema_name, table_name)?;
+        join_paths(&join_paths(&scoped_base, &schema_name)?, &table_name)
     }
 
     /// The id the catalog's next snapshot is expected to take, or `None` when

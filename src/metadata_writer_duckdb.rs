@@ -2270,7 +2270,7 @@ fn refuse_view_at_start(tx: &Transaction<'_>, schema_id: i64, table_name: &str) 
     }
     let view = tx
         .query_row(
-            crate::metadata_writer::LIVE_VIEW_NAMED_SQL,
+            crate::metadata_writer::LIVE_VIEW_NAMED_SQL_DUCKDB,
             params![schema_id, table_name],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
@@ -2286,7 +2286,7 @@ fn refuse_view_at_commit(tx: &Transaction<'_>, table_id: i64) -> Result<()> {
     }
     let view = tx
         .query_row(
-            crate::metadata_writer::LIVE_VIEW_OF_TABLE_SQL,
+            crate::metadata_writer::LIVE_VIEW_OF_TABLE_SQL_DUCKDB,
             params![table_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
@@ -3247,9 +3247,13 @@ impl DuckdbMetadataWriter {
         let conn = self.connection();
         let schema_id: Option<i64> = conn
             .query_row(
-                "SELECT schema_id FROM ducklake_schema
-                 WHERE schema_name = ? AND end_snapshot IS NULL
-                   AND begin_snapshot <> ?",
+                concat!(
+                    "SELECT schema_id FROM ducklake_schema
+                 WHERE ",
+                    crate::catalog_name::name_eq!(duckdb, "schema_name", "?"),
+                    " AND end_snapshot IS NULL
+                   AND begin_snapshot <> ?"
+                ),
                 params![schema_name, crate::metadata_writer::PENDING_SNAPSHOT],
                 |row| row.get(0),
             )
@@ -3257,9 +3261,13 @@ impl DuckdbMetadataWriter {
         let table_id: Option<i64> = match schema_id {
             Some(schema_id) => conn
                 .query_row(
-                    "SELECT table_id FROM ducklake_table
-                     WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL
-                   AND begin_snapshot <> ?",
+                    concat!(
+                        "SELECT table_id FROM ducklake_table
+                     WHERE schema_id = ? AND ",
+                        crate::catalog_name::name_eq!(duckdb, "table_name", "?"),
+                        " AND end_snapshot IS NULL
+                   AND begin_snapshot <> ?"
+                    ),
                     params![schema_id, table_name, crate::metadata_writer::PENDING_SNAPSHOT],
                     |row| row.get(0),
                 )
@@ -3585,9 +3593,13 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // second time beside it.
         let existing: Option<(i64, i64)> = tx
             .query_row(
-                "SELECT schema_id, begin_snapshot FROM ducklake_schema
-                 WHERE schema_name = ? AND end_snapshot IS NULL
-                 ORDER BY begin_snapshot LIMIT 1",
+                concat!(
+                    "SELECT schema_id, begin_snapshot FROM ducklake_schema
+                 WHERE ",
+                    crate::catalog_name::name_eq!(duckdb, "schema_name", "?"),
+                    " AND end_snapshot IS NULL
+                 ORDER BY begin_snapshot LIMIT 1"
+                ),
                 params![name],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -3647,9 +3659,13 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // As `get_or_create_schema`: a pending table is taken up, not made twice.
         let existing: Option<(i64, i64)> = tx
             .query_row(
-                "SELECT table_id, begin_snapshot FROM ducklake_table
-                 WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL
-                 ORDER BY begin_snapshot LIMIT 1",
+                concat!(
+                    "SELECT table_id, begin_snapshot FROM ducklake_table
+                 WHERE schema_id = ? AND ",
+                    crate::catalog_name::name_eq!(duckdb, "table_name", "?"),
+                    " AND end_snapshot IS NULL
+                 ORDER BY begin_snapshot LIMIT 1"
+                ),
                 params![schema_id, name],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -4190,13 +4206,19 @@ impl MetadataWriter for DuckdbMetadataWriter {
     fn table_types_support_inlining(&self, schema_name: &str, table_name: &str) -> Result<bool> {
         let refused: bool = self.connection().query_row(
             &format!(
-                "SELECT EXISTS(
+                concat!(
+                    "SELECT EXISTS(
                      SELECT 1 FROM ducklake_column c
                      JOIN ducklake_table t ON t.table_id = c.table_id
                      JOIN ducklake_schema s ON s.schema_id = t.schema_id
-                     WHERE s.schema_name = ? AND s.end_snapshot IS NULL
-                       AND t.table_name = ? AND t.end_snapshot IS NULL
-                       AND c.end_snapshot IS NULL AND LOWER(c.column_type) IN ({}))",
+                     WHERE ",
+                    crate::catalog_name::name_eq!(duckdb, "s.schema_name", "?"),
+                    " AND s.end_snapshot IS NULL
+                       AND ",
+                    crate::catalog_name::name_eq!(duckdb, "t.table_name", "?"),
+                    " AND t.end_snapshot IS NULL
+                       AND c.end_snapshot IS NULL AND LOWER(c.column_type) IN ({}))"
+                ),
                 crate::types::sql_uninlinable_types()
             ),
             params![schema_name, table_name],
@@ -5662,22 +5684,42 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
     }
 
+    fn stored_spelling(&self, schema_name: &str, table_name: &str) -> Result<(String, String)> {
+        let conn = self.connection();
+        let found = conn
+            .query_row(
+                crate::metadata_writer::STORED_SPELLING_SQL_DUCKDB,
+                params![schema_name, table_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(crate::metadata_writer::stored_spelling(
+            found,
+            schema_name,
+            table_name,
+        ))
+    }
+
     fn get_table_column_nullability(
         &self,
         schema_name: &str,
         table_name: &str,
     ) -> Result<Option<Vec<(String, bool)>>> {
         let conn = self.connection();
-        let mut statement = conn.prepare(
+        let mut statement = conn.prepare(concat!(
             "SELECT c.column_name, c.nulls_allowed
              FROM ducklake_column c
              JOIN ducklake_table t ON t.table_id = c.table_id
              JOIN ducklake_schema s ON s.schema_id = t.schema_id
-             WHERE s.schema_name = ? AND s.end_snapshot IS NULL
-               AND t.table_name = ? AND t.end_snapshot IS NULL
+             WHERE ",
+            crate::catalog_name::name_eq!(duckdb, "s.schema_name", "?"),
+            " AND s.end_snapshot IS NULL
+               AND ",
+            crate::catalog_name::name_eq!(duckdb, "t.table_name", "?"),
+            " AND t.end_snapshot IS NULL
                AND c.end_snapshot IS NULL AND c.parent_column IS NULL
-             ORDER BY c.column_order",
-        )?;
+             ORDER BY c.column_order"
+        ))?;
         let rows = statement.query_map(params![schema_name, table_name], |row| {
             let name: String = row.get(0)?;
             let nullable: Option<bool> = row.get(1)?;
@@ -5815,8 +5857,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let schema_id: i64 = {
             let existing: Option<i64> = tx
                 .query_row(
-                    "SELECT schema_id FROM ducklake_schema
-                     WHERE schema_name = ? AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1",
+                    concat!(
+                        "SELECT schema_id FROM ducklake_schema
+                     WHERE ",
+                        crate::catalog_name::name_eq!(duckdb, "schema_name", "?"),
+                        " AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1"
+                    ),
                     params![schema_name],
                     |row| row.get(0),
                 )
@@ -5835,8 +5881,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let table_id: i64 = {
             let existing: Option<i64> = tx
                 .query_row(
-                    "SELECT table_id FROM ducklake_table
-                     WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1",
+                    concat!(
+                        "SELECT table_id FROM ducklake_table
+                     WHERE schema_id = ? AND ",
+                        crate::catalog_name::name_eq!(duckdb, "table_name", "?"),
+                        " AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1"
+                    ),
                     params![schema_id, table_name],
                     |row| row.get(0),
                 )

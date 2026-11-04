@@ -2179,7 +2179,7 @@ async fn refuse_view_at_start(
         return Ok(());
     }
     let view: Option<(String, String)> =
-        sqlx::query_as(crate::metadata_writer::LIVE_VIEW_NAMED_SQL)
+        sqlx::query_as(crate::metadata_writer::LIVE_VIEW_NAMED_SQL_MYSQL)
             .bind(schema_id)
             .bind(table_name)
             .fetch_optional(&mut **tx)
@@ -2197,7 +2197,7 @@ async fn refuse_view_at_commit(
         return Ok(());
     }
     let view: Option<(String, String)> =
-        sqlx::query_as(crate::metadata_writer::LIVE_VIEW_OF_TABLE_SQL)
+        sqlx::query_as(crate::metadata_writer::LIVE_VIEW_OF_TABLE_SQL_MYSQL)
             .bind(table_id)
             .fetch_optional(&mut **tx)
             .await?;
@@ -3355,22 +3355,26 @@ impl MySqlMetadataWriter {
         Option<i64>,
     )> {
         self.block_on(async {
-            let schema_id: Option<i64> = sqlx::query_scalar(
+            let schema_id: Option<i64> = sqlx::query_scalar(concat!(
                 "SELECT schema_id FROM ducklake_schema
-                 WHERE schema_name = ? AND end_snapshot IS NULL
-                   AND begin_snapshot <> ?",
-            )
+                 WHERE ",
+                crate::catalog_name::name_eq!(mysql, "schema_name", "?"),
+                " AND end_snapshot IS NULL
+                   AND begin_snapshot <> ?"
+            ))
             .bind(schema_name)
             .bind(crate::metadata_writer::PENDING_SNAPSHOT)
             .fetch_optional(&self.pool)
             .await?;
             let table_id: Option<i64> = match schema_id {
                 Some(schema_id) => {
-                    sqlx::query_scalar(
+                    sqlx::query_scalar(concat!(
                         "SELECT table_id FROM ducklake_table
-                         WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL
-                   AND begin_snapshot <> ?",
-                    )
+                         WHERE schema_id = ? AND ",
+                        crate::catalog_name::name_eq!(mysql, "table_name", "?"),
+                        " AND end_snapshot IS NULL
+                   AND begin_snapshot <> ?"
+                    ))
                     .bind(schema_id)
                     .bind(table_name)
                     .bind(crate::metadata_writer::PENDING_SNAPSHOT)
@@ -3735,9 +3739,9 @@ impl MetadataWriter for MySqlMetadataWriter {
             // committed (pending) is taken up, created here at this snapshot, rather than
             // made a second time beside it.
             let existing: Option<(i64, i64)> = sqlx::query_as(
-                "SELECT schema_id, begin_snapshot FROM ducklake_schema
-                 WHERE schema_name = ? AND end_snapshot IS NULL
-                 ORDER BY begin_snapshot LIMIT 1",
+                concat!("SELECT schema_id, begin_snapshot FROM ducklake_schema
+                 WHERE ", crate::catalog_name::name_eq!(mysql, "schema_name", "?"), " AND end_snapshot IS NULL
+                 ORDER BY begin_snapshot LIMIT 1"),
             )
             .bind(name)
             .fetch_optional(&mut *tx)
@@ -3807,9 +3811,9 @@ impl MetadataWriter for MySqlMetadataWriter {
             let mut tx = self.pool.begin().await?;
             // As `get_or_create_schema`: a pending table is taken up, not made twice.
             let existing: Option<(i64, i64)> = sqlx::query_as(
-                "SELECT table_id, begin_snapshot FROM ducklake_table
-                 WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL
-                 ORDER BY begin_snapshot LIMIT 1",
+                concat!("SELECT table_id, begin_snapshot FROM ducklake_table
+                 WHERE schema_id = ? AND ", crate::catalog_name::name_eq!(mysql, "table_name", "?"), " AND end_snapshot IS NULL
+                 ORDER BY begin_snapshot LIMIT 1"),
             )
             .bind(schema_id)
             .bind(name)
@@ -4423,13 +4427,19 @@ impl MetadataWriter for MySqlMetadataWriter {
     fn table_types_support_inlining(&self, schema_name: &str, table_name: &str) -> Result<bool> {
         self.block_on(async {
             let refused: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT EXISTS(
+                concat!(
+                    "SELECT EXISTS(
                      SELECT 1 FROM ducklake_column c
                      JOIN ducklake_table t ON t.table_id = c.table_id
                      JOIN ducklake_schema s ON s.schema_id = t.schema_id
-                     WHERE s.schema_name = ? AND s.end_snapshot IS NULL
-                       AND t.table_name = ? AND t.end_snapshot IS NULL
-                       AND c.end_snapshot IS NULL AND LOWER(c.column_type) IN ({}))",
+                     WHERE ",
+                    crate::catalog_name::name_eq!(mysql, "s.schema_name", "?"),
+                    " AND s.end_snapshot IS NULL
+                       AND ",
+                    crate::catalog_name::name_eq!(mysql, "t.table_name", "?"),
+                    " AND t.end_snapshot IS NULL
+                       AND c.end_snapshot IS NULL AND LOWER(c.column_type) IN ({}))"
+                ),
                 crate::types::sql_uninlinable_types()
             )))
             .bind(schema_name)
@@ -6172,22 +6182,41 @@ impl MetadataWriter for MySqlMetadataWriter {
         })
     }
 
+    fn stored_spelling(&self, schema_name: &str, table_name: &str) -> Result<(String, String)> {
+        self.block_on(async {
+            let found = sqlx::query_as(crate::metadata_writer::STORED_SPELLING_SQL_MYSQL)
+                .bind(schema_name)
+                .bind(table_name)
+                .fetch_optional(&self.pool)
+                .await?;
+            Ok(crate::metadata_writer::stored_spelling(
+                found,
+                schema_name,
+                table_name,
+            ))
+        })
+    }
+
     fn get_table_column_nullability(
         &self,
         schema_name: &str,
         table_name: &str,
     ) -> Result<Option<Vec<(String, bool)>>> {
         self.block_on(async {
-            let rows = sqlx::query(
+            let rows = sqlx::query(concat!(
                 "SELECT c.column_name, c.nulls_allowed
                  FROM ducklake_column c
                  JOIN ducklake_table t ON t.table_id = c.table_id
                  JOIN ducklake_schema s ON s.schema_id = t.schema_id
-                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL
-                   AND t.table_name = ? AND t.end_snapshot IS NULL
+                 WHERE ",
+                crate::catalog_name::name_eq!(mysql, "s.schema_name", "?"),
+                " AND s.end_snapshot IS NULL
+                   AND ",
+                crate::catalog_name::name_eq!(mysql, "t.table_name", "?"),
+                " AND t.end_snapshot IS NULL
                    AND c.end_snapshot IS NULL AND c.parent_column IS NULL
-                 ORDER BY c.column_order",
-            )
+                 ORDER BY c.column_order"
+            ))
             .bind(schema_name)
             .bind(table_name)
             .fetch_all(&self.pool)
@@ -6490,8 +6519,8 @@ impl MetadataWriter for MySqlMetadataWriter {
 
             let schema_id: i64 = {
                 let existing = sqlx::query(
-                    "SELECT schema_id FROM ducklake_schema
-                     WHERE schema_name = ? AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1",
+                    concat!("SELECT schema_id FROM ducklake_schema
+                     WHERE ", crate::catalog_name::name_eq!(mysql, "schema_name", "?"), " AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1"),
                 )
                 .bind(schema_name)
                 .fetch_optional(&mut *tx)
@@ -6515,8 +6544,8 @@ impl MetadataWriter for MySqlMetadataWriter {
 
             let table_id: i64 = {
                 let existing = sqlx::query(
-                    "SELECT table_id FROM ducklake_table
-                     WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1",
+                    concat!("SELECT table_id FROM ducklake_table
+                     WHERE schema_id = ? AND ", crate::catalog_name::name_eq!(mysql, "table_name", "?"), " AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1"),
                 )
                 .bind(schema_id)
                 .bind(table_name)

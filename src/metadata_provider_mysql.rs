@@ -2162,12 +2162,14 @@ impl MetadataProvider for MySqlMetadataProvider {
 
     fn get_schema_by_name(&self, name: &str, snapshot_id: i64) -> Result<Option<SchemaMetadata>> {
         block_on(async {
-            let row = sqlx::query(
+            let row = sqlx::query(concat!(
                 "SELECT schema_id, schema_name, path, path_is_relative FROM ducklake_schema
-                 WHERE schema_name = ?
+                 WHERE ",
+                crate::catalog_name::name_eq!(mysql, "schema_name", "?"),
+                "
                    AND ? >= begin_snapshot
-                   AND (? < end_snapshot OR end_snapshot IS NULL)",
-            )
+                   AND (? < end_snapshot OR end_snapshot IS NULL)"
+            ))
             .bind(name)
             .bind(snapshot_id)
             .bind(snapshot_id)
@@ -2193,13 +2195,15 @@ impl MetadataProvider for MySqlMetadataProvider {
         snapshot_id: i64,
     ) -> Result<Option<TableMetadata>> {
         block_on(async {
-            let row = sqlx::query(
+            let row = sqlx::query(concat!(
                 "SELECT table_id, table_name, path, path_is_relative FROM ducklake_table
                  WHERE schema_id = ?
-                   AND table_name = ?
+                   AND ",
+                crate::catalog_name::name_eq!(mysql, "table_name", "?"),
+                "
                    AND ? >= begin_snapshot
-                   AND (? < end_snapshot OR end_snapshot IS NULL)",
-            )
+                   AND (? < end_snapshot OR end_snapshot IS NULL)"
+            ))
             .bind(schema_id)
             .bind(name)
             .bind(snapshot_id)
@@ -2230,12 +2234,12 @@ impl MetadataProvider for MySqlMetadataProvider {
                 return Ok(None);
             }
             let row = sqlx::query(
-                "SELECT view_id, schema_id, begin_snapshot, view_name, dialect, `sql`, column_aliases
+                concat!("SELECT view_id, schema_id, begin_snapshot, view_name, dialect, `sql`, column_aliases
                  FROM ducklake_view
                  WHERE schema_id = ?
-                   AND view_name = ?
+                   AND ", crate::catalog_name::name_eq!(mysql, "view_name", "?"), "
                    AND ? >= begin_snapshot
-                   AND (? < end_snapshot OR end_snapshot IS NULL)",
+                   AND (? < end_snapshot OR end_snapshot IS NULL)"),
             )
             .bind(schema_id)
             .bind(name)
@@ -2252,13 +2256,15 @@ impl MetadataProvider for MySqlMetadataProvider {
         block_on(async {
             // MySQL doesn't support SELECT EXISTS(...) the same way PostgreSQL does
             // Use COUNT instead
-            let row = sqlx::query(
+            let row = sqlx::query(concat!(
                 "SELECT COUNT(*) FROM ducklake_table
                  WHERE schema_id = ?
-                   AND table_name = ?
+                   AND ",
+                crate::catalog_name::name_eq!(mysql, "table_name", "?"),
+                "
                    AND ? >= begin_snapshot
-                   AND (? < end_snapshot OR end_snapshot IS NULL)",
-            )
+                   AND (? < end_snapshot OR end_snapshot IS NULL)"
+            ))
             .bind(schema_id)
             .bind(name)
             .bind(snapshot_id)
@@ -2332,11 +2338,13 @@ impl MetadataProvider for MySqlMetadataProvider {
         snapshot_id: i64,
     ) -> Result<Option<i64>> {
         block_on(async {
-            let result = sqlx::query(
+            let result = sqlx::query(concat!(
                 "SELECT view_id FROM ducklake_view
-                 WHERE schema_id = ? AND view_name = ? AND ? >= begin_snapshot
-                   AND (? < end_snapshot OR end_snapshot IS NULL)",
-            )
+                 WHERE schema_id = ? AND ",
+                crate::catalog_name::name_eq!(mysql, "view_name", "?"),
+                " AND ? >= begin_snapshot
+                   AND (? < end_snapshot OR end_snapshot IS NULL)"
+            ))
             .bind(schema_id)
             .bind(name)
             .bind(snapshot_id)

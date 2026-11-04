@@ -41,16 +41,20 @@ pub(crate) async fn drop_live_table(
     // Filters on `end_snapshot IS NULL` on both schema and table so
     // an already-tombstoned table is treated as not-found and the
     // call becomes an idempotent no-op.
-    let table_id: i64 = match sqlx::query(
+    let table_id: i64 = match sqlx::query(concat!(
         "SELECT t.table_id FROM ducklake_table t
              JOIN ducklake_schema s ON s.schema_id = t.schema_id
              JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
              WHERE m.catalog_id = $1
-               AND s.schema_name = $2
+               AND ",
+        crate::catalog_name::name_eq!(postgres, "s.schema_name", "$2"),
+        "
                AND s.end_snapshot IS NULL
-               AND t.table_name = $3
-               AND t.end_snapshot IS NULL",
-    )
+               AND ",
+        crate::catalog_name::name_eq!(postgres, "t.table_name", "$3"),
+        "
+               AND t.end_snapshot IS NULL"
+    ))
     .bind(catalog_id)
     .bind(schema_name)
     .bind(table_name)

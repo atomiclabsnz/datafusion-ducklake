@@ -73,6 +73,7 @@
 //! worth knowing if you are counting them.
 
 pub mod catalog;
+pub(crate) mod catalog_name;
 mod catalog_read_memo;
 pub mod change_detection;
 pub mod column_rename;

@@ -136,11 +136,12 @@ pub(crate) fn view_exists_error(table: impl std::fmt::Display) -> DuckLakeError 
     ))
 }
 
-/// The view checks' SQL, one text per check, spelled once for each placeholder style:
-/// `?` (SQLite, DuckDB, MySQL) and `$n` (Postgres). Each finds the live view that holds a
-/// table's name, as `(schema_name, view_name)`, for [`refuse_live_view`].
+/// The view checks' SQL, one text per check, spelled once for each SQL dialect (its
+/// placeholder style and its name comparison, [`crate::catalog_name`]). Each finds the live view
+/// that holds a table's name in any ASCII case, as `(schema_name, view_name)`, for
+/// [`refuse_live_view`].
 macro_rules! live_view_of_table_sql {
-    ($table_id:literal) => {
+    ($dialect:ident, $table_id:literal) => {
         concat!(
             "SELECT schema_meta.schema_name, view_meta.view_name FROM ducklake_view view_meta
              JOIN ducklake_table table_meta ON table_meta.schema_id = view_meta.schema_id
@@ -148,38 +149,98 @@ macro_rules! live_view_of_table_sql {
              WHERE table_meta.table_id = ",
             $table_id,
             " AND table_meta.end_snapshot IS NULL
-               AND view_meta.view_name = table_meta.table_name
+               AND ",
+            crate::catalog_name::name_eq!($dialect, "view_meta.view_name", "table_meta.table_name"),
+            "
                AND view_meta.end_snapshot IS NULL
              LIMIT 1"
         )
     };
 }
+#[cfg(any(feature = "write-duckdb", feature = "write-mysql", feature = "write-postgres"))]
 macro_rules! live_view_named_sql {
-    ($schema_id:literal, $name:literal) => {
+    ($dialect:ident, $schema_id:literal, $name:literal) => {
         concat!(
             "SELECT schema_meta.schema_name, view_meta.view_name FROM ducklake_view view_meta
              JOIN ducklake_schema schema_meta ON schema_meta.schema_id = view_meta.schema_id
              WHERE view_meta.schema_id = ",
             $schema_id,
-            " AND view_meta.view_name = ",
-            $name,
+            " AND ",
+            crate::catalog_name::name_eq!($dialect, "view_meta.view_name", $name),
             " AND view_meta.end_snapshot IS NULL
              LIMIT 1"
         )
     };
 }
 
+/// [`MetadataWriter::stored_spelling`]'s SQL, spelled once per dialect: the live schema named
+/// by the first parameter and its live table named by the second, each in any ASCII case, as
+/// `(schema_name, table_name)` with the table `NULL` when there is none. No row: no schema.
+/// The newest table row first: a `CREATE OR REPLACE` under way has made its pending table, of
+/// the spelling it was given, beside the live one it replaces.
+macro_rules! stored_spelling_sql {
+    ($dialect:ident, $schema:literal, $table:literal) => {
+        concat!(
+            "SELECT s.schema_name, t.table_name
+             FROM (SELECT schema_id, schema_name, begin_snapshot FROM ducklake_schema
+                   WHERE end_snapshot IS NULL AND ",
+            crate::catalog_name::name_eq!($dialect, "schema_name", $schema),
+            ") s
+             LEFT JOIN ducklake_table t ON t.schema_id = s.schema_id AND t.end_snapshot IS NULL
+               AND ",
+            crate::catalog_name::name_eq!($dialect, "t.table_name", $table),
+            "
+             ORDER BY s.begin_snapshot, t.begin_snapshot DESC
+             LIMIT 1"
+        )
+    };
+}
+#[cfg(any(feature = "write-sqlite", feature = "host-sqlite"))]
+pub(crate) const STORED_SPELLING_SQL_SQLITE: &str = stored_spelling_sql!(sqlite, "?", "?");
+#[cfg(feature = "write-duckdb")]
+pub(crate) const STORED_SPELLING_SQL_DUCKDB: &str = stored_spelling_sql!(duckdb, "?", "?");
+#[cfg(feature = "write-mysql")]
+pub(crate) const STORED_SPELLING_SQL_MYSQL: &str = stored_spelling_sql!(mysql, "?", "?");
+#[cfg(feature = "write-postgres")]
+pub(crate) const STORED_SPELLING_SQL_PG: &str = stored_spelling_sql!(postgres, "$1", "$2");
+
+/// [`MetadataWriter::stored_spelling`] from its query's row.
+pub(crate) fn stored_spelling(
+    found: Option<(String, Option<String>)>,
+    schema_name: &str,
+    table_name: &str,
+) -> (String, String) {
+    match found {
+        Some((schema, table)) => (schema, table.unwrap_or_else(|| table_name.to_string())),
+        None => (schema_name.to_string(), table_name.to_string()),
+    }
+}
+
 /// The commit's view check: the live view named as the live table `table_id` (bound once).
 /// Read inside the commit, so a view another writer created since the write began is found.
-pub(crate) const LIVE_VIEW_OF_TABLE_SQL: &str = live_view_of_table_sql!("?");
-/// [`LIVE_VIEW_OF_TABLE_SQL`] with Postgres placeholders.
-pub(crate) const LIVE_VIEW_OF_TABLE_SQL_PG: &str = live_view_of_table_sql!("$1");
+#[cfg(any(feature = "write-sqlite", feature = "host-sqlite"))]
+pub(crate) const LIVE_VIEW_OF_TABLE_SQL_SQLITE: &str = live_view_of_table_sql!(sqlite, "?");
+/// [`LIVE_VIEW_OF_TABLE_SQL_SQLITE`] for a DuckDB catalog.
+#[cfg(feature = "write-duckdb")]
+pub(crate) const LIVE_VIEW_OF_TABLE_SQL_DUCKDB: &str = live_view_of_table_sql!(duckdb, "?");
+/// [`LIVE_VIEW_OF_TABLE_SQL_SQLITE`] for a MySQL catalog.
+#[cfg(feature = "write-mysql")]
+pub(crate) const LIVE_VIEW_OF_TABLE_SQL_MYSQL: &str = live_view_of_table_sql!(mysql, "?");
+/// [`LIVE_VIEW_OF_TABLE_SQL_SQLITE`] for a Postgres catalog.
+#[cfg(feature = "write-postgres")]
+pub(crate) const LIVE_VIEW_OF_TABLE_SQL_PG: &str = live_view_of_table_sql!(postgres, "$1");
 /// The start's view check: the live view named `table_name` in schema `schema_id` (bound in
 /// that order). The start may not have a table row yet (Postgres reserves an id only), so it
 /// asks by name, not by table id.
-pub(crate) const LIVE_VIEW_NAMED_SQL: &str = live_view_named_sql!("?", "?");
-/// [`LIVE_VIEW_NAMED_SQL`] with Postgres placeholders.
-pub(crate) const LIVE_VIEW_NAMED_SQL_PG: &str = live_view_named_sql!("$1", "$2");
+/// (The SQLite writer asks by name through its own `live_view_id`.)
+#[cfg(feature = "write-duckdb")]
+pub(crate) const LIVE_VIEW_NAMED_SQL_DUCKDB: &str = live_view_named_sql!(duckdb, "?", "?");
+/// [`LIVE_VIEW_NAMED_SQL_DUCKDB`] for a MySQL catalog.
+#[cfg(feature = "write-mysql")]
+pub(crate) const LIVE_VIEW_NAMED_SQL_MYSQL: &str = live_view_named_sql!(mysql, "?", "?");
+/// [`LIVE_VIEW_NAMED_SQL_DUCKDB`] for a Postgres catalog.
+#[cfg(feature = "write-postgres")]
+pub(crate) const LIVE_VIEW_NAMED_SQL_PG: &str = live_view_named_sql!(postgres, "$1", "$2");
 
 /// The refusal [`makes_table`] asks for, from a view check's result: a live view of the
 /// table's name, named as the catalog names it.
@@ -4972,6 +5033,20 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
 
     /// Get the data path from catalog metadata.
     fn get_data_path(&self) -> Result<String>;
+
+    /// How the catalog spells the live schema `schema_name` and its live table `table_name`,
+    /// each found as DuckDB finds a name, in any ASCII case ([`crate::catalog_name`]); a name
+    /// no live object has is kept as given. A write keys its files by these, so a table DuckDB
+    /// created as `"Orders"` is written under `Orders/` whichever spelling names it.
+    ///
+    /// While a `CREATE OR REPLACE` is under way, the table is the pending one it makes, which
+    /// takes the spelling it was given, as DuckDB's replace does.
+    ///
+    /// The default keeps both names as given: right for a backend whose names are compared
+    /// exactly. Every backend in this crate overrides it.
+    fn stored_spelling(&self, schema_name: &str, table_name: &str) -> Result<(String, String)> {
+        Ok((schema_name.to_string(), table_name.to_string()))
+    }
 
     /// Return the live top-level column nullability for an existing table.
     ///
