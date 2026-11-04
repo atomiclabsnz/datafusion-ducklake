@@ -1065,10 +1065,11 @@ impl SqliteMetadataWriter {
                  JOIN ducklake_schema s ON s.schema_id = t.schema_id
                  WHERE s.schema_name = ? AND s.end_snapshot IS NULL
                    AND t.table_name = ? AND t.end_snapshot IS NULL
-                   AND t.begin_snapshot <> 9223372036854775807",
+                   AND t.begin_snapshot <> ?",
             )
             .bind(schema_name)
             .bind(table_name)
+            .bind(crate::metadata_writer::PENDING_SNAPSHOT)
             .fetch_optional(&mut *tx)
             .await?
             {
@@ -3184,15 +3185,23 @@ async fn finalize_table_snapshot(
     // Classify this commit as DDL vs pure data write. The table's begin snapshot
     // identifies creation even when it has no columns; using an empty live-column
     // set would misclassify a later schemaless Replace as another create.
-    let (schema_begin_snapshot, table_begin_snapshot): (i64, i64) = sqlx::query_as(
-        "SELECT schema.begin_snapshot, table_meta.begin_snapshot
-         FROM ducklake_table table_meta
-         JOIN ducklake_schema schema ON schema.schema_id = table_meta.schema_id
-         WHERE table_meta.table_id = ?",
-    )
-    .bind(table_id)
-    .fetch_one(&mut **tx)
-    .await?;
+    // The table's newest row: its live one, unless another writer dropped the table since this
+    // write began (and perhaps made a view of its name), which is a conflict.
+    let (schema_begin_snapshot, table_begin_snapshot, table_end_snapshot): (i64, i64, Option<i64>) =
+        sqlx::query_as(
+            "SELECT schema.begin_snapshot, table_meta.begin_snapshot, table_meta.end_snapshot
+             FROM ducklake_table table_meta
+             JOIN ducklake_schema schema ON schema.schema_id = table_meta.schema_id
+             WHERE table_meta.table_id = ?
+             ORDER BY table_meta.begin_snapshot DESC
+             LIMIT 1",
+        )
+        .bind(table_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    if table_end_snapshot.is_some() {
+        return Err(crate::metadata_writer::table_dropped_error(table_id));
+    }
     // A row the write's start created is the commit's from here: it takes the snapshot this
     // commit does, so the creation below is measured against the snapshot that publishes it.
     let pending = crate::metadata_writer::PENDING_SNAPSHOT;
@@ -3271,35 +3280,8 @@ async fn finalize_table_snapshot(
         !current.is_empty(),
         format!("{schema_name}.{table_name}"),
     )?;
-    // A write that makes the table refuses a live view of its name, read here so one another
-    // writer created since this write began is refused too.
     if crate::metadata_writer::makes_table(mode, !current.is_empty()) {
-        // A catalog from before views has no `ducklake_view`, and so no view.
-        let views: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ducklake_view'",
-        )
-        .fetch_one(&mut **tx)
-        .await?;
-        let live_view = if views > 0 {
-            sqlx::query(
-                "SELECT 1 FROM ducklake_view view_meta
-                 JOIN ducklake_table table_meta ON table_meta.schema_id = view_meta.schema_id
-                 WHERE table_meta.table_id = ? AND table_meta.end_snapshot IS NULL
-                   AND view_meta.view_name = table_meta.table_name
-                   AND view_meta.end_snapshot IS NULL
-                 LIMIT 1",
-            )
-            .bind(table_id)
-            .fetch_optional(&mut **tx)
-            .await?
-        } else {
-            None
-        };
-        if live_view.is_some() {
-            return Err(crate::metadata_writer::view_exists_error(format!(
-                "{schema_name}.{table_name}"
-            )));
-        }
+        refuse_view_at_commit(tx, table_id).await?;
     }
     // CREATE OR REPLACE: the live table of the name ends here, in the snapshot that creates
     // this one (whose start made it a new table, with no columns yet).
@@ -3548,6 +3530,34 @@ async fn finalize_table_snapshot(
     Ok(())
 }
 
+/// Whether the catalog has `ducklake_view`: one from before views has none, and so no view.
+async fn has_view_table(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<bool> {
+    let views: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ducklake_view'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(views > 0)
+}
+
+/// A write that makes its table, at its commit: refused a live view of the table's name, read
+/// here so one another writer created since the write began is refused too. (Its start asked
+/// [`live_view_id`].)
+async fn refuse_view_at_commit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+) -> Result<()> {
+    if !has_view_table(tx).await? {
+        return Ok(());
+    }
+    let view: Option<(String, String)> =
+        sqlx::query_as(crate::metadata_writer::LIVE_VIEW_OF_TABLE_SQL)
+            .bind(table_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    crate::metadata_writer::refuse_live_view(view)
+}
+
 /// End table `table_id` at `snapshot_id` as `DROP TABLE` ends it: everything of the table
 /// official ends with it (DuckDB 1.5.6's DROP TABLE, read off the catalog), its sort and
 /// partition specs and its tags too. Its statistics stay. The caller records the change and
@@ -3667,12 +3677,15 @@ async fn end_replaced_table(
     Ok(replaced)
 }
 
-/// The live view `schema_name.view_name`, if there is one.
+/// The live view `schema_name.view_name`, if there is one: none in a catalog from before views.
 async fn live_view_id(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     schema_name: &str,
     view_name: &str,
 ) -> Result<Option<i64>> {
+    if !has_view_table(tx).await? {
+        return Ok(None);
+    }
     Ok(sqlx::query_scalar(
         "SELECT v.view_id FROM ducklake_view v
          JOIN ducklake_schema s ON s.schema_id = v.schema_id
@@ -4268,9 +4281,10 @@ impl SqliteMetadataWriter {
             let schema_id: Option<i64> = sqlx::query_scalar(
                 "SELECT schema_id FROM ducklake_schema
                  WHERE schema_name = ? AND end_snapshot IS NULL
-                   AND begin_snapshot <> 9223372036854775807",
+                   AND begin_snapshot <> ?",
             )
             .bind(schema_name)
+            .bind(crate::metadata_writer::PENDING_SNAPSHOT)
             .fetch_optional(&self.pool)
             .await?;
             let table_id: Option<i64> = match schema_id {
@@ -4278,10 +4292,11 @@ impl SqliteMetadataWriter {
                     sqlx::query_scalar(
                         "SELECT table_id FROM ducklake_table
                          WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL
-                   AND begin_snapshot <> 9223372036854775807",
+                   AND begin_snapshot <> ?",
                     )
                     .bind(schema_id)
                     .bind(table_name)
+                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                     .fetch_optional(&self.pool)
                     .await?
                 },
@@ -8665,6 +8680,16 @@ impl MetadataWriter for SqliteMetadataWriter {
                         )));
                     }
                 }
+            }
+
+            // A write that makes the table is refused a live view of its name here, before
+            // any file is written; the commit asks again, for a view made since.
+            if crate::metadata_writer::makes_table(mode, !existing_catalog_columns.is_empty())
+                && live_view_id(&mut tx, schema_name, table_name).await?.is_some()
+            {
+                return Err(crate::metadata_writer::view_exists_error(format!(
+                    "{schema_name}.{table_name}"
+                )));
             }
 
             // Final per-column ids: reuse the existing id for a column already in

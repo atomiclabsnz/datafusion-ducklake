@@ -916,8 +916,13 @@ Known edges:
   conflict check is not designed for multiple `register_data_file` calls sharing one base.
 - Two concurrent `CREATE TABLE` of the same name on the PostgreSQL multi-catalog path are
   rejected by a unique index, surfacing as a raw database unique-violation rather than a
-  clean `Conflict`. An append racing a `DROP` of its table fails with `Conflict` and
-  removes its file.
+  clean `Conflict`. A write racing a `DROP` of its table fails with `Conflict` and
+  removes its file, on every write backend, also when a view of the table's name was created
+  after the drop. A write that would make a table where a live view has the name is refused
+  `ViewExists` at its start, before any file is written, and again at its commit. Names are
+  compared exactly on SQLite, DuckDB and PostgreSQL; on MySQL every catalog name lookup (schemas,
+  tables and views alike) follows the columns' collation, case- and accent-insensitive under
+  MySQL 8's default. DuckDB folds case (#17 item 1).
 - Every commit path is fenced on the table's live partition generation, so a file inconsistent
   with the live spec is never committed — never one stamped with a retired `partition_id`, and
   never a `partition_id`-less file in a partitioned table.

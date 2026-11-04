@@ -2,7 +2,8 @@
 //! `WriteMode::Create`, the write of `CREATE TABLE … AS`: a table that exists is refused, and
 //! so is one another writer creates after this write began, inside the commit's own
 //! transaction. A live view with the table's name is refused (`ViewExists`), in every mode
-//! that would make the table. Each case runs
+//! that would make the table: at the write's start, and again at its commit for a view made
+//! since. Each case runs
 //! with the rows inlined in the catalog and with them in Parquet, the two ways a write commits.
 
 use std::sync::Arc;
@@ -457,7 +458,9 @@ async fn create_is_refused_on_duckdb_as_on_sqlite() {
     drop(connection);
 
     // DuckDB allows one client per catalog file, so the view is added with the writer
-    // closed. Nothing but the commit checks for a view, so this runs that check.
+    // closed. With no table of the name, each write is refused at its start, before a file
+    // is written; `create_refusals` cannot add a view mid-write here, so the commit's check
+    // is run by the backend's own race test (`metadata_writer_duckdb`).
     let connection = duckdb::Connection::open(&path).unwrap();
     connection.execute(&add_view_sql("viewed"), []).unwrap();
     drop(connection);

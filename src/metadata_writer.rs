@@ -95,9 +95,10 @@ pub enum WriteMode {
 /// sees, which a retry of the write takes up again. (A start that stamped the snapshot it
 /// guessed it would commit left a table with no columns whenever it did not commit, and the
 /// next commit to take that snapshot published it: DuckDB will not open such a lake.)
+///
+/// Every lookup that excludes pending rows binds it (`begin_snapshot <> ?`), as the commit's
+/// stamps do, so no SQL spells the sentinel as a literal.
 pub(crate) const PENDING_SNAPSHOT: i64 = i64::MAX;
-// Spelled as a literal in SQL that excludes pending rows (`begin_snapshot <> …`).
-const _: () = assert!(PENDING_SNAPSHOT == 9_223_372_036_854_775_807);
 
 /// [`WriteMode::Create`]'s check, at a write's start and again inside its commit:
 /// refused unless the table has no live columns yet. That is read in the caller's own
@@ -126,11 +127,87 @@ pub(crate) fn makes_table(mode: WriteMode, has_live_columns: bool) -> bool {
     matches!(mode, WriteMode::Create | WriteMode::CreateOrReplace) || !has_live_columns
 }
 
-/// The refusal of a write that would make a table where a live view has its name, checked
-/// inside the commit, in every mode.
+/// The refusal of a write that would make a table where a live view has its name
+/// ([`makes_table`]), in every mode: checked at the write's start, before any file is
+/// written, and again inside its commit, for a view made since.
 pub(crate) fn view_exists_error(table: impl std::fmt::Display) -> DuckLakeError {
     DuckLakeError::ViewExists(format!(
         "{table}: a write does not create a table where a view has that name"
+    ))
+}
+
+/// The view checks' SQL, one text per check, spelled once for each placeholder style:
+/// `?` (SQLite, DuckDB, MySQL) and `$n` (Postgres). Each finds the live view that holds a
+/// table's name, as `(schema_name, view_name)`, for [`refuse_live_view`].
+macro_rules! live_view_of_table_sql {
+    ($table_id:literal) => {
+        concat!(
+            "SELECT schema_meta.schema_name, view_meta.view_name FROM ducklake_view view_meta
+             JOIN ducklake_table table_meta ON table_meta.schema_id = view_meta.schema_id
+             JOIN ducklake_schema schema_meta ON schema_meta.schema_id = view_meta.schema_id
+             WHERE table_meta.table_id = ",
+            $table_id,
+            " AND table_meta.end_snapshot IS NULL
+               AND view_meta.view_name = table_meta.table_name
+               AND view_meta.end_snapshot IS NULL
+             LIMIT 1"
+        )
+    };
+}
+macro_rules! live_view_named_sql {
+    ($schema_id:literal, $name:literal) => {
+        concat!(
+            "SELECT schema_meta.schema_name, view_meta.view_name FROM ducklake_view view_meta
+             JOIN ducklake_schema schema_meta ON schema_meta.schema_id = view_meta.schema_id
+             WHERE view_meta.schema_id = ",
+            $schema_id,
+            " AND view_meta.view_name = ",
+            $name,
+            " AND view_meta.end_snapshot IS NULL
+             LIMIT 1"
+        )
+    };
+}
+
+/// The commit's view check: the live view named as the live table `table_id` (bound once).
+/// Read inside the commit, so a view another writer created since the write began is found.
+pub(crate) const LIVE_VIEW_OF_TABLE_SQL: &str = live_view_of_table_sql!("?");
+/// [`LIVE_VIEW_OF_TABLE_SQL`] with Postgres placeholders.
+pub(crate) const LIVE_VIEW_OF_TABLE_SQL_PG: &str = live_view_of_table_sql!("$1");
+/// The start's view check: the live view named `table_name` in schema `schema_id` (bound in
+/// that order). The start may not have a table row yet (Postgres reserves an id only), so it
+/// asks by name, not by table id.
+pub(crate) const LIVE_VIEW_NAMED_SQL: &str = live_view_named_sql!("?", "?");
+/// [`LIVE_VIEW_NAMED_SQL`] with Postgres placeholders.
+pub(crate) const LIVE_VIEW_NAMED_SQL_PG: &str = live_view_named_sql!("$1", "$2");
+
+/// The refusal [`makes_table`] asks for, from a view check's result: a live view of the
+/// table's name, named as the catalog names it.
+pub(crate) fn refuse_live_view(view: Option<(String, String)>) -> Result<()> {
+    match view {
+        Some((schema_name, view_name)) => {
+            Err(view_exists_error(format!("{schema_name}.{view_name}")))
+        },
+        None => Ok(()),
+    }
+}
+
+/// The refusal of a commit whose table another writer dropped after the write began (and
+/// perhaps replaced with a view of the same name): [`DuckLakeError::Conflict`], with the words
+/// official's commit refuses it with, as every backend's conflict check already does for a
+/// drop since the write's base. Each backend raises it where its commit reads the table's live
+/// row and finds none.
+///
+/// What a retry does is the retried call's: a SQL `INSERT` plans against the catalog as it now
+/// is and fails "table not found", as DuckDB's does; a view of the name is refused
+/// [`DuckLakeError::ViewExists`] at any write's start; and [`DuckLakeTableWriter::append_table`]
+/// and `write_table`, which create a table that is absent, create it again.
+///
+/// [`DuckLakeTableWriter::append_table`]: crate::DuckLakeTableWriter::append_table
+pub(crate) fn table_dropped_error(table_id: i64) -> DuckLakeError {
+    DuckLakeError::Conflict(format!(
+        "Transaction conflict - attempting to insert into table with index \"{table_id}\" \
+         - but another transaction has dropped it"
     ))
 }
 

@@ -247,6 +247,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A write onto a view's name is refused `ViewExists` before any file is written (#17).
+- A write whose table another writer drops before it commits is refused `Conflict` (#17).
+- `drop_table` / `drop_view` of a missing name return `false` in a catalog with no views (#17).
 - A replace (`INSERT OVERWRITE`, `WriteMode::Replace`) and `end_table_files` end the delete files
   of the data files they end, as official's `CREATE OR REPLACE` does, on every backend (#19).
 - A write that never committed (refused, failed, or abandoned) no longer leaves a column-less table
