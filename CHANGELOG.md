@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `WriteSetupResult` has a `started` field; a `MetadataWriter` that inserts no
+  pending rows sets `started: StartedRows::default()` (#15).
+- `get_or_create_table` leaves a new table unpublished until `set_columns` gives it columns,
+  on SQLite, DuckDB and MySQL catalogs (#15).
 - **Breaking:** `WriteMode` has a `CreateOrReplace` variant; exhaustive matches need its arm.
 - `DuckLakeSchema::register_table` refuses a view or an external table instead of making an empty table of its columns (ferrion#611).
 - DuckDB 1.5.6 is the bundled engine (`duckdb ~1.10506.1`) and the oracle (CI's CLI,
@@ -35,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `MetadataWriter::release_started_rows` and `StartedRows`: a write's own pending rows (#15).
 - `MetadataWriter::stored_location` and `location_of_table`: where a schema and table keep their files.
 - `WriteMode::CreateOrReplace` and `DuckLakeTableWriter::create_or_replace_table`: DuckDB's
   `CREATE OR REPLACE TABLE`, a new table in one snapshot, on SQLite (ferrion#611).
@@ -249,6 +254,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A write that does not commit removes the pending schema and table rows its start made, unless
+  another write took them up (catalogs with `schema_uuid` / `table_uuid`, #15).
+- MySQL: concurrent starts and `get_or_create_*` of one new name insert one row, not two (#15).
 - Schema, table and view names are found in any ASCII case on every backend, as DuckDB finds
   them (#17, ferrion#708).
 - A write into a table DuckDB renamed puts its files under the table's `path`, not its new name.

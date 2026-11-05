@@ -9351,6 +9351,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 table_id,
                 column_ids: top_level_column_ids(&catalog_columns, &field_ids)?,
                 field_ids,
+                            started: crate::metadata_writer::StartedRows::default(),
             })
         })
     }

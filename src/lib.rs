@@ -236,8 +236,8 @@ pub use metadata_writer::{
     DeleteFileEntry, DeleteFileInfo, ImportedFile, InlinedFlushDeleteFile, InlinedFlushFile,
     InlinedFlushFileDelete, InlinedFlushTable, InlinedRowRef, MetadataWriter, MultiTableCommit,
     PromoteLayout, PromotedFile, RowIdStart, SnapshotCommitMetadata, SourceRetirement,
-    StagedTableData, StagedTableWrite, StoredLocation, StoredPath, WriteMode, WriteResult,
-    WriteSetupResult,
+    StagedTableData, StagedTableWrite, StartedRow, StartedRows, StoredLocation, StoredPath,
+    WriteMode, WriteResult, WriteSetupResult,
 };
 #[cfg(feature = "write-duckdb")]
 pub use metadata_writer_duckdb::DuckdbMetadataWriter;

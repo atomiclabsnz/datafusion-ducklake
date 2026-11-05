@@ -742,7 +742,9 @@ async fn a_pending_row_an_abandoned_write_left_steers_no_later_write() {
             .begin_write("main", table, &batch(&[]).schema(), mode)
             .unwrap();
         session.write_batch(&batch(&[7])).unwrap();
-        drop(session);
+        // Abandoned as a process that dies abandons it: nothing of it runs again, so its
+        // rows stay (a session dropped in-process releases them, #15).
+        std::mem::forget(session);
     }
     assert_eq!(pending_rows(&catalog), ["ORDERS|ORDERS/", "NewT|NewT/"]);
 

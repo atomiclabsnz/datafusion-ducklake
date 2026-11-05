@@ -2985,6 +2985,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 table_id,
                 column_ids,
                 field_ids,
+                            started: crate::metadata_writer::StartedRows::default(),
             })
         })
     }
