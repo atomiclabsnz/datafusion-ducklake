@@ -209,10 +209,8 @@ async fn crate_commit_without_commit_metadata_preserves_nulls() {
     let snapshots = provider.list_snapshots().unwrap();
     assert_eq!(snapshots.len(), 1);
     let snapshot = &snapshots[0];
-    let changes_made = format!(
-        "created_schema:\"main\",created_table:\"main\".\"events\",inserted_into_table:{}",
-        setup.table_id
-    );
+    // A fileless commit inserts no rows, so records no insert (#27).
+    let changes_made = "created_schema:\"main\",created_table:\"main\".\"events\"".to_string();
     let expected = ExpectedSnapshot {
         snapshot_id: committed.snapshot_id,
         schema_version: 1,

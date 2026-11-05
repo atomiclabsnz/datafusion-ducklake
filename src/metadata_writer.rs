@@ -1481,6 +1481,27 @@ pub(crate) fn catalog_column_defs(columns: &[ColumnDef]) -> Result<Vec<CatalogCo
             }
         }
     }
+    // A column without a default as DuckDB records it (#27): the literal `NULL`, typed
+    // `literal`, except a nested column's own row, which DuckDB leaves untyped (`''`).
+    // Readers take `NULL` for no default.
+    for def in &mut result {
+        if def.default_value.is_none()
+            && def.default_value_type.is_none()
+            && def.default_value_dialect.is_none()
+        {
+            let nested = matches!(def.ducklake_type.as_str(), "struct" | "list" | "map");
+            def.default_value = Some("NULL".to_string());
+            def.default_value_type = Some(
+                if nested {
+                    ""
+                } else {
+                    "literal"
+                }
+                .to_string(),
+            );
+            def.default_value_dialect = Some("duckdb".to_string());
+        }
+    }
     Ok(result)
 }
 
@@ -1758,6 +1779,66 @@ pub(crate) fn assign_column_ids(
         .zip(fresh_ids)
         .map(|(path, fresh_id)| existing_by_path.get(path).copied().unwrap_or(*fresh_id))
         .collect())
+}
+
+/// The SQL of the first column id a table has not used: one past the highest of its columns,
+/// live or ended, bound to the table id. DuckDB numbers each table's columns from 1 and gives a
+/// new one this id (atomiclabsnz/datafusion-ducklake#27); an ended column's id is never given
+/// again, as its field id may be in a file still read at an older snapshot.
+pub(crate) const NEXT_TABLE_COLUMN_ID_SQL: &str =
+    "SELECT COALESCE(MAX(column_id), 0) + 1 FROM ducklake_column WHERE table_id = ?";
+
+/// `n` column ids from `first`: the ids of a table's columns all set at once.
+pub(crate) fn fresh_column_ids(first: i64, n: usize) -> Vec<i64> {
+    (first..).take(n).collect()
+}
+
+/// The ids a write's start offers `proposed`, for [`assign_column_ids`]: a column `existing`
+/// has keeps its id, and the columns it has not take `first`, `first + 1`, ... in order, as
+/// DuckDB numbers the columns an `ALTER TABLE … ADD COLUMN` adds.
+pub(crate) fn offered_column_ids(
+    proposed: &[CatalogColumnDef],
+    existing: &[ExistingCatalogColumn],
+    first: i64,
+) -> Result<Vec<i64>> {
+    // No column id is negative: -1 marks a column the table does not have.
+    let matched = assign_column_ids(proposed, existing, &vec![-1; proposed.len()])?;
+    let mut next = first;
+    Ok(matched
+        .into_iter()
+        .map(|id| {
+            if id >= 0 {
+                id
+            } else {
+                next += 1;
+                next - 1
+            }
+        })
+        .collect())
+}
+
+/// Refuse a commit that would give a new column of the table an id one of its columns already
+/// has (`used`: every column id of the table, live or ended), as a conflict to retry. A start
+/// offers the ids past the table's highest, so this is a column another write added since:
+/// `committed` are the ids [`assign_column_ids`] gave at the commit, `existing` the live
+/// columns they were matched against.
+pub(crate) fn refuse_reused_column_ids(
+    committed: &[i64],
+    existing: &[ExistingCatalogColumn],
+    used: &[i64],
+) -> Result<()> {
+    let live: HashSet<i64> = existing.iter().map(|column| column.column_id).collect();
+    let used: HashSet<i64> = used.iter().copied().collect();
+    if committed
+        .iter()
+        .any(|id| !live.contains(id) && used.contains(id))
+    {
+        return Err(DuckLakeError::Conflict(
+            "another write added a column to the table since this write began; retry the write"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Whether `proposed` (depth first, with `field_ids`) changes the live
@@ -6255,7 +6336,7 @@ mod tests {
                 ("id", "int32", false, None),
                 ("levels", "list", false, None),
                 ("element", "struct", false, Some(1)),
-                ("price", "decimal(38, 16)", false, Some(2)),
+                ("price", "decimal(38,16)", false, Some(2)),
                 ("tags", "list", true, Some(2)),
                 ("element", "varchar", true, Some(4)),
                 ("attrs", "map", true, None),
@@ -6272,7 +6353,11 @@ mod tests {
             .iter()
             .enumerate()
             .filter_map(|(index, column)| {
-                column.default_value.as_deref().map(|value| (index, value))
+                column
+                    .default_value
+                    .as_deref()
+                    .filter(|value| *value != "NULL")
+                    .map(|value| (index, value))
             })
             .collect::<Vec<_>>();
         assert_eq!(defaults, vec![(0, "7")]);

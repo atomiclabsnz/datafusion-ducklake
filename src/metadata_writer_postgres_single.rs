@@ -28,8 +28,8 @@ use crate::metadata_writer::{
     MetadataWriter, MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite,
     WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
     catalog_column_type_requires_migration, catalog_columns_differ, quote_snapshot_name,
-    quote_snapshot_table, snapshot_has_change, staged_table_write_changes, table_write_changes,
-    tag_change, top_level_column_ids, validate_name,
+    quote_snapshot_table, snapshot_has_change, staged_table_write_changes, tag_change,
+    top_level_column_ids, validate_name,
 };
 use crate::metadata_writer::{InlinedFlushTable, inlined_flush_changes, validate_inlined_flush};
 use crate::metadata_writer_postgres::apply_inlined_flush_at_snapshot;
@@ -394,6 +394,34 @@ impl PostgresSingleCatalogMetadataWriter {
 /// Reserve `n` consecutive ids from a counter in `ducklake_metadata`, returning the
 /// LAST of the block (`last - n + 1 ..= last`). The `UPDATE` holds an exclusive row
 /// lock until commit, so concurrent reservations block rather than overlap.
+/// Record data file `data_file_id` as Parquet, as DuckDB records every file it writes (#27):
+/// where the catalog has `file_format` (DuckDB's does; this crate's own schema has not).
+async fn mark_parquet(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    data_file_id: i64,
+) -> Result<()> {
+    let has_format: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'ducklake_data_file' AND column_name = 'file_format')",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if has_format {
+        sqlx::query(
+            "UPDATE ducklake_data_file SET file_format = 'parquet' WHERE data_file_id = $1",
+        )
+        .bind(data_file_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// [`crate::metadata_writer::NEXT_TABLE_COLUMN_ID_SQL`] in Postgres' placeholders.
+const NEXT_TABLE_COLUMN_ID_SQL: &str =
+    "SELECT COALESCE(MAX(column_id), 0) + 1 FROM ducklake_column WHERE table_id = $1";
+
 async fn reserve_ids(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     key: &str,
@@ -654,7 +682,7 @@ async fn record_snapshot_changes(
 
 /// Record the change summary for a data-write commit: whether this snapshot also
 /// created the schema/table or altered it, plus the insert/delete shape from
-/// [`table_write_changes`]. Mirrors the MySQL and SQLite writers.
+/// [`table_storage_changes`](crate::metadata_writer::table_storage_changes). Mirrors the MySQL and SQLite writers.
 async fn record_table_write_changes(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     snapshot_id: i64,
@@ -662,6 +690,8 @@ async fn record_table_write_changes(
     schema_name: &str,
     table_name: &str,
     mode: WriteMode,
+    // Whether the commit inserts rows: a fileless commit inserts none (#27).
+    inserts: bool,
     commit_metadata: &SnapshotCommitMetadata,
 ) -> Result<()> {
     let replaced_existing_data: bool = sqlx::query_scalar(
@@ -675,7 +705,12 @@ async fn record_table_write_changes(
     .fetch_one(&mut **tx)
     .await?;
 
-    let write_changes = table_write_changes(table_id, mode, false, (replaced_existing_data, false));
+    let write_changes = crate::metadata_writer::table_storage_changes(
+        table_id,
+        inserts.then_some(false),
+        mode == WriteMode::Replace && replaced_existing_data,
+        false,
+    );
     record_table_changes(
         tx,
         snapshot_id,
@@ -1101,6 +1136,16 @@ async fn finalize_table_snapshot(
                 .to_string(),
         ));
     }
+    let used: Vec<i64> =
+        sqlx::query_scalar("SELECT DISTINCT column_id FROM ducklake_column WHERE table_id = $1")
+            .bind(table_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    crate::metadata_writer::refuse_reused_column_ids(
+        &committed_ids,
+        &existing_catalog_columns,
+        &used,
+    )?;
     let is_ddl = current.is_empty()
         || catalog_columns_differ(
             &existing_catalog_columns,
@@ -1731,14 +1776,18 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            // Reserve a contiguous column_id block from the monotonic counter and
-            // insert with explicit ids, keeping the allocator authoritative.
+            // The columns take ids past the table's highest, as DuckDB numbers a table's
+            // columns (#27); the crate's counter is kept past them too. Read after the
+            // counter's lock, so no other writer adds one meanwhile.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
             crate::metadata_writer_postgres_allocators::raise_column_counter(&mut tx).await?;
-            let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
-            let first_column_id = last_column_id - n + 1;
-            let field_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
+            reserve_ids(&mut tx, "next_column_id", n).await?;
+            let first: i64 = sqlx::query_scalar(NEXT_TABLE_COLUMN_ID_SQL)
+                .bind(table_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let field_ids = crate::metadata_writer::fresh_column_ids(first, catalog_columns.len());
             for (column, column_id) in catalog_columns.iter().zip(field_ids.iter()) {
                 let parent_id = column.parent_index.map(|index| field_ids[index]);
                 sqlx::query(
@@ -1907,6 +1956,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?
             .try_get(0)?;
 
+            mark_parquet(&mut tx, data_file_id).await?;
             // Persist the file's zone maps + refresh the roll-up.
             insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
             insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
@@ -1941,6 +1991,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 schema_name,
                 table_name,
                 mode,
+                true,
                 commit_metadata,
             )
             .await?;
@@ -2069,6 +2120,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 .fetch_one(&mut *tx)
                 .await?
                 .try_get(0)?;
+                mark_parquet(&mut tx, data_file_id).await?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
@@ -2104,6 +2156,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 schema_name,
                 table_name,
                 mode,
+                true,
                 commit_metadata,
             )
             .await?;
@@ -2564,6 +2617,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 schema_name,
                 table_name,
                 mode,
+                false,
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
@@ -2818,16 +2872,13 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
 
-            // Reserve the column ids first so the counter UPDATE takes the write
-            // lock up front. These ids match the staged parquet field ids.
+            // The counter UPDATE first takes the write lock up front. The ids a new column
+            // takes are its table's own (below); the counter stays past every id, so a
+            // release that draws from it reuses none.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
             crate::metadata_writer_postgres_allocators::raise_column_counter(&mut tx).await?;
-            let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
-            // Freshly reserved ids. Only a genuinely-new column actually consumes
-            // one below; an existing column keeps its current id, so some of these
-            // may go unused (harmless monotonic-counter gaps).
-            let fresh_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
+            reserve_ids(&mut tx, "next_column_id", n).await?;
 
             // The catalog head this write is based on; a Replace commit aborts if
             // another writer published a newer generation of the table past it.
@@ -2914,6 +2965,18 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                     parent_column,
                 });
             }
+            // Offered ids: past the table's highest column id, as DuckDB numbers a table's
+            // columns (#27). Only a genuinely new column takes one; an existing column keeps
+            // its id. These are the staged Parquet field ids.
+            let first: i64 = sqlx::query_scalar(NEXT_TABLE_COLUMN_ID_SQL)
+                .bind(table_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let fresh_ids = crate::metadata_writer::offered_column_ids(
+                &catalog_columns,
+                &existing_catalog_columns,
+                first,
+            )?;
             let field_ids =
                 assign_column_ids(&catalog_columns, &existing_catalog_columns, &fresh_ids)?;
 

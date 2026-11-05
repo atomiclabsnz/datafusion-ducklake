@@ -638,12 +638,12 @@ async fn test_write_and_read_list_struct_column_roundtrip() {
             ("element".to_string(), "struct".to_string(), Some(ids[1])),
             (
                 "price".to_string(),
-                "decimal(38, 16)".to_string(),
+                "decimal(38,16)".to_string(),
                 Some(ids[2]),
             ),
             (
                 "size".to_string(),
-                "decimal(38, 16)".to_string(),
+                "decimal(38,16)".to_string(),
                 Some(ids[2]),
             ),
             ("count".to_string(), "uint32".to_string(), Some(ids[2])),
@@ -1281,7 +1281,10 @@ async fn test_append_migrates_legacy_list_catalog_rows() {
     assert_eq!(catalog_rows[2].1, "element");
     assert_eq!(catalog_rows[2].2, "float32");
     assert_eq!(catalog_rows[2].3, Some(list_id));
-    assert_ne!(catalog_rows[2].0, old_element_id);
+    // The element takes the table's next id, as DuckDB numbers a column it adds (#27). A file
+    // from before nested rows carries no nested field id, so none can name it otherwise.
+    assert_eq!(catalog_rows[2].0, list_id + 1);
+    assert_eq!(old_element_id, list_id + 1, "the row the test removed");
 
     let historical = SessionContext::new();
     let provider = Arc::new(

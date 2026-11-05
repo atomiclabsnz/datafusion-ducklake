@@ -533,8 +533,9 @@ CREATE TABLE IF NOT EXISTS ducklake_table (
 -- One-live-row / non-null / ownership invariants are enforced in the writer
 -- code + tests, exactly as upstream guarantees them (its table has no such
 -- constraints). The four `*default*` columns + `parent_column` are projected by
--- DuckDB when it reads catalogs we produce; we leave them NULL (no nested-type
--- or column-default writes yet). See docs/column-id-versioning-design.md §4.1.
+-- DuckDB when it reads catalogs we produce; a column without a default is
+-- recorded as DuckDB records it (`NULL`, `literal`, `duckdb`), and a table's
+-- column ids count from 1 per table, as DuckDB's do.
 CREATE TABLE IF NOT EXISTS ducklake_view (
     view_id BIGINT,
     view_uuid UUID,
@@ -1625,6 +1626,24 @@ async fn raise_column_counter(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> R
     )
     .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+/// Record data file `data_file_id` as Parquet, as DuckDB records every file it writes (#27):
+/// where the catalog has `file_format` (DuckDB's does; this crate's own schema has not).
+async fn mark_parquet(conn: &mut sqlx::SqliteConnection, data_file_id: i64) -> Result<()> {
+    let has_format: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('ducklake_data_file')
+                        WHERE name = 'file_format')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if has_format {
+        sqlx::query("UPDATE ducklake_data_file SET file_format = 'parquet' WHERE data_file_id = ?")
+            .bind(data_file_id)
+            .execute(&mut *conn)
+            .await?;
+    }
     Ok(())
 }
 
@@ -3309,6 +3328,16 @@ async fn finalize_table_snapshot(
                 .to_string(),
         ));
     }
+    let used: Vec<i64> =
+        sqlx::query_scalar("SELECT DISTINCT column_id FROM ducklake_column WHERE table_id = ?")
+            .bind(table_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    crate::metadata_writer::refuse_reused_column_ids(
+        &committed_ids,
+        &existing_catalog_columns,
+        &used,
+    )?;
     let table_was_created = table_begin_snapshot == snapshot_id;
     let is_ddl = table_was_created
         || catalog_columns_differ(
@@ -4026,6 +4055,7 @@ async fn commit_files_at_snapshot(
         .bind(snapshot_id)
         .execute(&mut **tx)
         .await?;
+        mark_parquet(&mut **tx, file_id).await?;
         let data_file_id = file_id;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
         insert_partition_metadata(tx, write.table_id, data_file_id, file).await?;
@@ -5737,15 +5767,17 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            // Reserve a contiguous column_id block from the monotonic counter and
-            // insert with explicit ids, keeping the allocator authoritative (the
-            // write path's begin/commit reserve column ids from the same counter).
+            // The columns take ids past the table's highest, as DuckDB numbers a table's
+            // columns (#27); the crate's counter is kept past them too.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
             raise_column_counter(&mut tx).await?;
-            let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
-            let first_column_id = last_column_id - n + 1;
-            let column_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
+            reserve_ids(&mut tx, "next_column_id", n).await?;
+            let first: i64 = sqlx::query_scalar(crate::metadata_writer::NEXT_TABLE_COLUMN_ID_SQL)
+                .bind(table_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let column_ids = crate::metadata_writer::fresh_column_ids(first, catalog_columns.len());
             for (column, column_id) in catalog_columns.iter().zip(column_ids.iter()) {
                 let parent_id = column.parent_index.map(|index| column_ids[index]);
                 sqlx::query(
@@ -5770,6 +5802,22 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(&column.default_value_dialect)
                 .execute(&mut *tx)
                 .await?;
+            }
+
+            // Setting a table's columns is DDL: the snapshot takes a new schema version, as
+            // DuckDB's `CREATE TABLE` and `ALTER TABLE` give it, so a DuckDB that attached the
+            // lake before reloads its catalog and sees the table (#27).
+            let schema_version = bump_schema_version(&mut tx, snapshot_id).await?;
+            let recorded: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM ducklake_schema_versions
+                                WHERE table_id = ? AND begin_snapshot = ?)",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !recorded {
+                record_schema_version(&mut tx, snapshot_id, schema_version, table_id).await?;
             }
 
             if publishes {
@@ -5925,6 +5973,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
+            mark_parquet(&mut *tx, file_id).await?;
 
             // Persist the file's per-column zone-map stats in the same tx.
             let data_file_id = file_id;
@@ -6107,6 +6156,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
+                mark_parquet(&mut *tx, file_id).await?;
                 let data_file_id = file_id;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
@@ -6299,6 +6349,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
+                mark_parquet(&mut *tx, data_file_id).await?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
@@ -7059,6 +7110,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
+            mark_parquet(&mut *tx, file_id).await?;
 
             // Persist the new file's per-column zone-map stats.
             let data_file_id = file_id;
@@ -7330,6 +7382,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
+                mark_parquet(&mut *tx, file_id).await?;
                 let data_file_id = file_id;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
@@ -7882,6 +7935,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(out.partial_max)
                 .execute(&mut *tx)
                 .await?;
+                mark_parquet(&mut *tx, file_id).await?;
                 // Persist the compacted file's harvested zone maps under its id
                 // (same tx). Mirrors how official DuckLake records stats for
                 // compaction outputs via the shared write path.
@@ -7982,6 +8036,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(out.partial_max)
                     .execute(&mut *tx)
                     .await?;
+                    mark_parquet(&mut *tx, file_id).await?;
                     let data_file_id = file_id;
                     insert_file_column_stats(
                         &mut tx,
@@ -8375,7 +8430,7 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Official's tokens for the storage the truncate ended: Parquet
             // files, inlined rows, or both.
-            let changes_made = crate::metadata_writer::table_storage_changes(
+            let changes_made = table_storage_changes(
                 table_id,
                 None,
                 ours.deleted_from,
@@ -8426,12 +8481,14 @@ impl MetadataWriter for SqliteMetadataWriter {
             )
             .await?;
             let replaced_existing_data = replaced_storage(&mut tx, table_id, snapshot_id).await?;
-            // CREATE OR REPLACE of no rows inserts nothing, and official records no insert.
-            let changes_made = if mode == WriteMode::CreateOrReplace {
-                String::new()
-            } else {
-                table_write_changes(table_id, mode, false, replaced_existing_data)
-            };
+            // A fileless commit inserts no rows, and official records no insert (#27): only a
+            // Replace's end of the prior rows.
+            let changes_made = table_storage_changes(
+                table_id,
+                None,
+                mode == WriteMode::Replace && replaced_existing_data.0,
+                mode == WriteMode::Replace && replaced_existing_data.1,
+            );
             record_snapshot_changes(
                 &mut tx,
                 snapshot_id,
@@ -8737,17 +8794,14 @@ impl MetadataWriter for SqliteMetadataWriter {
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
 
-            // Reserve the column ids first so the counter UPDATE takes the write
-            // lock up front, avoiding a lock-upgrade deadlock between concurrent
-            // begins. These ids match the staged parquet field ids.
+            // The counter UPDATE first takes the write lock up front, avoiding a
+            // lock-upgrade deadlock between concurrent begins. The ids a new column
+            // takes are its table's own (below); the counter stays past every id, so
+            // a release that draws from it reuses none.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
             raise_column_counter(&mut tx).await?;
-            let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
-            // Freshly reserved ids. Only a genuinely-new column actually consumes
-            // one below; an existing column keeps its current id, so some of these
-            // may go unused (harmless monotonic-counter gaps).
-            let fresh_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
+            reserve_ids(&mut tx, "next_column_id", n).await?;
 
             // The catalog head this write is based on; a Replace commit aborts if
             // another writer published a newer generation of the table past it.
@@ -8883,6 +8937,18 @@ impl MetadataWriter for SqliteMetadataWriter {
                 });
             }
 
+            // Offered ids: past the table's highest column id, as DuckDB numbers a table's
+            // columns (#27), in order. An existing column keeps its id. These are the staged
+            // Parquet field ids.
+            let first: i64 = sqlx::query_scalar(crate::metadata_writer::NEXT_TABLE_COLUMN_ID_SQL)
+                .bind(table_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let fresh_ids = crate::metadata_writer::offered_column_ids(
+                &catalog_columns,
+                &existing_catalog_columns,
+                first,
+            )?;
             let field_ids =
                 assign_column_ids(&catalog_columns, &existing_catalog_columns, &fresh_ids)?;
 

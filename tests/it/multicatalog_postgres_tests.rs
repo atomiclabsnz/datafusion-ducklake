@@ -467,7 +467,7 @@ async fn postgres_writer_persists_recursive_columns() {
             (
                 setup.field_ids[2],
                 "price".into(),
-                "decimal(38, 16)".into(),
+                "decimal(38,16)".into(),
                 Some(setup.field_ids[1]),
             ),
             (

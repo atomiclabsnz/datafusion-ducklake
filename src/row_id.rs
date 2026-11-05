@@ -110,7 +110,7 @@ pub fn embedded_rowid_field() -> Field {
 /// DuckLake extension's `_ducklake_internal_snapshot_id` field-id
 /// (`ROW_ID_PARQUET_FIELD_ID - 1`); the two reserved ids sit adjacent below
 /// `i32::MAX` so neither collides with a catalog `column_id` (which are small
-/// positive ints assigned from `next_column_id`).
+/// positive ints, numbered per table from 1).
 pub const SNAPSHOT_ID_PARQUET_FIELD_ID: i32 = 2_147_483_539;
 
 /// Parquet column name our writer uses for the embedded snapshot-id column on

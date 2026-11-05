@@ -4042,7 +4042,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].column_type,
-            "struct<levels:list<struct<price:decimal(38, 16)>>,attrs:map<varchar,list<int32>>>"
+            "struct<levels:list<struct<price:decimal(38,16)>>,attrs:map<varchar,list<int32>>>"
         );
         assert_eq!(result[0].nested_column_ids, vec![2, 3, 4, 5, 6, 7, 8]);
     }

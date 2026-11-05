@@ -507,7 +507,9 @@ async fn concurrent_starts_for_a_new_table_commit_one_table() {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    assert_eq!(finish_in_turn(&writers[0], sessions).await, 3);
+    // Each start was offered the new table's ids from 1, so the writes after the first append
+    // into the table it made, refused nothing (#27).
+    assert_eq!(finish_in_turn(&writers[0], sessions).await, 0);
     assert_eq!(
         rows(
             &lake.duckdb(None),
@@ -571,16 +573,9 @@ async fn a_pending_table_get_or_create_takes_up_is_published_only_with_its_colum
     metadata
         .set_columns(table_id, &columns(), snapshot)
         .unwrap();
-    // `set_columns` gave the columns ids of its own: the write in flight is refused, as a
-    // concurrent create is, and its retry appends.
-    assert!(matches!(
-        late.finish().await.unwrap_err(),
-        DuckLakeError::Conflict(_)
-    ));
-    writer
-        .append_table("main", "t", &[batch(&[1])])
-        .await
-        .unwrap();
+    // `set_columns` numbered the columns from 1, the ids the write in flight was offered for
+    // the same columns: it appends (#27).
+    late.finish().await.unwrap();
     assert_eq!(lake.every_snapshot(), ["0: ", "1: main.t=0", "2: main.t=1"]);
     assert_eq!(lake.pending_rows(), Vec::<String>::new());
 }
@@ -722,7 +717,8 @@ mod duckdb_catalog {
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             });
-            assert_eq!(finish_in_turn(&writer, sessions).await, 3);
+            // Offered the same ids, every write after the first appends (#27).
+            assert_eq!(finish_in_turn(&writer, sessions).await, 0);
         }
         assert_eq!(
             rows(
