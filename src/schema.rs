@@ -513,23 +513,28 @@ impl SchemaProvider for DuckLakeSchema {
             writer.begin_write_transaction(&self.schema_name, &name, &columns, WriteMode::Create)
         })
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let release = crate::table_writer::ReleaseOnFailure::new(writer, &setup);
 
         // CREATE TABLE registers no data file, so publish the head here; without
         // this the new (empty) table never becomes visible on multicatalog
         // backends that defer the head advance out of begin_write_transaction.
-        let committed = crate::metadata_writer::with_inlining_limit(inlining_limit, || {
-            writer.publish_snapshot(
-                setup.table_id,
-                &self.schema_name,
-                &name,
-                setup.snapshot_id,
-                WriteMode::Create,
-                setup.base_snapshot_id,
-                &columns,
-                &setup.field_ids,
-            )
-        })
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let committed = release
+            .settle(crate::metadata_writer::with_inlining_limit(
+                inlining_limit,
+                || {
+                    writer.publish_snapshot(
+                        setup.table_id,
+                        &self.schema_name,
+                        &name,
+                        setup.snapshot_id,
+                        WriteMode::Create,
+                        setup.base_snapshot_id,
+                        &columns,
+                        &setup.field_ids,
+                    )
+                },
+            ))
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         // Resolve table path
         let table_path = resolve_path(&self.schema_path, &name, true)

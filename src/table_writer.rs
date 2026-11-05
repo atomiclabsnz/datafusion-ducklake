@@ -579,6 +579,64 @@ struct PreparedTableWrite {
     records_written: i64,
     /// What each of `write.rewritten_deletes` holds, in the same order.
     rewrite_sources: Vec<RewrittenDeleteSource>,
+    /// The pending rows the stage's start inserted, released unless the transaction commits.
+    release: ReleaseOnFailure,
+}
+
+/// The pending rows a write's start inserted ([`WriteSetupResult::started`]), released
+/// ([`MetadataWriter::release_started_rows`]) when the write ends without a commit: dropped —
+/// on an error returned after the start, an abort, a session or transaction dropped
+/// unfinished — before [`Self::settle`] saw it commit. A release that fails is logged; the
+/// write's own outcome is what its caller sees.
+#[derive(Default)]
+pub(crate) struct ReleaseOnFailure {
+    metadata: Option<Arc<dyn MetadataWriter>>,
+    rows: crate::metadata_writer::StartedRows,
+}
+
+impl std::fmt::Debug for ReleaseOnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReleaseOnFailure")
+            .field("rows", &self.rows)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReleaseOnFailure {
+    /// The rows `setup`'s start inserted, released through `metadata` unless settled.
+    pub(crate) fn new(metadata: &Arc<dyn MetadataWriter>, setup: &WriteSetupResult) -> Self {
+        Self {
+            metadata: Some(Arc::clone(metadata)),
+            rows: setup.started.clone(),
+        }
+    }
+
+    /// The write committed, and its commit published the rows: nothing is released.
+    pub(crate) fn committed(mut self) {
+        self.rows = crate::metadata_writer::StartedRows::default();
+    }
+
+    /// `result`, once the rows are settled: kept when it is `Ok` (the write committed, and its
+    /// commit published them), released when it is an error.
+    pub(crate) fn settle<T>(mut self, result: Result<T>) -> Result<T> {
+        if result.is_ok() {
+            self.rows = crate::metadata_writer::StartedRows::default();
+        }
+        result
+    }
+}
+
+impl Drop for ReleaseOnFailure {
+    fn drop(&mut self) {
+        if self.rows.is_empty() || std::thread::panicking() {
+            return;
+        }
+        if let Some(metadata) = &self.metadata
+            && let Err(error) = metadata.release_started_rows(&self.rows)
+        {
+            tracing::warn!(%error, "failed to remove the pending rows of a write that did not commit");
+        }
+    }
 }
 
 /// What a statement's rewritten delete file holds, kept so the commit can
@@ -1221,6 +1279,7 @@ impl DuckLakeTableWriter {
             Arc::new(self.validation_schema(schema_name, table_name, arrow_schema, mode)?);
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
         let setup = self.begin_write_transaction(schema_name, table_name, &columns, mode)?;
+        let release = ReleaseOnFailure::new(&self.metadata, &setup);
         // A session buffers its first rows while they number at most the
         // table's limit, as official's insert does, and commits them inlined
         // when the write ends there.
@@ -1383,6 +1442,7 @@ impl DuckLakeTableWriter {
             roller,
             rolled,
             commit_metadata: SnapshotCommitMetadata::default(),
+            release,
         })
     }
 
@@ -1619,7 +1679,7 @@ impl DuckLakeTableWriter {
         schema_name: &str,
         table_name: &str,
         arrow_schema: &Schema,
-    ) -> Result<StagedTableWrite> {
+    ) -> Result<(StagedTableWrite, ReleaseOnFailure)> {
         let validation_schema = self.validation_schema(
             schema_name,
             table_name,
@@ -1633,13 +1693,17 @@ impl DuckLakeTableWriter {
             &columns,
             WriteMode::CreateOrReplace,
         )?;
-        Ok(empty_replace_stage(
-            schema_name,
-            table_name,
-            setup.base_snapshot_id,
-            setup.table_id,
-            columns,
-            setup.field_ids,
+        let release = ReleaseOnFailure::new(&self.metadata, &setup);
+        Ok((
+            empty_replace_stage(
+                schema_name,
+                table_name,
+                setup.base_snapshot_id,
+                setup.table_id,
+                columns,
+                setup.field_ids,
+            ),
+            release,
         ))
     }
 
@@ -1665,11 +1729,12 @@ impl DuckLakeTableWriter {
         let arrow_schema = batches[0].schema();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         if total_rows == 0 && mode == WriteMode::CreateOrReplace {
-            let stage = self.prepare_empty_replace(schema_name, table_name, &arrow_schema)?;
-            let committed = self.with_inlining_limit(|| {
+            let (stage, release) =
+                self.prepare_empty_replace(schema_name, table_name, &arrow_schema)?;
+            let committed = release.settle(self.with_inlining_limit(|| {
                 self.metadata
                     .commit_multi_table(&[stage], &SnapshotCommitMetadata::new(), None)
-            })?;
+            }))?;
             return empty_replace_result(committed);
         }
         if total_rows > 0 {
@@ -2327,6 +2392,7 @@ impl DuckLakeTableWriter {
             self.refuse_encrypted_parquet("write a data file")?;
         }
         let setup = self.begin_write_transaction(schema_name, table_name, &columns, mode)?;
+        let release = ReleaseOnFailure::new(&self.metadata, &setup);
 
         // Validate the caller's assignment against the live spec BEFORE writing
         // anything (inline or Parquet), so a bad one costs no uploads. A wrong
@@ -2387,6 +2453,7 @@ impl DuckLakeTableWriter {
                     options.expected_base_snapshot_id,
                 )
             })?;
+            release.committed();
             return Ok(WriteResult {
                 snapshot_id: committed.snapshot_id,
                 table_id: committed.table_id,
@@ -2448,6 +2515,7 @@ impl DuckLakeTableWriter {
             },
         };
 
+        release.committed();
         Ok(WriteResult {
             snapshot_id: committed.snapshot_id,
             table_id: committed.table_id,
@@ -2577,6 +2645,7 @@ impl DuckLakeTableWriter {
             self.refuse_encrypted_parquet("write a data file")?;
         }
         let setup = self.begin_write_transaction(schema_name, table_name, &columns, mode)?;
+        let release = ReleaseOnFailure::new(&self.metadata, &setup);
 
         if !resolve_layout && self.metadata.live_partition_spec(setup.table_id)?.is_some() {
             return Err(crate::DuckLakeError::Conflict(
@@ -2624,6 +2693,7 @@ impl DuckLakeTableWriter {
                     None,
                 )
             })?;
+            release.committed();
             return Ok(WriteResult {
                 snapshot_id: committed.snapshot_id,
                 table_id: committed.table_id,
@@ -2695,6 +2765,7 @@ impl DuckLakeTableWriter {
             },
         };
 
+        release.committed();
         Ok(WriteResult {
             snapshot_id: committed.snapshot_id,
             table_id: committed.table_id,
@@ -2732,6 +2803,7 @@ impl DuckLakeTableWriter {
             self.refuse_encrypted_parquet("write a data file")?;
         }
         let setup = self.begin_write_transaction(schema_name, table_name, &columns, mode)?;
+        let release = ReleaseOnFailure::new(&self.metadata, &setup);
 
         if records_written == 0 {
             return Err(crate::error::DuckLakeError::InvalidConfig(
@@ -2787,6 +2859,7 @@ impl DuckLakeTableWriter {
                 files_written: 0,
                 records_written: records_written as i64,
                 rewrite_sources: Vec::new(),
+                release,
             });
         }
 
@@ -2854,6 +2927,7 @@ impl DuckLakeTableWriter {
             files_written,
             records_written,
             rewrite_sources: Vec::new(),
+            release,
         })
     }
 
@@ -3407,6 +3481,43 @@ impl<'a> DuckLakeWriteTransaction<'a> {
 }
 
 impl DuckLakeWriteTransaction<'_> {
+    /// Adds a stage. A row an earlier stage's start inserted and this stage's start took up —
+    /// still carrying that earlier start's UUID, so no other write took it up in between —
+    /// stays this transaction's: its release moves to this stage, which a dropped or refused
+    /// transaction releases after the stages before it, so a schema is removed after its
+    /// tables.
+    fn push(&mut self, mut prepared: PreparedTableWrite) {
+        fn adopt(
+            own: &mut Option<crate::metadata_writer::StartedRow>,
+            taken: Option<&crate::metadata_writer::TakenRow>,
+        ) -> Option<crate::metadata_writer::StartedRow> {
+            let taken = taken?;
+            let mine = own.as_ref().is_some_and(|own| {
+                own.id == taken.id && taken.previous.as_deref() == Some(own.uuid.as_str())
+            });
+            mine.then(|| {
+                *own = None;
+                crate::metadata_writer::StartedRow {
+                    id: taken.id,
+                    uuid: taken.uuid.clone(),
+                }
+            })
+        }
+        let started = prepared.release.rows.clone();
+        for earlier in &mut self.writes {
+            let rows = &mut earlier.release.rows;
+            if let Some(table) = adopt(&mut rows.table, started.taken_table.as_ref()) {
+                prepared.release.rows.table = Some(table);
+                prepared.release.rows.taken_table = None;
+            }
+            if let Some(schema) = adopt(&mut rows.schema, started.taken_schema.as_ref()) {
+                prepared.release.rows.schema = Some(schema);
+                prepared.release.rows.taken_schema = None;
+            }
+        }
+        self.writes.push(prepared);
+    }
+
     /// Stage the empty new table of a [`WriteMode::CreateOrReplace`] of no rows, which every
     /// `stage_write*` does where another mode stages nothing for no rows: the replace still
     /// drops the old table and creates the new one, as official's does.
@@ -3416,15 +3527,16 @@ impl DuckLakeWriteTransaction<'_> {
         table_name: &str,
         arrow_schema: &Schema,
     ) -> Result<()> {
-        let write = self
-            .writer
-            .prepare_empty_replace(schema_name, table_name, arrow_schema)?;
-        self.writes.push(PreparedTableWrite {
+        let (write, release) =
+            self.writer
+                .prepare_empty_replace(schema_name, table_name, arrow_schema)?;
+        self.push(PreparedTableWrite {
             write,
             object_paths: Vec::new(),
             files_written: 0,
             records_written: 0,
             rewrite_sources: Vec::new(),
+            release,
         });
         Ok(())
     }
@@ -3457,7 +3569,7 @@ impl DuckLakeWriteTransaction<'_> {
             .writer
             .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
             .await?;
-        self.writes.push(prepared);
+        self.push(prepared);
         Ok(())
     }
 
@@ -3482,7 +3594,7 @@ impl DuckLakeWriteTransaction<'_> {
         let prepared = writer
             .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
             .await?;
-        self.writes.push(prepared);
+        self.push(prepared);
         Ok(())
     }
 
@@ -3540,7 +3652,7 @@ impl DuckLakeWriteTransaction<'_> {
             .iter()
             .map(|name| (*name).to_string())
             .collect();
-        self.writes.push(prepared);
+        self.push(prepared);
         Ok(())
     }
 
@@ -3691,6 +3803,7 @@ impl DuckLakeWriteTransaction<'_> {
             &columns,
             WriteMode::Append,
         )?;
+        let release = ReleaseOnFailure::new(&self.writer.metadata, &setup);
         let object_paths = positional_deletes
             .iter()
             .map(|entry| {
@@ -3702,7 +3815,7 @@ impl DuckLakeWriteTransaction<'_> {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        self.writes.push(PreparedTableWrite {
+        self.push(PreparedTableWrite {
             write: StagedTableWrite {
                 table_id: setup.table_id,
                 schema_name: schema_name.to_string(),
@@ -3725,6 +3838,7 @@ impl DuckLakeWriteTransaction<'_> {
             files_written: 0,
             records_written: 0,
             rewrite_sources: Vec::new(),
+            release,
         });
         Ok(())
     }
@@ -3880,7 +3994,7 @@ impl DuckLakeWriteTransaction<'_> {
             },
             StagedTableData::None => (0, 0),
         };
-        self.writes.push(PreparedTableWrite {
+        self.push(PreparedTableWrite {
             write: StagedTableWrite {
                 table_id,
                 schema_name: schema_name.to_string(),
@@ -3903,6 +4017,8 @@ impl DuckLakeWriteTransaction<'_> {
             files_written,
             records_written,
             rewrite_sources,
+            // A row mutation has no start of its own: its table is live.
+            release: ReleaseOnFailure::default(),
         });
         Ok(())
     }
@@ -3998,6 +4114,10 @@ impl DuckLakeWriteTransaction<'_> {
             }
             return Err(e);
         };
+        // Committed: the rows the stages' starts made are published, not released.
+        for prepared in &mut self.writes {
+            std::mem::take(&mut prepared.release).committed();
+        }
         if committed.tables.len() != self.writes.len() {
             return Err(crate::error::DuckLakeError::Internal(format!(
                 "multi-table commit returned {} table ids for {} stages",
@@ -5172,7 +5292,9 @@ pub(crate) async fn remove_objects(
 /// session uploads its one file in `finish()`. Nothing is committed before
 /// `finish()`, which registers every file in one snapshot. A session dropped or
 /// [aborted](Self::abort) without finishing removes its staging files and every
-/// object it uploaded, and so does a `finish()` that fails with nothing committed.
+/// object it uploaded, and so does a `finish()` that fails with nothing committed; each
+/// also removes the pending schema and table rows its start made, unless another write's
+/// start has taken them up ([`MetadataWriter::release_started_rows`]).
 /// A `COMMIT` on a networked catalog that fails with its outcome unknown keeps
 /// them, where official DuckLake removes them, since the commit may have applied.
 /// Top-level column IDs drive statistics and partitions, while recursive field
@@ -5249,6 +5371,9 @@ pub struct TableWriteSession {
     /// Uploads the files the roller finishes, as it finishes them.
     rolled: StagedUploads,
     commit_metadata: SnapshotCommitMetadata,
+    /// The pending rows the session's start inserted: released when the session ends without
+    /// a commit (an abort, a failed `finish`, a session dropped unfinished).
+    release: ReleaseOnFailure,
 }
 
 /// The rows a [`TableWriteSession`] holds while they number at most the
@@ -5552,6 +5677,12 @@ impl TableWriteSession {
 
     #[tracing::instrument(name = "ducklake.write_session_finish", level = "info", skip_all)]
     pub async fn finish(mut self) -> Result<WriteResult> {
+        let release = std::mem::take(&mut self.release);
+        release.settle(self.finish_inner().await)
+    }
+
+    /// [`Self::finish`] without the release of the start's rows on a failure.
+    async fn finish_inner(mut self) -> Result<WriteResult> {
         if let Some(batches) = self.take_inlinable_rows()? {
             let batches = self.inline_order(batches)?;
             return self.commit_inlined(batches);
@@ -5825,6 +5956,15 @@ impl TableWriteSession {
     /// DuckLake removes a failed transaction's delete files. Only a `COMMIT` whose
     /// outcome is unknown (`DuckLakeError::CommitOutcomeUnknown`) keeps them.
     pub async fn finish_with_deletes(mut self, deletes: &[DeleteFileEntry]) -> Result<WriteResult> {
+        let release = std::mem::take(&mut self.release);
+        release.settle(self.finish_with_deletes_inner(deletes).await)
+    }
+
+    /// [`Self::finish_with_deletes`] without the release of the start's rows on a failure.
+    async fn finish_with_deletes_inner(
+        mut self,
+        deletes: &[DeleteFileEntry],
+    ) -> Result<WriteResult> {
         // No deletes means this IS a plain append, so take the ordinary commit path
         // and make the documented equivalence literal. This matters beyond
         // tidiness: the delete-carrying commit is implemented only by the backends

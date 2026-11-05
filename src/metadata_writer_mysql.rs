@@ -1008,6 +1008,191 @@ async fn reserve_ids(
     Ok(last)
 }
 
+/// Serializes every take-up-or-insert of a schema or table row by name — a write's start,
+/// `get_or_create_schema`, `get_or_create_table` — and the release of a start's rows: an
+/// exclusive lock on the `next_column_id` counter row, the row every write's start updates
+/// first ([`reserve_ids`]). Without it two of them could each read that no row of a name is
+/// there and each insert one. It is the transaction's first statement, so InnoDB's
+/// `REPEATABLE READ` read view, which its first plain read takes, is taken after the lock and
+/// sees every row a take-up holding it before committed.
+///
+/// **Lock order.** Every transaction that takes this lock takes it FIRST, before it locks any
+/// schema, table or column row: a write's start, `get_or_create_*`, `set_columns` and
+/// `release_started_rows`. One that locked a table row first and the counter second (as
+/// `set_columns` once did) could deadlock (1213) against a start or release holding the
+/// counter and waiting on that row. The commits never take this lock: they lock the
+/// `next_snapshot_id` counter, then table rows, and wait on no row a holder of this lock holds
+/// while waiting on them.
+async fn lock_catalog_names(tx: &mut sqlx::Transaction<'_, sqlx::MySql>) -> Result<()> {
+    sqlx::query(
+        "SELECT `value` FROM ducklake_metadata
+         WHERE `key` = 'next_column_id' AND scope IS NULL FOR UPDATE",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Whether the catalog's `table` has `column`: a catalog DuckDB made has `schema_uuid` and
+/// `table_uuid`; this crate's own schema has neither.
+async fn has_column(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    table: &str,
+    column: &str,
+) -> Result<bool> {
+    let found: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(found > 0)
+}
+
+/// A new live `ducklake_schema` row for `name` at `snapshot_id`, with a fresh UUID where the
+/// catalog has the column: the one insert `get_or_create_schema` and a write's start share.
+/// Returns the id and the UUID it was given.
+async fn insert_schema_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    name: &str,
+    path: &str,
+    snapshot_id: i64,
+) -> Result<(i64, Option<String>)> {
+    // No RETURNING: the new auto-increment id is read via last_insert_id().
+    if has_column(tx, "ducklake_schema", "schema_uuid").await? {
+        let uuid = crate::metadata_writer::take_up_uuid();
+        let id = sqlx::query(
+            "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot, schema_uuid)
+             VALUES (?, ?, 1, ?, ?)",
+        )
+        .bind(name)
+        .bind(path)
+        .bind(snapshot_id)
+        .bind(&uuid)
+        .execute(&mut **tx)
+        .await?
+        .last_insert_id() as i64;
+        return Ok((id, Some(uuid)));
+    }
+    let id = sqlx::query(
+        "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
+         VALUES (?, ?, 1, ?)",
+    )
+    .bind(name)
+    .bind(path)
+    .bind(snapshot_id)
+    .execute(&mut **tx)
+    .await?
+    .last_insert_id() as i64;
+    Ok((id, None))
+}
+
+/// A new live `ducklake_table` row, as [`insert_schema_row`]: the one insert
+/// `get_or_create_table` and a write's start share.
+async fn insert_table_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    schema_id: i64,
+    name: &str,
+    path: &str,
+    snapshot_id: i64,
+) -> Result<(i64, Option<String>)> {
+    if has_column(tx, "ducklake_table", "table_uuid").await? {
+        let uuid = crate::metadata_writer::take_up_uuid();
+        let id = sqlx::query(
+            "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot, table_uuid)
+             VALUES (?, ?, ?, 1, ?, ?)",
+        )
+        .bind(schema_id)
+        .bind(name)
+        .bind(path)
+        .bind(snapshot_id)
+        .bind(&uuid)
+        .execute(&mut **tx)
+        .await?
+        .last_insert_id() as i64;
+        return Ok((id, Some(uuid)));
+    }
+    let id = sqlx::query(
+        "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
+         VALUES (?, ?, ?, 1, ?)",
+    )
+    .bind(schema_id)
+    .bind(name)
+    .bind(path)
+    .bind(snapshot_id)
+    .execute(&mut **tx)
+    .await?
+    .last_insert_id() as i64;
+    Ok((id, None))
+}
+
+/// The take-up of the pending row `id` ([`crate::metadata_writer::NamedRow::Pending`]): a
+/// fresh UUID where the catalog has the column, so the start that inserted the row leaves it
+/// when it releases what it made, and nothing else — the row keeps its name and path. `table`
+/// picks `ducklake_table` over `ducklake_schema`. `None`: the row is no longer pending (read
+/// as it now is, `FOR UPDATE`); else the take-up, `None` inside when the catalog has no UUID
+/// column to record it by.
+async fn take_up_pending(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    table: bool,
+    id: i64,
+) -> Result<Option<Option<crate::metadata_writer::TakenRow>>> {
+    let (catalog_table, column, take_up) = if table {
+        (
+            "ducklake_table",
+            "table_uuid",
+            crate::metadata_writer::TAKE_UP_TABLE_SQL,
+        )
+    } else {
+        (
+            "ducklake_schema",
+            "schema_uuid",
+            crate::metadata_writer::TAKE_UP_SCHEMA_SQL,
+        )
+    };
+    let pending = crate::metadata_writer::PENDING_SNAPSHOT;
+    if !has_column(tx, catalog_table, column).await? {
+        let found: Option<i64> = sqlx::query_scalar(if table {
+            "SELECT table_id FROM ducklake_table WHERE table_id = ? AND begin_snapshot = ? FOR UPDATE"
+        } else {
+            "SELECT schema_id FROM ducklake_schema WHERE schema_id = ? AND begin_snapshot = ? FOR UPDATE"
+        })
+        .bind(id)
+        .bind(pending)
+        .fetch_optional(&mut **tx)
+        .await?;
+        return Ok(found.map(|_| None));
+    }
+    let previous: Option<(Option<String>,)> = sqlx::query_as(if table {
+        "SELECT CAST(table_uuid AS CHAR) FROM ducklake_table
+         WHERE table_id = ? AND begin_snapshot = ? FOR UPDATE"
+    } else {
+        "SELECT CAST(schema_uuid AS CHAR) FROM ducklake_schema
+         WHERE schema_id = ? AND begin_snapshot = ? FOR UPDATE"
+    })
+    .bind(id)
+    .bind(pending)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((previous,)) = previous else {
+        return Ok(None);
+    };
+    let uuid = crate::metadata_writer::take_up_uuid();
+    sqlx::query(take_up)
+        .bind(&uuid)
+        .bind(id)
+        .bind(pending)
+        .execute(&mut **tx)
+        .await?;
+    Ok(Some(Some(crate::metadata_writer::TakenRow {
+        id,
+        previous,
+        uuid,
+    })))
+}
+
 async fn reserve_file_ids(tx: &mut sqlx::Transaction<'_, sqlx::MySql>, n: i64) -> Result<Vec<i64>> {
     let last = reserve_ids(tx, "next_file_id", n).await?;
     Ok(((last - n + 1)..=last).collect())
@@ -3745,32 +3930,35 @@ impl MetadataWriter for MySqlMetadataWriter {
         validate_name(name, "Schema")?;
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
+            lock_catalog_names(&mut tx).await?;
             // A committed schema is returned; one a write's start has made and not yet
             // committed (pending) is taken up, created here at this snapshot, rather than
             // made a second time beside it.
-            let existing: Option<(i64, i64)> = sqlx::query_as(
-                concat!("SELECT schema_id, begin_snapshot FROM ducklake_schema
-                 WHERE ", crate::catalog_name::name_eq!(mysql, "schema_name", "?"), " AND end_snapshot IS NULL
-                 ORDER BY begin_snapshot LIMIT 1"),
-            )
+            let existing: Option<(i64, i64)> = sqlx::query_as(concat!(
+                "SELECT schema_id, begin_snapshot FROM ducklake_schema
+                 WHERE ",
+                crate::catalog_name::name_eq!(mysql, "schema_name", "?"),
+                " AND end_snapshot IS NULL
+                 ORDER BY begin_snapshot LIMIT 1"
+            ))
             .bind(name)
             .fetch_optional(&mut *tx)
             .await?;
             let schema_path = directory_path(path.unwrap_or(name));
-            let schema_id: i64 = match existing {
-                Some((schema_id, begin)) if begin != crate::metadata_writer::PENDING_SNAPSHOT => {
+            let schema_id: i64 = match crate::metadata_writer::NamedRow::of(existing) {
+                crate::metadata_writer::NamedRow::Committed(schema_id) => {
                     tx.commit().await?;
                     return Ok((schema_id, false));
-                }
-                Some((schema_id, _)) => {
+                },
+                crate::metadata_writer::NamedRow::Pending(schema_id) => {
                     // Only while it is still pending: one a commit stamped since is returned as
-                    // found.
+                    // found. A taken-up row keeps its path: a write in flight may be
+                    // putting its files there (#29); `path` applies only to a row inserted here.
                     let taken = sqlx::query(
-                        "UPDATE ducklake_schema SET begin_snapshot = ?, path = COALESCE(?, path)
+                        "UPDATE ducklake_schema SET begin_snapshot = ?
                          WHERE schema_id = ? AND begin_snapshot = ?",
                     )
                     .bind(snapshot_id)
-                    .bind(path.map(directory_path))
                     .bind(schema_id)
                     .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                     .execute(&mut *tx)
@@ -3781,20 +3969,12 @@ impl MetadataWriter for MySqlMetadataWriter {
                         return Ok((schema_id, false));
                     }
                     schema_id
-                }
-                None => {
-                    // No RETURNING: read the new auto-increment id via last_insert_id().
-                    sqlx::query(
-                        "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                         VALUES (?, ?, 1, ?)",
-                    )
-                    .bind(name)
-                    .bind(&schema_path)
-                    .bind(snapshot_id)
-                    .execute(&mut *tx)
-                    .await?
-                    .last_insert_id() as i64
-                }
+                },
+                crate::metadata_writer::NamedRow::Absent => {
+                    insert_schema_row(&mut tx, name, &schema_path, snapshot_id)
+                        .await?
+                        .0
+                },
             };
 
             record_snapshot_changes(
@@ -3814,77 +3994,52 @@ impl MetadataWriter for MySqlMetadataWriter {
         schema_id: i64,
         name: &str,
         path: Option<&str>,
-        snapshot_id: i64,
+        _snapshot_id: i64,
     ) -> Result<(i64, bool)> {
         validate_name(name, "Table")?;
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
-            // As `get_or_create_schema`: a pending table is taken up, not made twice.
-            let existing: Option<(i64, i64)> = sqlx::query_as(
-                concat!("SELECT table_id, begin_snapshot FROM ducklake_table
-                 WHERE schema_id = ? AND ", crate::catalog_name::name_eq!(mysql, "table_name", "?"), " AND end_snapshot IS NULL
-                 ORDER BY begin_snapshot LIMIT 1"),
-            )
+            lock_catalog_names(&mut tx).await?;
+            // As `get_or_create_schema`: a pending table is taken up, not made twice. Unlike a
+            // schema, a table is not published here: a table with no columns is none to a
+            // reader (DuckDB will not load a lake at a snapshot holding one), so the row stays
+            // pending until `set_columns` publishes it with its columns.
+            let existing: Option<(i64, i64)> = sqlx::query_as(concat!(
+                "SELECT table_id, begin_snapshot FROM ducklake_table
+                 WHERE schema_id = ? AND ",
+                crate::catalog_name::name_eq!(mysql, "table_name", "?"),
+                " AND end_snapshot IS NULL
+                 ORDER BY begin_snapshot LIMIT 1"
+            ))
             .bind(schema_id)
             .bind(name)
             .fetch_optional(&mut *tx)
             .await?;
-            let pending = match existing {
-                Some((table_id, begin)) if begin != crate::metadata_writer::PENDING_SNAPSHOT => {
+            let table_id = match crate::metadata_writer::NamedRow::of(existing) {
+                crate::metadata_writer::NamedRow::Committed(table_id) => {
                     tx.commit().await?;
                     return Ok((table_id, false));
-                }
-                Some((table_id, _)) => Some(table_id),
-                None => None,
-            };
-
-            let schema_name: String =
-                sqlx::query_scalar("SELECT schema_name FROM ducklake_schema WHERE schema_id = ?")
-                    .bind(schema_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-
-            let table_path = directory_path(path.unwrap_or(name));
-            let table_id: i64 = match pending {
-                Some(table_id) => {
-                    // As for the schema: only while it is still pending.
-                    let taken = sqlx::query(
-                        "UPDATE ducklake_table SET begin_snapshot = ?, path = COALESCE(?, path)
-                         WHERE table_id = ? AND begin_snapshot = ?",
-                    )
-                    .bind(snapshot_id)
-                    .bind(path.map(directory_path))
-                    .bind(table_id)
-                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected();
-                    if taken == 0 {
+                },
+                crate::metadata_writer::NamedRow::Pending(table_id) => {
+                    // As for the schema: only while it is still pending, and its path kept.
+                    if take_up_pending(&mut tx, true, table_id).await?.is_none() {
                         tx.commit().await?;
                         return Ok((table_id, false));
                     }
                     table_id
-                }
-                None => sqlx::query(
-                    "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                     VALUES (?, ?, ?, 1, ?)",
-                )
-                .bind(schema_id)
-                .bind(name)
-                .bind(&table_path)
-                .bind(snapshot_id)
-                .execute(&mut *tx)
-                .await?
-                .last_insert_id() as i64,
+                },
+                crate::metadata_writer::NamedRow::Absent => {
+                    insert_table_row(
+                        &mut tx,
+                        schema_id,
+                        name,
+                        &directory_path(path.unwrap_or(name)),
+                        crate::metadata_writer::PENDING_SNAPSHOT,
+                    )
+                    .await?
+                    .0
+                },
             };
-
-            record_snapshot_changes(
-                &mut tx,
-                snapshot_id,
-                &format!("created_table:{}", quote_snapshot_table(&schema_name, name)),
-                &SnapshotCommitMetadata::default(),
-            )
-            .await?;
             tx.commit().await?;
             Ok((table_id, true))
         })
@@ -3999,8 +4154,27 @@ impl MetadataWriter for MySqlMetadataWriter {
         }
         self.block_on(async {
             // Transaction for atomicity: if column insertion fails, we don't leave
-            // existing columns marked as ended.
+            // existing columns marked as ended. The counter lock first, as every holder of
+            // it takes it ([`lock_catalog_names`]).
             let mut tx = self.pool.begin().await?;
+            lock_catalog_names(&mut tx).await?;
+            let table_begin_snapshot: i64 =
+                sqlx::query_scalar("SELECT begin_snapshot FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            // A table `get_or_create_table` left pending is published here, with its columns.
+            let publishes = table_begin_snapshot == crate::metadata_writer::PENDING_SNAPSHOT;
+            if publishes {
+                sqlx::query(
+                    "UPDATE ducklake_table SET begin_snapshot = ? WHERE table_id = ? AND begin_snapshot = ?",
+                )
+                .bind(snapshot_id)
+                .bind(table_id)
+                .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+                .execute(&mut *tx)
+                .await?;
+            }
 
             sqlx::query(
                 "UPDATE ducklake_column SET end_snapshot = ?
@@ -4044,12 +4218,20 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .await?;
             }
 
-            let table_begin_snapshot: i64 =
-                sqlx::query_scalar("SELECT begin_snapshot FROM ducklake_table WHERE table_id = ?")
-                    .bind(table_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            if table_begin_snapshot != snapshot_id {
+            if publishes {
+                let (schema_name, table_name): (String, String) =
+                    sqlx::query_as(crate::metadata_writer::STORED_NAMES_OF_TABLE_SQL)
+                        .bind(table_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                record_snapshot_changes(
+                    &mut tx,
+                    snapshot_id,
+                    &format!("created_table:{}", quote_snapshot_table(&schema_name, &table_name)),
+                    &SnapshotCommitMetadata::default(),
+                )
+                .await?;
+            } else if table_begin_snapshot != snapshot_id {
                 record_snapshot_changes(
                     &mut tx,
                     snapshot_id,
@@ -6222,6 +6404,70 @@ impl MetadataWriter for MySqlMetadataWriter {
         })
     }
 
+    fn release_started_rows(&self, rows: &crate::metadata_writer::StartedRows) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let pending = crate::metadata_writer::PENDING_SNAPSHOT;
+        self.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog_names(&mut tx).await?;
+            // Schema row before table row, the order a commit stamps them in, so a release
+            // never holds a table row while waiting on its schema.
+            for schema_id in [
+                rows.schema.as_ref().map(|row| row.id),
+                rows.taken_schema.as_ref().map(|row| row.id),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                sqlx::query("SELECT schema_id FROM ducklake_schema WHERE schema_id = ? FOR UPDATE")
+                    .bind(schema_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            }
+            if let Some(table) = &rows.table {
+                sqlx::query(crate::metadata_writer::RELEASE_TABLE_SQL)
+                    .bind(table.id)
+                    .bind(pending)
+                    .bind(&table.uuid)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            if let Some(schema) = &rows.schema {
+                sqlx::query(crate::metadata_writer::RELEASE_SCHEMA_SQL)
+                    .bind(schema.id)
+                    .bind(pending)
+                    .bind(&schema.uuid)
+                    .bind(schema.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            for (sql, taken) in [
+                (
+                    crate::metadata_writer::HAND_BACK_TABLE_SQL,
+                    &rows.taken_table,
+                ),
+                (
+                    crate::metadata_writer::HAND_BACK_SCHEMA_SQL,
+                    &rows.taken_schema,
+                ),
+            ] {
+                if let Some(taken) = taken {
+                    sqlx::query(sql)
+                        .bind(&taken.previous)
+                        .bind(taken.id)
+                        .bind(pending)
+                        .bind(&taken.uuid)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
     fn get_table_column_nullability(
         &self,
         schema_name: &str,
@@ -6519,6 +6765,7 @@ impl MetadataWriter for MySqlMetadataWriter {
         }
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
+            lock_catalog_names(&mut tx).await?;
 
             // Reserve the column ids first so the counter UPDATE takes the write
             // lock up front. These ids match the staged parquet field ids.
@@ -6542,55 +6789,73 @@ impl MetadataWriter for MySqlMetadataWriter {
             // commit (finalize_snapshot), so it may differ under concurrency.
             let snapshot_id: i64 = base_snapshot_id + 1;
 
-            let schema_id: i64 = {
-                let existing = sqlx::query(
-                    concat!("SELECT schema_id FROM ducklake_schema
-                     WHERE ", crate::catalog_name::name_eq!(mysql, "schema_name", "?"), " AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1"),
-                )
-                .bind(schema_name)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                if let Some(row) = existing {
-                    row.try_get(0)?
-                } else {
-                    let result = sqlx::query(
-                        "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                         VALUES (?, ?, 1, ?)",
+            // Pending rows this start inserts, which the write releases if it never commits.
+            let mut started = crate::metadata_writer::StartedRows::default();
+            let existing: Option<(i64, i64)> = sqlx::query_as(concat!(
+                "SELECT schema_id, begin_snapshot FROM ducklake_schema
+                 WHERE ",
+                crate::catalog_name::name_eq!(mysql, "schema_name", "?"),
+                " AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1"
+            ))
+            .bind(schema_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let schema_id: i64 = match crate::metadata_writer::NamedRow::of(existing) {
+                crate::metadata_writer::NamedRow::Committed(schema_id) => schema_id,
+                crate::metadata_writer::NamedRow::Pending(schema_id) => {
+                    started.taken_schema = take_up_pending(&mut tx, false, schema_id)
+                        .await?
+                        .flatten();
+                    schema_id
+                }
+                crate::metadata_writer::NamedRow::Absent => {
+                    let (schema_id, uuid) = insert_schema_row(
+                        &mut tx,
+                        schema_name,
+                        &directory_path(schema_name),
+                        crate::metadata_writer::PENDING_SNAPSHOT,
                     )
-                    .bind(schema_name)
-                    .bind(directory_path(schema_name))
-                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
-                    .execute(&mut *tx)
                     .await?;
-                    result.last_insert_id() as i64
+                    started.schema = uuid.map(|uuid| crate::metadata_writer::StartedRow {
+                        id: schema_id,
+                        uuid,
+                    });
+                    schema_id
                 }
             };
 
-            let table_id: i64 = {
-                let existing = sqlx::query(
-                    concat!("SELECT table_id FROM ducklake_table
-                     WHERE schema_id = ? AND ", crate::catalog_name::name_eq!(mysql, "table_name", "?"), " AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1"),
-                )
-                .bind(schema_id)
-                .bind(table_name)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                if let Some(row) = existing {
-                    row.try_get(0)?
-                } else {
-                    let result = sqlx::query(
-                        "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                         VALUES (?, ?, ?, 1, ?)",
+            let existing: Option<(i64, i64)> = sqlx::query_as(concat!(
+                "SELECT table_id, begin_snapshot FROM ducklake_table
+                 WHERE schema_id = ? AND ",
+                crate::catalog_name::name_eq!(mysql, "table_name", "?"),
+                " AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1"
+            ))
+            .bind(schema_id)
+            .bind(table_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let table_id: i64 = match crate::metadata_writer::NamedRow::of(existing) {
+                crate::metadata_writer::NamedRow::Committed(table_id) => table_id,
+                crate::metadata_writer::NamedRow::Pending(table_id) => {
+                    started.taken_table = take_up_pending(&mut tx, true, table_id)
+                        .await?
+                        .flatten();
+                    table_id
+                }
+                crate::metadata_writer::NamedRow::Absent => {
+                    let (table_id, uuid) = insert_table_row(
+                        &mut tx,
+                        schema_id,
+                        table_name,
+                        &directory_path(table_name),
+                        crate::metadata_writer::PENDING_SNAPSHOT,
                     )
-                    .bind(schema_id)
-                    .bind(table_name)
-                    .bind(directory_path(table_name))
-                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
-                    .execute(&mut *tx)
                     .await?;
-                    result.last_insert_id() as i64
+                    started.table = uuid.map(|uuid| crate::metadata_writer::StartedRow {
+                        id: table_id,
+                        uuid,
+                    });
+                    table_id
                 }
             };
 
@@ -6701,6 +6966,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 table_id,
                 column_ids: top_level_column_ids(&catalog_columns, &field_ids)?,
                 field_ids,
+                started,
             })
         })
     }

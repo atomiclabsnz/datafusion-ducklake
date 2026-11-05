@@ -242,6 +242,7 @@ impl DuckLakeTableWriter {
             &columns,
             crate::metadata_writer::WriteMode::Append,
         )?;
+        let release = crate::table_writer::ReleaseOnFailure::new(self.metadata_writer(), &setup);
         let base_snapshot = options.base_snapshot.unwrap_or(setup.base_snapshot_id);
         let live_spec = self.metadata_writer().live_partition_spec(setup.table_id)?;
         let keep_partitions = match (&live_spec, &manifest.partition_spec) {
@@ -304,7 +305,7 @@ impl DuckLakeTableWriter {
             )
         }
         .await;
-        match result {
+        match release.settle(result) {
             Ok(commit) => Ok(ImportResult {
                 snapshot_id: commit.snapshot_id,
                 table_id: commit.table_id,

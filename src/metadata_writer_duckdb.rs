@@ -1251,6 +1251,131 @@ impl DuckdbMetadataWriter {
     }
 }
 
+/// Whether the catalog's `table` has `column`: `schema_uuid` and `table_uuid` in every
+/// catalog DuckDB or this crate's `initialize_schema` made, but not in one older than both.
+fn has_column(tx: &Transaction<'_>, table: &str, column: &str) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT count(*) > 0 FROM information_schema.columns
+         WHERE table_catalog = current_database() AND table_schema = current_schema()
+           AND table_name = ? AND column_name = ?",
+        params![table, column],
+        |row| row.get(0),
+    )?)
+}
+
+/// A new live `ducklake_schema` row for `name` at `snapshot_id`, with a fresh UUID where the
+/// catalog has the column: the one insert `get_or_create_schema` and a write's start share.
+/// Returns the id and the UUID it was given.
+fn insert_schema_row(
+    tx: &Transaction<'_>,
+    name: &str,
+    path: &str,
+    snapshot_id: i64,
+) -> Result<(i64, Option<String>)> {
+    if has_column(tx, "ducklake_schema", "schema_uuid")? {
+        let uuid = crate::metadata_writer::take_up_uuid();
+        let id = tx.query_row(
+            "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot, schema_uuid)
+             VALUES (?, ?, true, ?, CAST(? AS UUID)) RETURNING schema_id",
+            params![name, path, snapshot_id, uuid],
+            |row| row.get(0),
+        )?;
+        return Ok((id, Some(uuid)));
+    }
+    let id = tx.query_row(
+        "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
+         VALUES (?, ?, true, ?) RETURNING schema_id",
+        params![name, path, snapshot_id],
+        |row| row.get(0),
+    )?;
+    Ok((id, None))
+}
+
+/// A new live `ducklake_table` row, as [`insert_schema_row`]: the one insert
+/// `get_or_create_table` and a write's start share.
+fn insert_table_row(
+    tx: &Transaction<'_>,
+    schema_id: i64,
+    name: &str,
+    path: &str,
+    snapshot_id: i64,
+) -> Result<(i64, Option<String>)> {
+    if has_column(tx, "ducklake_table", "table_uuid")? {
+        let uuid = crate::metadata_writer::take_up_uuid();
+        let id = tx.query_row(
+            "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot, table_uuid)
+             VALUES (?, ?, ?, true, ?, CAST(? AS UUID)) RETURNING table_id",
+            params![schema_id, name, path, snapshot_id, uuid],
+            |row| row.get(0),
+        )?;
+        return Ok((id, Some(uuid)));
+    }
+    let id = tx.query_row(
+        "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
+         VALUES (?, ?, ?, true, ?) RETURNING table_id",
+        params![schema_id, name, path, snapshot_id],
+        |row| row.get(0),
+    )?;
+    Ok((id, None))
+}
+
+/// The take-up of the pending row `id` ([`crate::metadata_writer::NamedRow::Pending`]): a
+/// fresh UUID where the catalog has the column, so the start that inserted the row leaves it
+/// when it releases what it made, and nothing else — the row keeps its name and path. `table`
+/// picks `ducklake_table` over `ducklake_schema`. `None`: the row is no longer pending; else
+/// the take-up, `None` inside when the catalog has no UUID column to record it by.
+fn take_up_pending(
+    tx: &Transaction<'_>,
+    table: bool,
+    id: i64,
+) -> Result<Option<Option<crate::metadata_writer::TakenRow>>> {
+    let (catalog_table, column, read, take_up) = if table {
+        (
+            "ducklake_table",
+            "table_uuid",
+            "SELECT CAST(table_uuid AS VARCHAR) FROM ducklake_table
+             WHERE table_id = ? AND begin_snapshot = ?",
+            crate::metadata_writer::TAKE_UP_TABLE_SQL_DUCKDB,
+        )
+    } else {
+        (
+            "ducklake_schema",
+            "schema_uuid",
+            "SELECT CAST(schema_uuid AS VARCHAR) FROM ducklake_schema
+             WHERE schema_id = ? AND begin_snapshot = ?",
+            crate::metadata_writer::TAKE_UP_SCHEMA_SQL_DUCKDB,
+        )
+    };
+    let pending = crate::metadata_writer::PENDING_SNAPSHOT;
+    if !has_column(tx, catalog_table, column)? {
+        let still_pending: bool = tx.query_row(
+            if table {
+                "SELECT count(*) > 0 FROM ducklake_table WHERE table_id = ? AND begin_snapshot = ?"
+            } else {
+                "SELECT count(*) > 0 FROM ducklake_schema WHERE schema_id = ? AND begin_snapshot = ?"
+            },
+            params![id, pending],
+            |row| row.get(0),
+        )?;
+        return Ok(still_pending.then_some(None));
+    }
+    let Some(previous) = tx
+        .query_row(read, params![id, pending], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let uuid = crate::metadata_writer::take_up_uuid();
+    tx.execute(take_up, params![uuid, id, pending])?;
+    Ok(Some(Some(crate::metadata_writer::TakenRow {
+        id,
+        previous,
+        uuid,
+    })))
+}
+
 /// Atomically reserve `n` consecutive ids from a monotonic counter row in
 /// `ducklake_metadata` (seeded by `initialize_schema`), returning the LAST id of
 /// the block — the reserved ids are `last - n + 1 ..= last`. Mirrors the SQLite
@@ -3617,22 +3742,19 @@ impl MetadataWriter for DuckdbMetadataWriter {
             )
             .optional()?;
         let schema_path = directory_path(path.unwrap_or(name));
-        let schema_id: i64 = match existing {
-            Some((schema_id, begin)) if begin != crate::metadata_writer::PENDING_SNAPSHOT => {
+        let schema_id: i64 = match crate::metadata_writer::NamedRow::of(existing) {
+            crate::metadata_writer::NamedRow::Committed(schema_id) => {
                 tx.commit()?;
                 return Ok((schema_id, false));
             },
-            Some((schema_id, _)) => {
+            crate::metadata_writer::NamedRow::Pending(schema_id) => {
                 // Only while it is still pending: one a commit stamped since is returned as found.
+                // A taken-up row keeps its path: a write in flight may be putting its files
+                // there (#29); `path` applies only to a row inserted here.
                 let taken = tx.execute(
-                    "UPDATE ducklake_schema SET begin_snapshot = ?, path = COALESCE(?, path)
+                    "UPDATE ducklake_schema SET begin_snapshot = ?
                      WHERE schema_id = ? AND begin_snapshot = ?",
-                    params![
-                        snapshot_id,
-                        path.map(directory_path),
-                        schema_id,
-                        crate::metadata_writer::PENDING_SNAPSHOT
-                    ],
+                    params![snapshot_id, schema_id, crate::metadata_writer::PENDING_SNAPSHOT],
                 )?;
                 if taken == 0 {
                     tx.commit()?;
@@ -3640,12 +3762,9 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 }
                 schema_id
             },
-            None => tx.query_row(
-                "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                 VALUES (?, ?, true, ?) RETURNING schema_id",
-                params![name, schema_path, snapshot_id],
-                |row| row.get(0),
-            )?,
+            crate::metadata_writer::NamedRow::Absent => {
+                insert_schema_row(&tx, name, &schema_path, snapshot_id)?.0
+            },
         };
         record_snapshot_changes(
             &tx,
@@ -3662,13 +3781,16 @@ impl MetadataWriter for DuckdbMetadataWriter {
         schema_id: i64,
         name: &str,
         path: Option<&str>,
-        snapshot_id: i64,
+        _snapshot_id: i64,
     ) -> Result<(i64, bool)> {
         validate_name(name, "Table")?;
         let mut conn = self.connection();
         let tx = conn.transaction()?;
 
-        // As `get_or_create_schema`: a pending table is taken up, not made twice.
+        // As `get_or_create_schema`: a pending table is taken up, not made twice. Unlike a
+        // schema, a table is not published here: a table with no columns is none to a reader
+        // (DuckDB will not load a lake at a snapshot holding one), so the row stays pending
+        // until `set_columns` publishes it with its columns.
         let existing: Option<(i64, i64)> = tx
             .query_row(
                 concat!(
@@ -3682,54 +3804,30 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let pending = match existing {
-            Some((table_id, begin)) if begin != crate::metadata_writer::PENDING_SNAPSHOT => {
+        let table_id = match crate::metadata_writer::NamedRow::of(existing) {
+            crate::metadata_writer::NamedRow::Committed(table_id) => {
                 tx.commit()?;
                 return Ok((table_id, false));
             },
-            Some((table_id, _)) => Some(table_id),
-            None => None,
-        };
-
-        let schema_name: String = tx.query_row(
-            "SELECT schema_name FROM ducklake_schema WHERE schema_id = ?",
-            params![schema_id],
-            |row| row.get(0),
-        )?;
-
-        let table_path = directory_path(path.unwrap_or(name));
-        let table_id: i64 = match pending {
-            Some(table_id) => {
-                // As for the schema: only while it is still pending.
-                let taken = tx.execute(
-                    "UPDATE ducklake_table SET begin_snapshot = ?, path = COALESCE(?, path)
-                     WHERE table_id = ? AND begin_snapshot = ?",
-                    params![
-                        snapshot_id,
-                        path.map(directory_path),
-                        table_id,
-                        crate::metadata_writer::PENDING_SNAPSHOT
-                    ],
-                )?;
-                if taken == 0 {
+            crate::metadata_writer::NamedRow::Pending(table_id) => {
+                // As for the schema: only while it is still pending, and its path kept.
+                if take_up_pending(&tx, true, table_id)?.is_none() {
                     tx.commit()?;
                     return Ok((table_id, false));
                 }
                 table_id
-            }
-            None => tx.query_row(
-                "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                 VALUES (?, ?, ?, true, ?) RETURNING table_id",
-                params![schema_id, name, table_path, snapshot_id],
-                |row| row.get(0),
-            )?,
+            },
+            crate::metadata_writer::NamedRow::Absent => {
+                insert_table_row(
+                    &tx,
+                    schema_id,
+                    name,
+                    &directory_path(path.unwrap_or(name)),
+                    crate::metadata_writer::PENDING_SNAPSHOT,
+                )?
+                .0
+            },
         };
-        record_snapshot_changes(
-            &tx,
-            snapshot_id,
-            &format!("created_table:{}", quote_snapshot_table(&schema_name, name)),
-            &SnapshotCommitMetadata::default(),
-        )?;
         tx.commit()?;
         Ok((table_id, true))
     }
@@ -3839,6 +3937,20 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let mut conn = self.connection();
         let tx = conn.transaction()?;
 
+        let table_begin_snapshot: i64 = tx.query_row(
+            "SELECT begin_snapshot FROM ducklake_table WHERE table_id = ?",
+            params![table_id],
+            |row| row.get(0),
+        )?;
+        // A table `get_or_create_table` left pending is published here, with its columns.
+        let publishes = table_begin_snapshot == crate::metadata_writer::PENDING_SNAPSHOT;
+        if publishes {
+            tx.execute(
+                "UPDATE ducklake_table SET begin_snapshot = ? WHERE table_id = ? AND begin_snapshot = ?",
+                params![snapshot_id, table_id, crate::metadata_writer::PENDING_SNAPSHOT],
+            )?;
+        }
+
         tx.execute(
             "UPDATE ducklake_column SET end_snapshot = ?
              WHERE table_id = ? AND end_snapshot IS NULL",
@@ -3878,12 +3990,22 @@ impl MetadataWriter for DuckdbMetadataWriter {
             )?;
         }
 
-        let table_begin_snapshot: i64 = tx.query_row(
-            "SELECT begin_snapshot FROM ducklake_table WHERE table_id = ?",
-            params![table_id],
-            |row| row.get(0),
-        )?;
-        if table_begin_snapshot != snapshot_id {
+        if publishes {
+            let (schema_name, table_name): (String, String) = tx.query_row(
+                crate::metadata_writer::STORED_NAMES_OF_TABLE_SQL,
+                params![table_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            record_snapshot_changes(
+                &tx,
+                snapshot_id,
+                &format!(
+                    "created_table:{}",
+                    quote_snapshot_table(&schema_name, &table_name)
+                ),
+                &SnapshotCommitMetadata::default(),
+            )?;
+        } else if table_begin_snapshot != snapshot_id {
             record_snapshot_changes(
                 &tx,
                 snapshot_id,
@@ -5728,6 +5850,43 @@ impl MetadataWriter for DuckdbMetadataWriter {
         Ok(crate::metadata_writer::stored_location(found))
     }
 
+    fn release_started_rows(&self, rows: &crate::metadata_writer::StartedRows) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let pending = crate::metadata_writer::PENDING_SNAPSHOT;
+        if let Some(table) = &rows.table {
+            tx.execute(
+                crate::metadata_writer::RELEASE_TABLE_SQL_DUCKDB,
+                params![table.id, pending, table.uuid],
+            )?;
+        }
+        if let Some(schema) = &rows.schema {
+            tx.execute(
+                crate::metadata_writer::RELEASE_SCHEMA_SQL_DUCKDB,
+                params![schema.id, pending, schema.uuid, schema.id],
+            )?;
+        }
+        for (sql, taken) in [
+            (
+                crate::metadata_writer::HAND_BACK_TABLE_SQL_DUCKDB,
+                &rows.taken_table,
+            ),
+            (
+                crate::metadata_writer::HAND_BACK_SCHEMA_SQL_DUCKDB,
+                &rows.taken_schema,
+            ),
+        ] {
+            if let Some(taken) = taken {
+                tx.execute(sql, params![taken.previous, taken.id, pending, taken.uuid])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn get_table_column_nullability(
         &self,
         schema_name: &str,
@@ -5882,52 +6041,73 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // commit (finalize_snapshot), so it may differ under concurrency.
         let snapshot_id: i64 = base_snapshot_id + 1;
 
-        let schema_id: i64 = {
-            let existing: Option<i64> = tx
-                .query_row(
-                    concat!(
-                        "SELECT schema_id FROM ducklake_schema
-                     WHERE ",
-                        crate::catalog_name::name_eq!(duckdb, "schema_name", "?"),
-                        " AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1"
-                    ),
-                    params![schema_name],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match existing {
-                Some(id) => id,
-                None => tx.query_row(
-                    "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                     VALUES (?, ?, true, ?) RETURNING schema_id",
-                    params![schema_name, directory_path(schema_name), crate::metadata_writer::PENDING_SNAPSHOT],
-                    |row| row.get(0),
-                )?,
-            }
+        // Pending rows this start inserts, which the write releases if it never commits.
+        let mut started = crate::metadata_writer::StartedRows::default();
+        let existing: Option<(i64, i64)> = tx
+            .query_row(
+                concat!(
+                    "SELECT schema_id, begin_snapshot FROM ducklake_schema
+                 WHERE ",
+                    crate::catalog_name::name_eq!(duckdb, "schema_name", "?"),
+                    " AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1"
+                ),
+                params![schema_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let schema_id: i64 = match crate::metadata_writer::NamedRow::of(existing) {
+            crate::metadata_writer::NamedRow::Committed(schema_id) => schema_id,
+            crate::metadata_writer::NamedRow::Pending(schema_id) => {
+                started.taken_schema = take_up_pending(&tx, false, schema_id)?.flatten();
+                schema_id
+            },
+            crate::metadata_writer::NamedRow::Absent => {
+                let (schema_id, uuid) = insert_schema_row(
+                    &tx,
+                    schema_name,
+                    &directory_path(schema_name),
+                    crate::metadata_writer::PENDING_SNAPSHOT,
+                )?;
+                started.schema = uuid.map(|uuid| crate::metadata_writer::StartedRow {
+                    id: schema_id,
+                    uuid,
+                });
+                schema_id
+            },
         };
 
-        let table_id: i64 = {
-            let existing: Option<i64> = tx
-                .query_row(
-                    concat!(
-                        "SELECT table_id FROM ducklake_table
-                     WHERE schema_id = ? AND ",
-                        crate::catalog_name::name_eq!(duckdb, "table_name", "?"),
-                        " AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1"
-                    ),
-                    params![schema_id, table_name],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match existing {
-                Some(id) => id,
-                None => tx.query_row(
-                    "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                     VALUES (?, ?, ?, true, ?) RETURNING table_id",
-                    params![schema_id, table_name, directory_path(table_name), crate::metadata_writer::PENDING_SNAPSHOT],
-                    |row| row.get(0),
-                )?,
-            }
+        let existing: Option<(i64, i64)> = tx
+            .query_row(
+                concat!(
+                    "SELECT table_id, begin_snapshot FROM ducklake_table
+                 WHERE schema_id = ? AND ",
+                    crate::catalog_name::name_eq!(duckdb, "table_name", "?"),
+                    " AND end_snapshot IS NULL ORDER BY begin_snapshot LIMIT 1"
+                ),
+                params![schema_id, table_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let table_id: i64 = match crate::metadata_writer::NamedRow::of(existing) {
+            crate::metadata_writer::NamedRow::Committed(table_id) => table_id,
+            crate::metadata_writer::NamedRow::Pending(table_id) => {
+                started.taken_table = take_up_pending(&tx, true, table_id)?.flatten();
+                table_id
+            },
+            crate::metadata_writer::NamedRow::Absent => {
+                let (table_id, uuid) = insert_table_row(
+                    &tx,
+                    schema_id,
+                    table_name,
+                    &directory_path(table_name),
+                    crate::metadata_writer::PENDING_SNAPSHOT,
+                )?;
+                started.table = uuid.map(|uuid| crate::metadata_writer::StartedRow {
+                    id: table_id,
+                    uuid,
+                });
+                table_id
+            },
         };
 
         // Existing columns to (a) check schema compatibility and (b) REUSE each
@@ -6036,6 +6216,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             table_id,
             column_ids: top_level_column_ids(&catalog_columns, &field_ids)?,
             field_ids,
+            started,
         })
     }
 }

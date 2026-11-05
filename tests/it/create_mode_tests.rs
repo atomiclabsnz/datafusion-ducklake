@@ -874,7 +874,7 @@ async fn dropping_a_table_that_is_only_pending_drops_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_pending_table_taken_up_gets_the_path_it_is_created_with() {
+async fn a_pending_table_taken_up_keeps_its_path() {
     let temp = TempDir::new().unwrap();
     let (metadata, writer) = sqlite_writers(&temp).await;
     {
@@ -900,7 +900,7 @@ async fn a_pending_table_taken_up_gets_the_path_it_is_created_with() {
     .await
     .unwrap();
     assert_eq!(
-        path, "custom/",
-        "the take-up records the path it is created with"
+        path, "p/",
+        "a taken-up row keeps its path: a write in flight may be putting its files there"
     );
 }

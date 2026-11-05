@@ -100,6 +100,163 @@ pub enum WriteMode {
 /// stamps do, so no SQL spells the sentinel as a literal.
 pub(crate) const PENDING_SNAPSHOT: i64 = i64::MAX;
 
+/// What a lookup by name of a live schema or table row found, from its `(id, begin_snapshot)`:
+/// the one classification every backend's take-up shares (a write's start,
+/// `get_or_create_schema`, `get_or_create_table`, `CREATE SCHEMA`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NamedRow {
+    /// A row a commit has published: the object exists, and is used as found.
+    Committed(i64),
+    /// A row a write's start made ([`PENDING_SNAPSHOT`]) that no commit has published: taken
+    /// up, never made a second time beside it. Its owner may be in flight or gone; the
+    /// catalog cannot tell which.
+    Pending(i64),
+    /// No live row of the name: one is inserted.
+    Absent,
+}
+
+impl NamedRow {
+    /// The classification of a lookup's `(id, begin_snapshot)`, `None` when it found no row.
+    pub(crate) fn of(found: Option<(i64, i64)>) -> Self {
+        match found {
+            None => Self::Absent,
+            Some((id, PENDING_SNAPSHOT)) => Self::Pending(id),
+            Some((id, _)) => Self::Committed(id),
+        }
+    }
+}
+
+/// A pending schema or table row a write's start inserted, and the UUID it gave the row
+/// (`schema_uuid` / `table_uuid`): its mark of ownership. A later start that takes the row up
+/// gives it a fresh UUID ([`take_up_uuid`]), so a row whose UUID is still this one has been
+/// taken up by no other write, and [`MetadataWriter::release_started_rows`] may remove it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartedRow {
+    /// The row's `schema_id` or `table_id`.
+    pub id: i64,
+    /// The UUID the start gave it.
+    pub uuid: String,
+}
+
+/// A pending row a write's start took up rather than inserted: the UUID it found on the row
+/// (`None` when the column was NULL) and the fresh one it gave it ([`take_up_uuid`]). A
+/// transaction whose earlier stage inserted the row, and whose UUID this take-up replaced,
+/// knows no other write took the row up in between, and keeps it its own
+/// (`DuckLakeWriteTransaction`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakenRow {
+    /// The row's `schema_id` or `table_id`.
+    pub id: i64,
+    /// The UUID the row carried before this take-up.
+    pub previous: Option<String>,
+    /// The UUID this take-up gave it.
+    pub uuid: String,
+}
+
+/// The pending rows a write's start inserted ([`WriteSetupResult::started`]): what
+/// [`MetadataWriter::release_started_rows`] removes when the write ends without a commit.
+/// `schema` and `table` are empty when the start inserted none — it took up rows that were
+/// there, or the catalog has no `schema_uuid` / `table_uuid` column to mark a row's owner
+/// with, so an owner cannot be told from a taker and the row is left. `taken_schema` and
+/// `taken_table` record the rows it took up instead; a release does not remove them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartedRows {
+    /// The schema row, when the start made the schema.
+    pub schema: Option<StartedRow>,
+    /// The table row, when the start made the table.
+    pub table: Option<StartedRow>,
+    /// The pending schema row the start took up, when it found one.
+    pub taken_schema: Option<TakenRow>,
+    /// The pending table row the start took up, when it found one.
+    pub taken_table: Option<TakenRow>,
+}
+
+impl StartedRows {
+    /// Whether the start inserted no row and took none up: nothing to release or hand back.
+    pub fn is_empty(&self) -> bool {
+        self.schema.is_none()
+            && self.table.is_none()
+            && self.taken_schema.is_none()
+            && self.taken_table.is_none()
+    }
+}
+
+/// A fresh UUID for a pending row: given by the start that inserts the row, and again by each
+/// start or `get_or_create_*` that takes it up, so its inserter's [`StartedRow::uuid`] no
+/// longer matches and its release leaves the row to the taker.
+pub(crate) fn take_up_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// A start's or `get_or_create_*`'s take-up of a pending row: a fresh UUID ([`take_up_uuid`]),
+/// and nothing else — the row keeps its name and path, which a write in flight may be keying
+/// its files by; a path a `get_or_create_*` caller names applies only to a row it inserts.
+/// Bound: the UUID, the id, [`PENDING_SNAPSHOT`].
+#[cfg(any(feature = "write-sqlite", feature = "host-sqlite", feature = "write-mysql"))]
+pub(crate) const TAKE_UP_TABLE_SQL: &str =
+    "UPDATE ducklake_table SET table_uuid = ? WHERE table_id = ? AND begin_snapshot = ?";
+/// [`TAKE_UP_TABLE_SQL`] for a schema row.
+#[cfg(any(feature = "write-sqlite", feature = "host-sqlite", feature = "write-mysql"))]
+pub(crate) const TAKE_UP_SCHEMA_SQL: &str =
+    "UPDATE ducklake_schema SET schema_uuid = ? WHERE schema_id = ? AND begin_snapshot = ?";
+/// [`TAKE_UP_TABLE_SQL`] for a DuckDB catalog.
+#[cfg(feature = "write-duckdb")]
+pub(crate) const TAKE_UP_TABLE_SQL_DUCKDB: &str =
+    "UPDATE ducklake_table SET table_uuid = CAST(? AS UUID)
+     WHERE table_id = ? AND begin_snapshot = ?";
+/// [`TAKE_UP_SCHEMA_SQL`] for a DuckDB catalog.
+#[cfg(feature = "write-duckdb")]
+pub(crate) const TAKE_UP_SCHEMA_SQL_DUCKDB: &str =
+    "UPDATE ducklake_schema SET schema_uuid = CAST(? AS UUID)
+     WHERE schema_id = ? AND begin_snapshot = ?";
+
+/// [`MetadataWriter::release_started_rows`]'s hand-back of a row the start took up: its UUID
+/// put back, only while it is still pending and still carries this take-up's own, so the write
+/// that held it before (another start, or an earlier stage of the same transaction) owns it
+/// again. Bound: the previous UUID (NULL for none), the id, [`PENDING_SNAPSHOT`], this
+/// take-up's UUID.
+#[cfg(any(feature = "write-sqlite", feature = "host-sqlite", feature = "write-mysql"))]
+pub(crate) const HAND_BACK_TABLE_SQL: &str = "UPDATE ducklake_table SET table_uuid = ?
+     WHERE table_id = ? AND begin_snapshot = ? AND table_uuid = ?";
+/// [`HAND_BACK_TABLE_SQL`] for a schema row.
+#[cfg(any(feature = "write-sqlite", feature = "host-sqlite", feature = "write-mysql"))]
+pub(crate) const HAND_BACK_SCHEMA_SQL: &str = "UPDATE ducklake_schema SET schema_uuid = ?
+     WHERE schema_id = ? AND begin_snapshot = ? AND schema_uuid = ?";
+/// [`HAND_BACK_TABLE_SQL`] for a DuckDB catalog.
+#[cfg(feature = "write-duckdb")]
+pub(crate) const HAND_BACK_TABLE_SQL_DUCKDB: &str =
+    "UPDATE ducklake_table SET table_uuid = CAST(? AS UUID)
+     WHERE table_id = ? AND begin_snapshot = ? AND table_uuid = CAST(? AS UUID)";
+/// [`HAND_BACK_SCHEMA_SQL`] for a DuckDB catalog.
+#[cfg(feature = "write-duckdb")]
+pub(crate) const HAND_BACK_SCHEMA_SQL_DUCKDB: &str =
+    "UPDATE ducklake_schema SET schema_uuid = CAST(? AS UUID)
+     WHERE schema_id = ? AND begin_snapshot = ? AND schema_uuid = CAST(? AS UUID)";
+
+/// [`MetadataWriter::release_started_rows`]'s SQL, `?` placeholders. The table row: still
+/// pending and still carrying its inserter's UUID. Bound: the id, [`PENDING_SNAPSHOT`], the
+/// UUID.
+#[cfg(any(feature = "write-sqlite", feature = "host-sqlite", feature = "write-mysql"))]
+pub(crate) const RELEASE_TABLE_SQL: &str = "DELETE FROM ducklake_table
+     WHERE table_id = ? AND begin_snapshot = ? AND table_uuid = ?";
+/// The schema row, as the table's, and only while no live table row (pending or published,
+/// any write's) is in it. Bound: the id, [`PENDING_SNAPSHOT`], the UUID, the id.
+#[cfg(any(feature = "write-sqlite", feature = "host-sqlite", feature = "write-mysql"))]
+pub(crate) const RELEASE_SCHEMA_SQL: &str = "DELETE FROM ducklake_schema
+     WHERE schema_id = ? AND begin_snapshot = ? AND schema_uuid = ?
+       AND NOT EXISTS (SELECT 1 FROM ducklake_table
+                       WHERE schema_id = ? AND end_snapshot IS NULL)";
+/// [`RELEASE_TABLE_SQL`] for a DuckDB catalog, whose `table_uuid` is a `UUID`.
+#[cfg(feature = "write-duckdb")]
+pub(crate) const RELEASE_TABLE_SQL_DUCKDB: &str = "DELETE FROM ducklake_table
+     WHERE table_id = ? AND begin_snapshot = ? AND table_uuid = CAST(? AS UUID)";
+/// [`RELEASE_SCHEMA_SQL`] for a DuckDB catalog.
+#[cfg(feature = "write-duckdb")]
+pub(crate) const RELEASE_SCHEMA_SQL_DUCKDB: &str = "DELETE FROM ducklake_schema
+     WHERE schema_id = ? AND begin_snapshot = ? AND schema_uuid = CAST(? AS UUID)
+       AND NOT EXISTS (SELECT 1 FROM ducklake_table
+                       WHERE schema_id = ? AND end_snapshot IS NULL)";
+
 /// [`WriteMode::Create`]'s check, at a write's start and again inside its commit:
 /// refused unless the table has no live columns yet. That is read in the caller's own
 /// transaction, so at the commit it is the catalog as this commit leaves it — a table
@@ -3466,6 +3623,9 @@ pub struct WriteSetupResult {
     pub column_ids: Vec<i64>,
     /// Every typed field ID in DuckLake depth-first preorder.
     pub field_ids: Vec<i64>,
+    /// The pending rows this start inserted, which the write releases
+    /// ([`MetadataWriter::release_started_rows`]) when it ends without a commit.
+    pub started: StartedRows,
 }
 
 pub(crate) const INLINED_INDEX_COLUMNS_SETTING: &str = "inlined_index_columns";
@@ -3812,6 +3972,15 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ) -> Result<(i64, bool)>;
 
     /// Get or create a table, returning `(table_id, was_created)`.
+    ///
+    /// A table this call creates is not published here: on the SQLite, DuckDB and MySQL
+    /// catalogs its row stays pending (no snapshot reaches it) until
+    /// [`Self::set_columns`] publishes it at that call's snapshot with its columns, since a
+    /// table without columns is no table to a reader (DuckDB will not load a lake at a
+    /// snapshot holding one). A pending row of the name, another write's or an abandoned one,
+    /// is taken up the same way, and keeps its path: a write in flight may be putting its files
+    /// there, so `path` applies only to a row this call inserts (as for
+    /// [`Self::get_or_create_schema`]). The Postgres catalogs still publish the row here.
     fn get_or_create_table(
         &self,
         schema_id: i64,
@@ -3821,7 +3990,8 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ) -> Result<(i64, bool)>;
 
     /// Set columns for a table, returning assigned column IDs.
-    /// Ends existing columns using end_snapshot pattern for time travel.
+    /// Ends existing columns using end_snapshot pattern for time travel. A table
+    /// [`Self::get_or_create_table`] left pending is published here, at `snapshot_id`.
     fn set_columns(
         &self,
         table_id: i64,
@@ -5149,6 +5319,20 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
+    /// Remove the pending rows a write's start inserted ([`WriteSetupResult::started`]), when
+    /// the write ends without a commit: an abort, a refused commit, a failed upload. Only a
+    /// row still pending and still carrying the UUID its start gave it is removed — one another
+    /// write's start has taken up since has another UUID and is left to that write, and one a
+    /// commit has published is not pending — and a schema row only while no live table row is
+    /// in it. A row the start took up instead is handed back: its previous UUID restored while
+    /// it still carries this take-up's, so the write that held it before may release it.
+    /// Never fails a write over: the caller reports its own error.
+    ///
+    /// The default removes nothing, as for a backend whose starts insert no pending row.
+    fn release_started_rows(&self, _rows: &StartedRows) -> Result<()> {
+        Ok(())
+    }
+
     /// Return the live top-level column nullability for an existing table.
     ///
     /// `None` means the table does not exist. Writers use this read-only lookup
@@ -5541,6 +5725,64 @@ mod tests {
             r#"created_table:"main"."Ärger""#,
             r#"created_table:"main"."ärger""#
         ));
+    }
+
+    #[test]
+    fn no_catalog_sql_spells_the_pending_sentinel() {
+        // Every lookup that excludes a pending row binds PENDING_SNAPSHOT (#15).
+        let sentinel = PENDING_SNAPSHOT.to_string();
+        for (file, source) in [
+            ("metadata_writer.rs", include_str!("metadata_writer.rs")),
+            (
+                "metadata_writer_sqlite.rs",
+                include_str!("metadata_writer_sqlite.rs"),
+            ),
+            (
+                "metadata_writer_duckdb.rs",
+                include_str!("metadata_writer_duckdb.rs"),
+            ),
+            (
+                "metadata_writer_mysql.rs",
+                include_str!("metadata_writer_mysql.rs"),
+            ),
+            (
+                "metadata_writer_postgres.rs",
+                include_str!("metadata_writer_postgres.rs"),
+            ),
+            (
+                "metadata_writer_postgres_single.rs",
+                include_str!("metadata_writer_postgres_single.rs"),
+            ),
+            (
+                "metadata_provider_sqlite.rs",
+                include_str!("metadata_provider_sqlite.rs"),
+            ),
+            (
+                "metadata_provider_duckdb.rs",
+                include_str!("metadata_provider_duckdb.rs"),
+            ),
+            (
+                "metadata_provider_mysql.rs",
+                include_str!("metadata_provider_mysql.rs"),
+            ),
+            (
+                "metadata_provider_postgres.rs",
+                include_str!("metadata_provider_postgres.rs"),
+            ),
+            ("table_writer.rs", include_str!("table_writer.rs")),
+        ] {
+            assert!(!source.contains(&sentinel), "{file} spells {sentinel}");
+        }
+    }
+
+    #[test]
+    fn named_row_classifies_a_lookup() {
+        assert_eq!(NamedRow::of(None), NamedRow::Absent);
+        assert_eq!(
+            NamedRow::of(Some((7, PENDING_SNAPSHOT))),
+            NamedRow::Pending(7)
+        );
+        assert_eq!(NamedRow::of(Some((7, 3))), NamedRow::Committed(7));
     }
 
     #[test]
