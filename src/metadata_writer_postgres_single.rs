@@ -683,6 +683,7 @@ async fn record_snapshot_changes(
 /// Record the change summary for a data-write commit: whether this snapshot also
 /// created the schema/table or altered it, plus the insert/delete shape from
 /// [`table_storage_changes`](crate::metadata_writer::table_storage_changes). Mirrors the MySQL and SQLite writers.
+#[allow(clippy::too_many_arguments)]
 async fn record_table_write_changes(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     snapshot_id: i64,

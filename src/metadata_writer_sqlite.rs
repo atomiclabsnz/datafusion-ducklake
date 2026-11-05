@@ -4056,7 +4056,7 @@ async fn commit_files_at_snapshot(
         .bind(snapshot_id)
         .execute(&mut **tx)
         .await?;
-        mark_parquet(&mut **tx, file_id).await?;
+        mark_parquet(tx, file_id).await?;
         let data_file_id = file_id;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
         insert_partition_metadata(tx, write.table_id, data_file_id, file).await?;
@@ -5974,7 +5974,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
-            mark_parquet(&mut *tx, file_id).await?;
+            mark_parquet(&mut tx, file_id).await?;
 
             // Persist the file's per-column zone-map stats in the same tx.
             let data_file_id = file_id;
@@ -6157,7 +6157,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
-                mark_parquet(&mut *tx, file_id).await?;
+                mark_parquet(&mut tx, file_id).await?;
                 let data_file_id = file_id;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
@@ -6350,7 +6350,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
-                mark_parquet(&mut *tx, data_file_id).await?;
+                mark_parquet(&mut tx, data_file_id).await?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
@@ -7111,7 +7111,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
-            mark_parquet(&mut *tx, file_id).await?;
+            mark_parquet(&mut tx, file_id).await?;
 
             // Persist the new file's per-column zone-map stats.
             let data_file_id = file_id;
@@ -7383,7 +7383,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
-                mark_parquet(&mut *tx, file_id).await?;
+                mark_parquet(&mut tx, file_id).await?;
                 let data_file_id = file_id;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
@@ -7936,7 +7936,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(out.partial_max)
                 .execute(&mut *tx)
                 .await?;
-                mark_parquet(&mut *tx, file_id).await?;
+                mark_parquet(&mut tx, file_id).await?;
                 // Persist the compacted file's harvested zone maps under its id
                 // (same tx). Mirrors how official DuckLake records stats for
                 // compaction outputs via the shared write path.
@@ -8037,7 +8037,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(out.partial_max)
                     .execute(&mut *tx)
                     .await?;
-                    mark_parquet(&mut *tx, file_id).await?;
+                    mark_parquet(&mut tx, file_id).await?;
                     let data_file_id = file_id;
                     insert_file_column_stats(
                         &mut tx,

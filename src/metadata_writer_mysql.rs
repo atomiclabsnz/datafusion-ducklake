@@ -2857,7 +2857,7 @@ async fn commit_staged_files(
         .bind(snapshot_id)
         .execute(&mut **tx)
         .await?;
-        mark_parquet(&mut **tx, data_file_id).await?;
+        mark_parquet(tx, data_file_id).await?;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
         insert_partition_metadata(tx, write.table_id, data_file_id, file).await?;
         next_row_id += row_ids.advance;
@@ -4407,7 +4407,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
-            mark_parquet(&mut *tx, data_file_id).await?;
+            mark_parquet(&mut tx, data_file_id).await?;
 
             // Persist the file's zone maps + refresh the roll-up.
             insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
@@ -4580,7 +4580,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
-                mark_parquet(&mut *tx, data_file_id).await?;
+                mark_parquet(&mut tx, data_file_id).await?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
@@ -4869,7 +4869,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
-                mark_parquet(&mut *tx, data_file_id).await?;
+                mark_parquet(&mut tx, data_file_id).await?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
@@ -5179,7 +5179,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(output.partial_max)
                 .execute(&mut *tx)
                 .await?;
-                mark_parquet(&mut *tx, data_file_id).await?;
+                mark_parquet(&mut tx, data_file_id).await?;
                 insert_file_column_stats(
                     &mut tx,
                     table_id,
@@ -5281,7 +5281,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .bind(out.partial_max)
                     .execute(&mut *tx)
                     .await?;
-                    mark_parquet(&mut *tx, data_file_id).await?;
+                    mark_parquet(&mut tx, data_file_id).await?;
                     insert_file_column_stats(
                         &mut tx,
                         table.table_id,
