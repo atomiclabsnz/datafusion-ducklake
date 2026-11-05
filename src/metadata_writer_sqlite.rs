@@ -3826,34 +3826,62 @@ async fn insert_table_row(
 
 /// The take-up of the pending row `id` ([`crate::metadata_writer::NamedRow::Pending`]): a
 /// fresh UUID where the catalog has the column, so the start that inserted the row leaves it
-/// when it releases what it made. `table` picks `ducklake_table` over `ducklake_schema`.
+/// when it releases what it made, and nothing else — the row keeps its name and path. `table`
+/// picks `ducklake_table` over `ducklake_schema`. `None`: the row is no longer pending (a
+/// commit published it since it was read); else the take-up, `None` inside when the catalog
+/// has no UUID column to record it by.
 async fn take_up_pending(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table: bool,
     id: i64,
-) -> Result<()> {
-    let (catalog_table, column, sql) = if table {
+) -> Result<Option<Option<crate::metadata_writer::TakenRow>>> {
+    let (catalog_table, column, read, take_up) = if table {
         (
             "ducklake_table",
             "table_uuid",
+            "SELECT table_uuid FROM ducklake_table WHERE table_id = ? AND begin_snapshot = ?",
             crate::metadata_writer::TAKE_UP_TABLE_SQL,
         )
     } else {
         (
             "ducklake_schema",
             "schema_uuid",
+            "SELECT schema_uuid FROM ducklake_schema WHERE schema_id = ? AND begin_snapshot = ?",
             crate::metadata_writer::TAKE_UP_SCHEMA_SQL,
         )
     };
-    if has_column(tx, catalog_table, column).await? {
-        sqlx::query(sql)
-            .bind(crate::metadata_writer::take_up_uuid())
-            .bind(id)
-            .bind(crate::metadata_writer::PENDING_SNAPSHOT)
-            .execute(&mut **tx)
-            .await?;
+    if !has_column(tx, catalog_table, column).await? {
+        let still_pending: bool = sqlx::query_scalar(if table {
+            "SELECT EXISTS (SELECT 1 FROM ducklake_table WHERE table_id = ? AND begin_snapshot = ?)"
+        } else {
+            "SELECT EXISTS (SELECT 1 FROM ducklake_schema WHERE schema_id = ? AND begin_snapshot = ?)"
+        })
+        .bind(id)
+        .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+        .fetch_one(&mut **tx)
+        .await?;
+        return Ok(still_pending.then_some(None));
     }
-    Ok(())
+    let previous: Option<(Option<String>,)> = sqlx::query_as(read)
+        .bind(id)
+        .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some((previous,)) = previous else {
+        return Ok(None);
+    };
+    let uuid = crate::metadata_writer::take_up_uuid();
+    sqlx::query(take_up)
+        .bind(&uuid)
+        .bind(id)
+        .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+        .execute(&mut **tx)
+        .await?;
+    Ok(Some(Some(crate::metadata_writer::TakenRow {
+        id,
+        previous,
+        uuid,
+    })))
 }
 
 async fn record_snapshot_changes(
@@ -5134,13 +5162,13 @@ impl MetadataWriter for SqliteMetadataWriter {
                 },
                 crate::metadata_writer::NamedRow::Pending(schema_id) => {
                     // Only while it is still pending: a commit that stamped it since makes
-                    // it committed, and it is returned as found.
+                    // it committed, and it is returned as found. A taken-up row keeps its path: a write in flight may be
+                    // putting its files there (#29); `path` applies only to a row inserted here.
                     let taken = sqlx::query(
-                        "UPDATE ducklake_schema SET begin_snapshot = ?, path = COALESCE(?, path)
+                        "UPDATE ducklake_schema SET begin_snapshot = ?
                          WHERE schema_id = ? AND begin_snapshot = ?",
                     )
                     .bind(snapshot_id)
-                    .bind(path.map(directory_path))
                     .bind(schema_id)
                     .bind(crate::metadata_writer::PENDING_SNAPSHOT)
                     .execute(&mut *tx)
@@ -5210,22 +5238,11 @@ impl MetadataWriter for SqliteMetadataWriter {
                     return Ok((table_id, false));
                 },
                 crate::metadata_writer::NamedRow::Pending(table_id) => {
-                    // As for the schema: only while it is still pending.
-                    let taken = sqlx::query(
-                        "UPDATE ducklake_table SET path = COALESCE(?, path)
-                         WHERE table_id = ? AND begin_snapshot = ?",
-                    )
-                    .bind(path.map(directory_path))
-                    .bind(table_id)
-                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected();
-                    if taken == 0 {
+                    // As for the schema: only while it is still pending, and its path kept.
+                    if take_up_pending(&mut tx, true, table_id).await?.is_none() {
                         commit(tx).await?;
                         return Ok((table_id, false));
                     }
-                    take_up_pending(&mut tx, true, table_id).await?;
                     table_id
                 },
                 crate::metadata_writer::NamedRow::Absent => {
@@ -8739,7 +8756,9 @@ impl MetadataWriter for SqliteMetadataWriter {
             let schema_id: i64 = match crate::metadata_writer::NamedRow::of(existing) {
                 crate::metadata_writer::NamedRow::Committed(schema_id) => schema_id,
                 crate::metadata_writer::NamedRow::Pending(schema_id) => {
-                    take_up_pending(&mut tx, false, schema_id).await?;
+                    started.taken_schema = take_up_pending(&mut tx, false, schema_id)
+                        .await?
+                        .flatten();
                     schema_id
                 },
                 crate::metadata_writer::NamedRow::Absent => {
@@ -8792,7 +8811,9 @@ impl MetadataWriter for SqliteMetadataWriter {
             let table_id: i64 = match crate::metadata_writer::NamedRow::of(existing) {
                 crate::metadata_writer::NamedRow::Committed(table_id) => table_id,
                 crate::metadata_writer::NamedRow::Pending(table_id) => {
-                    take_up_pending(&mut tx, true, table_id).await?;
+                    started.taken_table = take_up_pending(&mut tx, true, table_id)
+                        .await?
+                        .flatten();
                     table_id
                 },
                 crate::metadata_writer::NamedRow::Absent => {

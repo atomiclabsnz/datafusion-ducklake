@@ -1321,32 +1321,59 @@ fn insert_table_row(
 
 /// The take-up of the pending row `id` ([`crate::metadata_writer::NamedRow::Pending`]): a
 /// fresh UUID where the catalog has the column, so the start that inserted the row leaves it
-/// when it releases what it made. `table` picks `ducklake_table` over `ducklake_schema`.
-fn take_up_pending(tx: &Transaction<'_>, table: bool, id: i64) -> Result<()> {
-    let (catalog_table, column, sql) = if table {
+/// when it releases what it made, and nothing else — the row keeps its name and path. `table`
+/// picks `ducklake_table` over `ducklake_schema`. `None`: the row is no longer pending; else
+/// the take-up, `None` inside when the catalog has no UUID column to record it by.
+fn take_up_pending(
+    tx: &Transaction<'_>,
+    table: bool,
+    id: i64,
+) -> Result<Option<Option<crate::metadata_writer::TakenRow>>> {
+    let (catalog_table, column, read, take_up) = if table {
         (
             "ducklake_table",
             "table_uuid",
+            "SELECT CAST(table_uuid AS VARCHAR) FROM ducklake_table
+             WHERE table_id = ? AND begin_snapshot = ?",
             crate::metadata_writer::TAKE_UP_TABLE_SQL_DUCKDB,
         )
     } else {
         (
             "ducklake_schema",
             "schema_uuid",
+            "SELECT CAST(schema_uuid AS VARCHAR) FROM ducklake_schema
+             WHERE schema_id = ? AND begin_snapshot = ?",
             crate::metadata_writer::TAKE_UP_SCHEMA_SQL_DUCKDB,
         )
     };
-    if has_column(tx, catalog_table, column)? {
-        tx.execute(
-            sql,
-            params![
-                crate::metadata_writer::take_up_uuid(),
-                id,
-                crate::metadata_writer::PENDING_SNAPSHOT
-            ],
+    let pending = crate::metadata_writer::PENDING_SNAPSHOT;
+    if !has_column(tx, catalog_table, column)? {
+        let still_pending: bool = tx.query_row(
+            if table {
+                "SELECT count(*) > 0 FROM ducklake_table WHERE table_id = ? AND begin_snapshot = ?"
+            } else {
+                "SELECT count(*) > 0 FROM ducklake_schema WHERE schema_id = ? AND begin_snapshot = ?"
+            },
+            params![id, pending],
+            |row| row.get(0),
         )?;
+        return Ok(still_pending.then_some(None));
     }
-    Ok(())
+    let Some(previous) = tx
+        .query_row(read, params![id, pending], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let uuid = crate::metadata_writer::take_up_uuid();
+    tx.execute(take_up, params![uuid, id, pending])?;
+    Ok(Some(Some(crate::metadata_writer::TakenRow {
+        id,
+        previous,
+        uuid,
+    })))
 }
 
 /// Atomically reserve `n` consecutive ids from a monotonic counter row in
@@ -3722,15 +3749,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
             },
             crate::metadata_writer::NamedRow::Pending(schema_id) => {
                 // Only while it is still pending: one a commit stamped since is returned as found.
+                // A taken-up row keeps its path: a write in flight may be putting its files
+                // there (#29); `path` applies only to a row inserted here.
                 let taken = tx.execute(
-                    "UPDATE ducklake_schema SET begin_snapshot = ?, path = COALESCE(?, path)
+                    "UPDATE ducklake_schema SET begin_snapshot = ?
                      WHERE schema_id = ? AND begin_snapshot = ?",
-                    params![
-                        snapshot_id,
-                        path.map(directory_path),
-                        schema_id,
-                        crate::metadata_writer::PENDING_SNAPSHOT
-                    ],
+                    params![snapshot_id, schema_id, crate::metadata_writer::PENDING_SNAPSHOT],
                 )?;
                 if taken == 0 {
                     tx.commit()?;
@@ -3786,21 +3810,11 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 return Ok((table_id, false));
             },
             crate::metadata_writer::NamedRow::Pending(table_id) => {
-                // As for the schema: only while it is still pending.
-                let taken = tx.execute(
-                    "UPDATE ducklake_table SET path = COALESCE(?, path)
-                     WHERE table_id = ? AND begin_snapshot = ?",
-                    params![
-                        path.map(directory_path),
-                        table_id,
-                        crate::metadata_writer::PENDING_SNAPSHOT
-                    ],
-                )?;
-                if taken == 0 {
+                // As for the schema: only while it is still pending, and its path kept.
+                if take_up_pending(&tx, true, table_id)?.is_none() {
                     tx.commit()?;
                     return Ok((table_id, false));
                 }
-                take_up_pending(&tx, true, table_id)?;
                 table_id
             },
             crate::metadata_writer::NamedRow::Absent => {
@@ -6030,7 +6044,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let schema_id: i64 = match crate::metadata_writer::NamedRow::of(existing) {
             crate::metadata_writer::NamedRow::Committed(schema_id) => schema_id,
             crate::metadata_writer::NamedRow::Pending(schema_id) => {
-                take_up_pending(&tx, false, schema_id)?;
+                started.taken_schema = take_up_pending(&tx, false, schema_id)?.flatten();
                 schema_id
             },
             crate::metadata_writer::NamedRow::Absent => {
@@ -6063,7 +6077,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let table_id: i64 = match crate::metadata_writer::NamedRow::of(existing) {
             crate::metadata_writer::NamedRow::Committed(table_id) => table_id,
             crate::metadata_writer::NamedRow::Pending(table_id) => {
-                take_up_pending(&tx, true, table_id)?;
+                started.taken_table = take_up_pending(&tx, true, table_id)?.flatten();
                 table_id
             },
             crate::metadata_writer::NamedRow::Absent => {

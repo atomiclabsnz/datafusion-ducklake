@@ -521,6 +521,89 @@ async fn a_pending_table_get_or_create_takes_up_is_published_only_with_its_colum
     assert_eq!(lake.pending_rows(), Vec::<String>::new());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn get_or_create_naming_another_path_takes_a_row_up_where_it_is() {
+    // A write in flight into a new schema and table puts its files under their rows' paths.
+    // `get_or_create_*` naming other paths takes the rows up as they are; the write commits and
+    // every row is where the catalog says (#29's rule: no take-up re-paths a row).
+    let lake = Lake::sqlite();
+    let metadata = lake.sqlite_writer(0).await;
+    let writer = table_writer(Arc::clone(&metadata) as Arc<dyn MetadataWriter>);
+    let mut late = writer
+        .begin_write("fresh", "t", &schema(), WriteMode::Append)
+        .unwrap();
+    late.write_batch(&batch(&[1, 2])).unwrap();
+    let snapshot = metadata.create_snapshot().unwrap();
+    let (schema_id, created) = metadata
+        .get_or_create_schema("fresh", Some("elsewhere"), snapshot)
+        .unwrap();
+    assert!(created);
+    let (_, created) = metadata
+        .get_or_create_table(schema_id, "t", Some("other"), snapshot)
+        .unwrap();
+    assert!(created);
+    late.finish().await.unwrap();
+    assert_eq!(lake.every_snapshot(), ["0: ", "1: ", "2: fresh.t=2"]);
+    assert_eq!(
+        rows(
+            &lake.duckdb(None),
+            "SELECT id FROM lake.fresh.t ORDER BY id"
+        ),
+        ["1", "2"]
+    );
+    assert_eq!(
+        rows(
+            &lake.duckdb(None),
+            "SELECT s.path || t.path FROM __ducklake_metadata_lake.ducklake_table t
+               JOIN __ducklake_metadata_lake.ducklake_schema s USING (schema_id)
+              WHERE t.table_name = 't'"
+        ),
+        ["fresh/t/"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aborted_transaction_releases_rows_its_own_stages_took_up() {
+    // Two stages into one new table, and two into two new tables of one new schema: the later
+    // stages take up the earlier ones' rows, and an abort releases all of them.
+    let lake = Lake::sqlite();
+    let writer = table_writer(lake.sqlite_writer(0).await);
+    let mut transaction = writer.transaction();
+    for table in ["t", "t", "u"] {
+        transaction
+            .stage_write("fresh", table, &schema(), WriteMode::Append, &[batch(&[1])])
+            .await
+            .unwrap();
+    }
+    assert_eq!(lake.pending_rows(), ["schema fresh", "table t", "table u"]);
+    transaction.abort().await.unwrap();
+    assert_eq!(lake.pending_rows(), Vec::<String>::new());
+    assert_eq!(lake.every_snapshot(), ["0: "]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_leaves_a_row_another_write_took_up_between_its_stages() {
+    let lake = Lake::sqlite();
+    let writer = table_writer(lake.sqlite_writer(0).await);
+    let mut transaction = writer.transaction();
+    transaction
+        .stage_write("fresh", "t", &schema(), WriteMode::Append, &[batch(&[1])])
+        .await
+        .unwrap();
+    let mut other = writer
+        .begin_write("fresh", "t", &schema(), WriteMode::Append)
+        .unwrap();
+    other.write_batch(&batch(&[2])).unwrap();
+    transaction
+        .stage_write("fresh", "t", &schema(), WriteMode::Append, &[batch(&[3])])
+        .await
+        .unwrap();
+    transaction.abort().await.unwrap();
+    assert_eq!(lake.pending_rows(), ["schema fresh", "table t"]);
+    other.finish().await.unwrap();
+    assert_eq!(lake.every_snapshot(), ["0: ", "1: fresh.t=1"]);
+}
+
 /// The DuckDB catalog: one connection per writer, so its starts are serialized; and the same
 /// release and publication rules. DuckDB opens a catalog file for one client, so the oracle
 /// reads it once the writer is dropped.

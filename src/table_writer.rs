@@ -3484,6 +3484,41 @@ impl DuckLakeWriteTransaction<'_> {
     /// Stage the empty new table of a [`WriteMode::CreateOrReplace`] of no rows, which every
     /// `stage_write*` does where another mode stages nothing for no rows: the replace still
     /// drops the old table and creates the new one, as official's does.
+    /// Adds a stage. A row an earlier stage's start inserted and this stage's start took up —
+    /// still carrying that earlier start's UUID, so no other write took it up in between —
+    /// stays this transaction's: its release moves to this stage, which a dropped or refused
+    /// transaction releases after the stages before it, so a schema is removed after its
+    /// tables.
+    fn push(&mut self, mut prepared: PreparedTableWrite) {
+        fn adopt(
+            own: &mut Option<crate::metadata_writer::StartedRow>,
+            taken: Option<&crate::metadata_writer::TakenRow>,
+        ) -> Option<crate::metadata_writer::StartedRow> {
+            let taken = taken?;
+            let mine = own.as_ref().is_some_and(|own| {
+                own.id == taken.id && taken.previous.as_deref() == Some(own.uuid.as_str())
+            });
+            mine.then(|| {
+                *own = None;
+                crate::metadata_writer::StartedRow {
+                    id: taken.id,
+                    uuid: taken.uuid.clone(),
+                }
+            })
+        }
+        let started = prepared.release.rows.clone();
+        for earlier in &mut self.writes {
+            let rows = &mut earlier.release.rows;
+            if let Some(table) = adopt(&mut rows.table, started.taken_table.as_ref()) {
+                prepared.release.rows.table = Some(table);
+            }
+            if let Some(schema) = adopt(&mut rows.schema, started.taken_schema.as_ref()) {
+                prepared.release.rows.schema = Some(schema);
+            }
+        }
+        self.writes.push(prepared);
+    }
+
     fn stage_empty_replace(
         &mut self,
         schema_name: &str,
@@ -3493,7 +3528,7 @@ impl DuckLakeWriteTransaction<'_> {
         let (write, release) =
             self.writer
                 .prepare_empty_replace(schema_name, table_name, arrow_schema)?;
-        self.writes.push(PreparedTableWrite {
+        self.push(PreparedTableWrite {
             write,
             object_paths: Vec::new(),
             files_written: 0,
@@ -3532,7 +3567,7 @@ impl DuckLakeWriteTransaction<'_> {
             .writer
             .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
             .await?;
-        self.writes.push(prepared);
+        self.push(prepared);
         Ok(())
     }
 
@@ -3557,7 +3592,7 @@ impl DuckLakeWriteTransaction<'_> {
         let prepared = writer
             .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
             .await?;
-        self.writes.push(prepared);
+        self.push(prepared);
         Ok(())
     }
 
@@ -3615,7 +3650,7 @@ impl DuckLakeWriteTransaction<'_> {
             .iter()
             .map(|name| (*name).to_string())
             .collect();
-        self.writes.push(prepared);
+        self.push(prepared);
         Ok(())
     }
 
@@ -3778,7 +3813,7 @@ impl DuckLakeWriteTransaction<'_> {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        self.writes.push(PreparedTableWrite {
+        self.push(PreparedTableWrite {
             write: StagedTableWrite {
                 table_id: setup.table_id,
                 schema_name: schema_name.to_string(),
@@ -3957,7 +3992,7 @@ impl DuckLakeWriteTransaction<'_> {
             },
             StagedTableData::None => (0, 0),
         };
-        self.writes.push(PreparedTableWrite {
+        self.push(PreparedTableWrite {
             write: StagedTableWrite {
                 table_id,
                 schema_name: schema_name.to_string(),

@@ -138,21 +138,41 @@ pub struct StartedRow {
     pub uuid: String,
 }
 
+/// A pending row a write's start took up rather than inserted: the UUID it found on the row
+/// (`None` when the column was NULL) and the fresh one it gave it ([`take_up_uuid`]). A
+/// transaction whose earlier stage inserted the row, and whose UUID this take-up replaced,
+/// knows no other write took the row up in between, and keeps it its own
+/// (`DuckLakeWriteTransaction`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakenRow {
+    /// The row's `schema_id` or `table_id`.
+    pub id: i64,
+    /// The UUID the row carried before this take-up.
+    pub previous: Option<String>,
+    /// The UUID this take-up gave it.
+    pub uuid: String,
+}
+
 /// The pending rows a write's start inserted ([`WriteSetupResult::started`]): what
 /// [`MetadataWriter::release_started_rows`] removes when the write ends without a commit.
-/// Empty when the start inserted none — it took up rows that were there, or the catalog has
-/// no `schema_uuid` / `table_uuid` column to mark a row's owner with, so an owner cannot be
-/// told from a taker and the row is left.
+/// `schema` and `table` are empty when the start inserted none — it took up rows that were
+/// there, or the catalog has no `schema_uuid` / `table_uuid` column to mark a row's owner
+/// with, so an owner cannot be told from a taker and the row is left. `taken_schema` and
+/// `taken_table` record the rows it took up instead; a release does not remove them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StartedRows {
     /// The schema row, when the start made the schema.
     pub schema: Option<StartedRow>,
     /// The table row, when the start made the table.
     pub table: Option<StartedRow>,
+    /// The pending schema row the start took up, when it found one.
+    pub taken_schema: Option<TakenRow>,
+    /// The pending table row the start took up, when it found one.
+    pub taken_table: Option<TakenRow>,
 }
 
 impl StartedRows {
-    /// Whether the start inserted no row.
+    /// Whether the start inserted no row: nothing to release.
     pub fn is_empty(&self) -> bool {
         self.schema.is_none() && self.table.is_none()
     }
@@ -167,7 +187,8 @@ pub(crate) fn take_up_uuid() -> String {
 
 /// A start's or `get_or_create_*`'s take-up of a pending row: a fresh UUID ([`take_up_uuid`]),
 /// and nothing else — the row keeps its name and path, which a write in flight may be keying
-/// its files by. Bound: the UUID, the id, [`PENDING_SNAPSHOT`].
+/// its files by; a path a `get_or_create_*` caller names applies only to a row it inserts.
+/// Bound: the UUID, the id, [`PENDING_SNAPSHOT`].
 #[cfg(any(feature = "write-sqlite", feature = "host-sqlite", feature = "write-mysql"))]
 pub(crate) const TAKE_UP_TABLE_SQL: &str =
     "UPDATE ducklake_table SET table_uuid = ? WHERE table_id = ? AND begin_snapshot = ?";
@@ -3931,7 +3952,9 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// [`Self::set_columns`] publishes it at that call's snapshot with its columns, since a
     /// table without columns is no table to a reader (DuckDB will not load a lake at a
     /// snapshot holding one). A pending row of the name, another write's or an abandoned one,
-    /// is taken up the same way. The Postgres catalogs still publish the row here.
+    /// is taken up the same way, and keeps its path: a write in flight may be putting its files
+    /// there, so `path` applies only to a row this call inserts (as for
+    /// [`Self::get_or_create_schema`]). The Postgres catalogs still publish the row here.
     fn get_or_create_table(
         &self,
         schema_id: i64,

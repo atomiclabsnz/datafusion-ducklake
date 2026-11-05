@@ -257,6 +257,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A write that does not commit removes the pending schema and table rows its start made, unless
   another write took them up (catalogs with `schema_uuid` / `table_uuid`, #15).
 - MySQL: concurrent starts and `get_or_create_*` of one new name insert one row, not two (#15).
+- `get_or_create_schema` / `get_or_create_table` taking up a pending row keep its path; a
+  path they are given applies only to a row they insert (#15).
 - Schema, table and view names are found in any ASCII case on every backend, as DuckDB finds
   them (#17, ferrion#708).
 - A write into a table DuckDB renamed puts its files under the table's `path`, not its new name.
