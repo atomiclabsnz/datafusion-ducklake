@@ -412,6 +412,29 @@ impl SchemaProvider for DuckLakeSchema {
         // Validate table name to prevent path traversal attacks
         validate_table_name(&name)?;
 
+        // Only a table with no rows is made here: the columns of `CREATE TABLE t (…)` or of an
+        // empty `CREATE TABLE … AS`, which DataFusion hands over as an empty `MemTable` (an
+        // `EmptyTable` is the same, schema-only). Any other provider — `CREATE VIEW`'s
+        // `ViewTable`, `CREATE EXTERNAL TABLE`'s `ListingTable` — would be published as an empty
+        // table of its columns, its definition or its files silently dropped (ferrion#611).
+        if table.downcast_ref::<MemTable>().is_none()
+            && table
+                .downcast_ref::<datafusion::datasource::empty::EmptyTable>()
+                .is_none()
+        {
+            let kind = match table.table_type() {
+                TableType::View => "a view (CREATE VIEW)",
+                TableType::Temporary => "a temporary table",
+                TableType::Base => "a table read from elsewhere (CREATE EXTERNAL TABLE)",
+            };
+            return Err(DataFusionError::NotImplemented(format!(
+                "{kind} cannot be registered in DuckLake schema {:?} as {name:?}: only a table with \
+                 no rows is created here (CREATE TABLE … (columns), or an empty CREATE TABLE … AS); \
+                 registering it would publish an empty table of its columns",
+                self.schema_name
+            )));
+        }
+
         let snapshot_id = self.resolve_snapshot()?;
         if self
             .provider

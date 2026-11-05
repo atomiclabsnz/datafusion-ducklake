@@ -601,6 +601,33 @@ fn parquet_files(dir: &Path) -> Vec<String> {
     found
 }
 
+/// Directory names as `dir`'s filesystem tells them apart. A case-insensitive one (macOS's
+/// default APFS) holds `main/ORDERS` and `main/orders` as one directory, so there the names
+/// are compared folded; a reader finds every file either way, by its row's path.
+fn as_this_filesystem_names<S: AsRef<str>>(
+    dir: &Path,
+    names: impl IntoIterator<Item = S>,
+) -> Vec<String> {
+    let probe = dir.join("CaseProbe");
+    std::fs::write(&probe, b"").unwrap();
+    let folds = dir.join("caseprobe").exists();
+    std::fs::remove_file(&probe).unwrap();
+    let mut out: Vec<String> = names
+        .into_iter()
+        .map(|n| {
+            let n = n.as_ref();
+            if folds {
+                n.to_ascii_lowercase()
+            } else {
+                n.to_string()
+            }
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// The directories DuckDB 1.5.6 gives a schema and table: its name as written, then kept by a
 /// rename. Pinned here, as the writer's keys follow them.
 #[test]
@@ -757,8 +784,8 @@ async fn a_pending_row_an_abandoned_write_left_steers_no_later_write() {
         ["5", "6"]
     );
     assert_eq!(
-        parquet_files(&data),
-        ["main/NewT", "main/ORDERS", "main/orders"],
+        as_this_filesystem_names(&data, parquet_files(&data)),
+        as_this_filesystem_names(&data, ["main/NewT", "main/ORDERS", "main/orders"]),
         "nothing written under the abandoned spellings that a reader would not look in"
     );
 }

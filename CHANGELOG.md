@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking:** `WriteMode` has a `CreateOrReplace` variant; exhaustive matches need its arm.
+- `DuckLakeSchema::register_table` refuses a view or an external table instead of making an empty table of its columns (ferrion#611).
 - DuckDB 1.5.6 is the bundled engine (`duckdb ~1.10506.1`) and the oracle (CI's CLI,
   the `ducklake` extension `ac7595b0`); 1.5.5 before. DuckDB 2.0 / format 1.1 is #22.
 - Table statistics as official reads them from 1.5.6: a `ducklake_table_column_stats` row with
