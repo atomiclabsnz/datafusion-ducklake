@@ -2556,6 +2556,14 @@ fn finalize_table_snapshot(
             params![snapshot_id, table_id, pending],
         )?;
     }
+    // Another write published the table since this one began: its start saw no columns.
+    crate::metadata_writer::refuse_columns_of_a_concurrent_create(
+        table_begin != pending && table_begin > base_snapshot,
+        &existing_catalog_columns,
+        &existing_nullability,
+        &proposed,
+        column_ids,
+    )?;
     let is_ddl = current.is_empty()
         || catalog_columns_differ(
             &existing_catalog_columns,

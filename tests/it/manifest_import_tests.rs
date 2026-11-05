@@ -708,3 +708,53 @@ async fn partition_values_are_kept_under_a_matching_spec() {
         .count();
     assert_eq!(ones, expected_ones.to_string());
 }
+
+/// A manifest column whose id a dropped column of the table had is refused as the manifest's
+/// error, not as a conflict to retry: the id is the files' field id, which no retry changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manifest_id_of_a_dropped_column_is_refused_and_not_retryable() {
+    let dir = TempDir::new().unwrap();
+    // The target's `t` gets `id` 1 and `a` 2, then drops `a`.
+    let first = Source::new(
+        &dir.path().join("first"),
+        "CREATE TABLE lake.t (id INT, a INT); INSERT INTO lake.t VALUES (1, 1);",
+    );
+    let target = Target::new(dir.path()).await;
+    target
+        .import(
+            "t",
+            &first.head_manifest("t").await,
+            &ImportOptions::default(),
+        )
+        .await
+        .unwrap();
+    let only_id = arrow::record_batch::RecordBatch::try_new(
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, true),
+        ])),
+        vec![Arc::new(arrow::array::Int32Array::from(vec![2]))],
+    )
+    .unwrap();
+    target
+        .table_writer()
+        .await
+        .append_table("main", "t", &[only_id])
+        .await
+        .unwrap();
+    // A source whose `b` has id 2.
+    let second = Source::new(
+        &dir.path().join("second"),
+        "CREATE TABLE lake.t (id INT, b INT); INSERT INTO lake.t VALUES (3, 3);",
+    );
+    let mut options = ImportOptions::default();
+    options.allow_schema_evolution = true;
+    let error = target
+        .import("t", &second.head_manifest("t").await, &options)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, DuckLakeError::InvalidConfig(message)
+            if message.contains("'b' has id 2") && message.contains("Not retryable")),
+        "{error:?}"
+    );
+}

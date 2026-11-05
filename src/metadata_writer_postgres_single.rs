@@ -391,23 +391,30 @@ impl PostgresSingleCatalogMetadataWriter {
     }
 }
 
-/// Reserve `n` consecutive ids from a counter in `ducklake_metadata`, returning the
-/// LAST of the block (`last - n + 1 ..= last`). The `UPDATE` holds an exclusive row
-/// lock until commit, so concurrent reservations block rather than overlap.
 /// Record data file `data_file_id` as Parquet, as DuckDB records every file it writes (#27):
 /// where the catalog has `file_format` (DuckDB's does; this crate's own schema has not).
+/// `has_format` keeps the answer for the commit's other files.
 async fn mark_parquet(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     data_file_id: i64,
+    has_format: &mut Option<bool>,
 ) -> Result<()> {
-    let has_format: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
-                        WHERE table_schema = current_schema()
-                          AND table_name = 'ducklake_data_file' AND column_name = 'file_format')",
-    )
-    .fetch_one(&mut **tx)
-    .await?;
-    if has_format {
+    let has = match *has_format {
+        Some(has) => has,
+        None => {
+            let has: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                                WHERE table_schema = current_schema()
+                                  AND table_name = 'ducklake_data_file'
+                                  AND column_name = 'file_format')",
+            )
+            .fetch_one(&mut **tx)
+            .await?;
+            *has_format = Some(has);
+            has
+        },
+    };
+    if has {
         sqlx::query(
             "UPDATE ducklake_data_file SET file_format = 'parquet' WHERE data_file_id = $1",
         )
@@ -422,6 +429,9 @@ async fn mark_parquet(
 const NEXT_TABLE_COLUMN_ID_SQL: &str =
     "SELECT COALESCE(MAX(column_id), 0) + 1 FROM ducklake_column WHERE table_id = $1";
 
+/// Reserve `n` consecutive ids from a counter in `ducklake_metadata`, returning the
+/// LAST of the block (`last - n + 1 ..= last`). The `UPDATE` holds an exclusive row
+/// lock until commit, so concurrent reservations block rather than overlap.
 async fn reserve_ids(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     key: &str,
@@ -1130,6 +1140,20 @@ async fn finalize_table_snapshot(
     if crate::metadata_writer::makes_table(mode, !current.is_empty()) {
         crate::metadata_writer_postgres::refuse_view_of_table(tx, table_id).await?;
     }
+    // Another write published the table since this one began: its start saw no columns.
+    let table_begin: i64 = sqlx::query_scalar(
+        "SELECT begin_snapshot FROM ducklake_table WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    crate::metadata_writer::refuse_columns_of_a_concurrent_create(
+        table_begin != snapshot_id && table_begin > base_snapshot,
+        &existing_catalog_columns,
+        &existing_nullability,
+        &proposed,
+        column_ids,
+    )?;
     let committed_ids = assign_column_ids(&proposed, &existing_catalog_columns, column_ids)?;
     if committed_ids != column_ids {
         return Err(crate::DuckLakeError::Conflict(
@@ -1958,7 +1982,8 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?
             .try_get(0)?;
 
-            mark_parquet(&mut tx, data_file_id).await?;
+            let mut file_format = None;
+            mark_parquet(&mut tx, data_file_id, &mut file_format).await?;
             // Persist the file's zone maps + refresh the roll-up.
             insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
             insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
@@ -2099,6 +2124,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             let mut total_advance: i64 = 0;
             let mut total_records: i64 = 0;
             let mut total_bytes: i64 = 0;
+            let mut file_format = None;
             for file in files {
                 let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
                 let data_file_id: i64 = sqlx::query(
@@ -2122,7 +2148,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 .fetch_one(&mut *tx)
                 .await?
                 .try_get(0)?;
-                mark_parquet(&mut tx, data_file_id).await?;
+                mark_parquet(&mut tx, data_file_id, &mut file_format).await?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;

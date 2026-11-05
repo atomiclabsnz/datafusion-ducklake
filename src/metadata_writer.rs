@@ -1817,29 +1817,66 @@ pub(crate) fn offered_column_ids(
         .collect())
 }
 
+/// Refuse a commit into a table another write created since this write began, unless this
+/// write's columns are exactly the ones that write gave it: the same columns, types,
+/// parents and top-level nullability (#32). Its start saw no live columns, so none of a
+/// start's checks of an existing table's columns (no type change, no new non-null column)
+/// ran, and with ids numbered per table a column of the same name has the same id in both
+/// writes: a different type would leave Parquet the catalog cannot read, a missing column
+/// would end the other write's. A retry starts against the table's columns, and is checked.
+pub(crate) fn refuse_columns_of_a_concurrent_create(
+    created_since_base: bool,
+    existing: &[ExistingCatalogColumn],
+    existing_nullability: &[bool],
+    proposed: &[CatalogColumnDef],
+    field_ids: &[i64],
+) -> Result<()> {
+    if created_since_base
+        && !staged_columns_match(existing, existing_nullability, proposed, field_ids)
+    {
+        return Err(DuckLakeError::Conflict(
+            "another write created the table since this write began, with other columns; retry \
+             the write"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The first column of `proposed` the commit adds (none of the live `existing` is it) whose id
+/// in `committed` is already in `used`, every column id of the table, live or ended: its name
+/// and id.
+pub(crate) fn reused_column_id(
+    proposed: &[CatalogColumnDef],
+    existing: &[ExistingCatalogColumn],
+    committed: &[i64],
+    used: &[i64],
+) -> Result<Option<(String, i64)>> {
+    // No column id is negative: -1 marks a column the table does not have.
+    let matched = assign_column_ids(proposed, existing, &vec![-1; proposed.len()])?;
+    let used: HashSet<i64> = used.iter().copied().collect();
+    Ok(proposed
+        .iter()
+        .zip(matched.iter().zip(committed))
+        .find(|(_, (matched, id))| **matched < 0 && used.contains(id))
+        .map(|(column, (_, id))| (column.name.clone(), *id)))
+}
+
 /// Refuse a commit that would give a new column of the table an id one of its columns already
-/// has (`used`: every column id of the table, live or ended), as a conflict to retry. A start
-/// offers the ids past the table's highest, so this is a column another write added since:
-/// `committed` are the ids [`assign_column_ids`] gave `proposed` at the commit, against the
-/// live columns `existing`; a column of `proposed` none of them is is new.
+/// has or had ([`reused_column_id`]), as a conflict to retry. A start offers the ids past the
+/// table's highest, so this is a column another write added since; the retry is offered the
+/// next ids.
 pub(crate) fn refuse_reused_column_ids(
     proposed: &[CatalogColumnDef],
     existing: &[ExistingCatalogColumn],
     committed: &[i64],
     used: &[i64],
 ) -> Result<()> {
-    // No column id is negative: -1 marks a column the table does not have.
-    let matched = assign_column_ids(proposed, existing, &vec![-1; proposed.len()])?;
-    let used: HashSet<i64> = used.iter().copied().collect();
-    if matched
-        .iter()
-        .zip(committed)
-        .any(|(matched, id)| *matched < 0 && used.contains(id))
-    {
-        return Err(DuckLakeError::Conflict(
-            "another write added a column to the table since this write began; retry the write"
-                .to_string(),
-        ));
+    if let Some((name, id)) = reused_column_id(proposed, existing, committed, used)? {
+        return Err(DuckLakeError::Conflict(format!(
+            "column '{name}' would take id {id}, which another write gave a column of the \
+             table since this write began; retry the write"
+        )));
     }
     Ok(())
 }

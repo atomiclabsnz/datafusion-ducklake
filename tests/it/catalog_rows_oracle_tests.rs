@@ -1125,3 +1125,112 @@ async fn a_duckdb_catalog_numbers_and_types_as_duckdb_does() {
         ["1|\"x\"|NULL", "2|\"y\"|9"]
     );
 }
+
+/// Two writes in flight make one new table, `n`, both appending: the first `(id, a)`, the second
+/// `second`'s columns. Returns the second's commit, and the lake.
+async fn two_creates(
+    backend: Backend,
+    inlining: usize,
+    second: RecordBatch,
+) -> (
+    Lake,
+    PathBuf,
+    datafusion_ducklake::Result<datafusion_ducklake::WriteResult>,
+) {
+    let lake = Lake::new(backend, inlining, BASE).await;
+    let ours = lake.copy("ours");
+    let writer = lake.table_writer(lake.writer(&ours).await);
+    let first = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("a", DataType::Int32, true),
+        ])),
+        vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef, Arc::new(Int32Array::from(vec![10]))],
+    )
+    .unwrap();
+    let append = datafusion_ducklake::WriteMode::Append;
+    let mut one = writer
+        .begin_write("main", "n", &first.schema(), append)
+        .unwrap();
+    let mut two = writer
+        .begin_write("main", "n", &second.schema(), append)
+        .unwrap();
+    one.write_batch(&first).unwrap();
+    two.write_batch(&second).unwrap();
+    one.finish().await.unwrap();
+    let result = two.finish().await;
+    drop(writer);
+    (lake, ours, result)
+}
+
+fn id_and(field: Option<Field>, value: Option<ArrayRef>) -> RecordBatch {
+    let mut fields = vec![Field::new("id", DataType::Int64, true)];
+    let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![2]))];
+    fields.extend(field);
+    columns.extend(value);
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+}
+
+/// A second create of the same new table whose `a` is another type is refused: it would put
+/// a `varchar` file under the first's `int32` column of the same id, which DuckDB cannot read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_concurrent_create_with_another_type_is_refused() {
+    for backend in backends() {
+        for inlining in [0, 10] {
+            let (lake, ours, second) = two_creates(
+                backend,
+                inlining,
+                id_and(
+                    Some(Field::new("a", DataType::Utf8, true)),
+                    Some(Arc::new(StringArray::from(vec!["hello"]))),
+                ),
+            )
+            .await;
+            assert!(
+                matches!(second, Err(datafusion_ducklake::DuckLakeError::Conflict(_))),
+                "{backend:?} inlining {inlining}: {second:?}"
+            );
+            assert_eq!(rows(&lake.duckdb(&ours), "SELECT * FROM lake.n"), ["1|10"]);
+        }
+    }
+}
+
+/// A second create of the same new table without `a` is refused: its commit would end the
+/// first's `a`, and the first's values with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_concurrent_create_without_a_column_is_refused() {
+    for backend in backends() {
+        for inlining in [0, 10] {
+            let (lake, ours, second) = two_creates(backend, inlining, id_and(None, None)).await;
+            assert!(
+                matches!(second, Err(datafusion_ducklake::DuckLakeError::Conflict(_))),
+                "{backend:?} inlining {inlining}: {second:?}"
+            );
+            assert_eq!(rows(&lake.duckdb(&ours), "SELECT * FROM lake.n"), ["1|10"]);
+        }
+    }
+}
+
+/// A second create of the same new table with the same columns appends into it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_concurrent_create_with_the_same_columns_appends() {
+    for backend in backends() {
+        for inlining in [0, 10] {
+            let (lake, ours, second) = two_creates(
+                backend,
+                inlining,
+                id_and(
+                    Some(Field::new("a", DataType::Int32, true)),
+                    Some(Arc::new(Int32Array::from(vec![20]))),
+                ),
+            )
+            .await;
+            second.unwrap();
+            assert_eq!(
+                rows(&lake.duckdb(&ours), "SELECT * FROM lake.n ORDER BY id"),
+                ["1|10", "2|20"]
+            );
+            lake.assert_ids_distinct(&ours);
+        }
+    }
+}

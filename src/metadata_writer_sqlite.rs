@@ -1631,14 +1631,26 @@ async fn raise_column_counter(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> R
 
 /// Record data file `data_file_id` as Parquet, as DuckDB records every file it writes (#27):
 /// where the catalog has `file_format` (DuckDB's does; this crate's own schema has not).
-async fn mark_parquet(conn: &mut sqlx::SqliteConnection, data_file_id: i64) -> Result<()> {
-    let has_format: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('ducklake_data_file')
-                        WHERE name = 'file_format')",
-    )
-    .fetch_one(&mut *conn)
-    .await?;
-    if has_format {
+/// `has_format` keeps the answer for the commit's other files.
+async fn mark_parquet(
+    conn: &mut sqlx::SqliteConnection,
+    data_file_id: i64,
+    has_format: &mut Option<bool>,
+) -> Result<()> {
+    let has = match *has_format {
+        Some(has) => has,
+        None => {
+            let has: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('ducklake_data_file')
+                                WHERE name = 'file_format')",
+            )
+            .fetch_one(&mut *conn)
+            .await?;
+            *has_format = Some(has);
+            has
+        },
+    };
+    if has {
         sqlx::query("UPDATE ducklake_data_file SET file_format = 'parquet' WHERE data_file_id = ?")
             .bind(data_file_id)
             .execute(&mut *conn)
@@ -3321,6 +3333,14 @@ async fn finalize_table_snapshot(
     } else {
         None
     };
+    // Another write published the table since this one began: its start saw no columns.
+    crate::metadata_writer::refuse_columns_of_a_concurrent_create(
+        table_begin_snapshot != snapshot_id && table_begin_snapshot > base_snapshot,
+        &existing_catalog_columns,
+        &existing_nullability,
+        &proposed,
+        column_ids,
+    )?;
     let committed_ids = assign_column_ids(&proposed, &existing_catalog_columns, column_ids)?;
     if committed_ids != column_ids {
         return Err(crate::DuckLakeError::Conflict(
@@ -4036,6 +4056,7 @@ async fn commit_files_at_snapshot(
     let mut total_advance = 0;
     let mut total_records = 0;
     let mut total_bytes = 0;
+    let mut file_format = None;
     for file in files {
         let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
         let file_id = next_file_id(tx).await?;
@@ -4056,7 +4077,7 @@ async fn commit_files_at_snapshot(
         .bind(snapshot_id)
         .execute(&mut **tx)
         .await?;
-        mark_parquet(tx, file_id).await?;
+        mark_parquet(tx, file_id, &mut file_format).await?;
         let data_file_id = file_id;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
         insert_partition_metadata(tx, write.table_id, data_file_id, file).await?;
@@ -5974,7 +5995,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
-            mark_parquet(&mut tx, file_id).await?;
+            let mut file_format = None;
+            mark_parquet(&mut tx, file_id, &mut file_format).await?;
 
             // Persist the file's per-column zone-map stats in the same tx.
             let data_file_id = file_id;
@@ -6137,6 +6159,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let mut total_advance: i64 = 0;
             let mut total_records: i64 = 0;
             let mut total_bytes: i64 = 0;
+            let mut file_format = None;
             for file in files {
                 let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
                 let file_id = next_file_id(&mut tx).await?;
@@ -6157,7 +6180,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
-                mark_parquet(&mut tx, file_id).await?;
+                mark_parquet(&mut tx, file_id, &mut file_format).await?;
                 let data_file_id = file_id;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
@@ -6220,6 +6243,44 @@ impl MetadataWriter for SqliteMetadataWriter {
     ) -> Result<CommitIds> {
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
+            // The manifest's ids are its files' field ids, which no retry changes: a new column
+            // whose id a column of the table has or had is refused as the manifest's error, not
+            // as a conflict to retry.
+            let live = sqlx::query(
+                "SELECT column_id, column_name, column_type, parent_column FROM ducklake_column
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .iter()
+            .map(|row| {
+                Ok::<_, sqlx::Error>(ExistingCatalogColumn {
+                    column_id: row.try_get(0)?,
+                    name: row.try_get(1)?,
+                    ducklake_type: row.try_get(2)?,
+                    parent_column: row.try_get(3)?,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+            let used: Vec<i64> = sqlx::query_scalar(
+                "SELECT DISTINCT column_id FROM ducklake_column WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            if let Some((name, id)) = crate::metadata_writer::reused_column_id(
+                &catalog_column_defs(columns)?,
+                &live,
+                column_ids,
+                &used,
+            )? {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "manifest column '{name}' has id {id}, which another column of the table has \
+                     or had: its files' field ids would name that column. Not retryable: the ids \
+                     are the files'; import into a table that has not used them"
+                )));
+            }
             let snapshot_id = finalize_snapshot(
                 &mut tx,
                 table_id,
@@ -6296,6 +6357,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
             let (mut total_advance, mut total_records, mut total_bytes) = (0i64, 0i64, 0i64);
             let mut has_deletes = false;
+            let mut file_format = None;
             for imported in files {
                 let file = &imported.file;
                 let mapping_id = match &imported.name_mapping {
@@ -6350,7 +6412,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
-                mark_parquet(&mut tx, data_file_id).await?;
+                mark_parquet(&mut tx, data_file_id, &mut file_format).await?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
@@ -7111,7 +7173,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
-            mark_parquet(&mut tx, file_id).await?;
+            let mut file_format = None;
+            mark_parquet(&mut tx, file_id, &mut file_format).await?;
 
             // Persist the new file's per-column zone-map stats.
             let data_file_id = file_id;
@@ -7363,6 +7426,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let mut total_advance: i64 = 0;
             let mut total_records: i64 = 0;
             let mut total_bytes: i64 = 0;
+            let mut file_format = None;
             for file in files {
                 let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
                 let file_id = next_file_id(&mut tx).await?;
@@ -7383,7 +7447,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
-                mark_parquet(&mut tx, file_id).await?;
+                mark_parquet(&mut tx, file_id, &mut file_format).await?;
                 let data_file_id = file_id;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
@@ -7915,6 +7979,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // row_id_start = the carried range of a rowid-adjacent merge, else
             // NULL (rowids are served from the embedded rowid column);
             // partial_max marks a merged partial file.
+            let mut file_format = None;
             for out in outputs {
                 let begin = out.begin_snapshot.unwrap_or(snapshot_id);
                 let file_id = next_file_id(&mut tx).await?;
@@ -7936,7 +8001,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(out.partial_max)
                 .execute(&mut *tx)
                 .await?;
-                mark_parquet(&mut tx, file_id).await?;
+                mark_parquet(&mut tx, file_id, &mut file_format).await?;
                 // Persist the compacted file's harvested zone maps under its id
                 // (same tx). Mirrors how official DuckLake records stats for
                 // compaction outputs via the shared write path.
@@ -8017,6 +8082,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
                 let mut added_bytes = 0;
+                let mut file_format = None;
                 for out in &table.files {
                     let file_id = next_file_id(&mut tx).await?;
                     sqlx::query(
@@ -8037,7 +8103,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(out.partial_max)
                     .execute(&mut *tx)
                     .await?;
-                    mark_parquet(&mut tx, file_id).await?;
+                    mark_parquet(&mut tx, file_id, &mut file_format).await?;
                     let data_file_id = file_id;
                     insert_file_column_stats(
                         &mut tx,
