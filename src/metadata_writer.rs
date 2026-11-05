@@ -1820,18 +1820,21 @@ pub(crate) fn offered_column_ids(
 /// Refuse a commit that would give a new column of the table an id one of its columns already
 /// has (`used`: every column id of the table, live or ended), as a conflict to retry. A start
 /// offers the ids past the table's highest, so this is a column another write added since:
-/// `committed` are the ids [`assign_column_ids`] gave at the commit, `existing` the live
-/// columns they were matched against.
+/// `committed` are the ids [`assign_column_ids`] gave `proposed` at the commit, against the
+/// live columns `existing`; a column of `proposed` none of them is is new.
 pub(crate) fn refuse_reused_column_ids(
-    committed: &[i64],
+    proposed: &[CatalogColumnDef],
     existing: &[ExistingCatalogColumn],
+    committed: &[i64],
     used: &[i64],
 ) -> Result<()> {
-    let live: HashSet<i64> = existing.iter().map(|column| column.column_id).collect();
+    // No column id is negative: -1 marks a column the table does not have.
+    let matched = assign_column_ids(proposed, existing, &vec![-1; proposed.len()])?;
     let used: HashSet<i64> = used.iter().copied().collect();
-    if committed
+    if matched
         .iter()
-        .any(|id| !live.contains(id) && used.contains(id))
+        .zip(committed)
+        .any(|(matched, id)| *matched < 0 && used.contains(id))
     {
         return Err(DuckLakeError::Conflict(
             "another write added a column to the table since this write began; retry the write"

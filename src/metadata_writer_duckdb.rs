@@ -2522,8 +2522,9 @@ fn finalize_table_snapshot(
         ids.collect::<std::result::Result<Vec<_>, duckdb::Error>>()?
     };
     crate::metadata_writer::refuse_reused_column_ids(
-        &committed_ids,
+        &proposed,
         &existing_catalog_columns,
+        &committed_ids,
         &used,
     )?;
 

@@ -1142,8 +1142,9 @@ async fn finalize_table_snapshot(
             .fetch_all(&mut **tx)
             .await?;
     crate::metadata_writer::refuse_reused_column_ids(
-        &committed_ids,
+        &proposed,
         &existing_catalog_columns,
+        &committed_ids,
         &used,
     )?;
     let is_ddl = current.is_empty()

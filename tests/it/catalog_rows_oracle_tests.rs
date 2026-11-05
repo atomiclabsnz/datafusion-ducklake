@@ -908,8 +908,8 @@ async fn a_table_numbered_by_an_earlier_release_keeps_its_ids() {
 }
 
 /// Two writes in flight add a different column each to the same table. Both are offered the
-/// table's next id; the one that commits second is refused as a conflict, and its retry takes
-/// the id after.
+/// table's next id; the one that commits second is refused as a conflict (here by the alter it
+/// did not see as well as by the id), and its retry takes the id after.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_new_columns_never_share_an_id() {
     let lake = Lake::new(
@@ -981,6 +981,60 @@ async fn concurrent_new_columns_never_share_an_id() {
         ),
         ["1|NULL|NULL", "2|7|NULL", "2|NULL|7"]
     );
+}
+
+/// Two writes in flight make the same new table, each with a different third column. Both
+/// are offered ids 1 to 3; the second to commit finds 3 taken by the first's column and is
+/// refused as a conflict, where it would otherwise give `b` the id of `a` (which no other check
+/// sees: the table's creation is no alter the second write conflicts with).
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_creates_with_different_columns_never_share_an_id() {
+    for backend in backends() {
+        let lake = Lake::new(backend, 0, BASE).await;
+        let ours = lake.copy("ours");
+        let writer = lake.table_writer(lake.writer(&ours).await);
+        let with = |name: &str, value: i32| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, true),
+                    Field::new(name, DataType::Int32, true),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                    Arc::new(Int32Array::from(vec![value])),
+                ],
+            )
+            .unwrap()
+        };
+        let (a, b) = (with("a", 1), with("b", 2));
+        let mut first = writer
+            .begin_write(
+                "main",
+                "n",
+                &a.schema(),
+                datafusion_ducklake::WriteMode::Append,
+            )
+            .unwrap();
+        let mut second = writer
+            .begin_write(
+                "main",
+                "n",
+                &b.schema(),
+                datafusion_ducklake::WriteMode::Append,
+            )
+            .unwrap();
+        first.write_batch(&a).unwrap();
+        second.write_batch(&b).unwrap();
+        first.finish().await.unwrap();
+        let refused = second.finish().await.unwrap_err();
+        assert!(
+            matches!(refused, datafusion_ducklake::DuckLakeError::Conflict(_)),
+            "{refused:?}"
+        );
+        lake.assert_ids_distinct(&ours);
+        assert_field_ids_are_column_ids(&lake, &ours);
+        assert_eq!(rows(&lake.duckdb(&ours), "SELECT * FROM lake.n"), ["1|1"]);
+    }
 }
 
 /// The DuckDB catalog this crate's DuckDB writer makes numbers each table's columns from 1,
