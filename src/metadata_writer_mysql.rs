@@ -1015,6 +1015,14 @@ async fn reserve_ids(
 /// there and each insert one. It is the transaction's first statement, so InnoDB's
 /// `REPEATABLE READ` read view, which its first plain read takes, is taken after the lock and
 /// sees every row a take-up holding it before committed.
+///
+/// **Lock order.** Every transaction that takes this lock takes it FIRST, before it locks any
+/// schema, table or column row: a write's start, `get_or_create_*`, `set_columns` and
+/// `release_started_rows`. One that locked a table row first and the counter second (as
+/// `set_columns` once did) could deadlock (1213) against a start or release holding the
+/// counter and waiting on that row. The commits never take this lock: they lock the
+/// `next_snapshot_id` counter, then table rows, and wait on no row a holder of this lock holds
+/// while waiting on them.
 async fn lock_catalog_names(tx: &mut sqlx::Transaction<'_, sqlx::MySql>) -> Result<()> {
     sqlx::query(
         "SELECT `value` FROM ducklake_metadata
@@ -4146,8 +4154,10 @@ impl MetadataWriter for MySqlMetadataWriter {
         }
         self.block_on(async {
             // Transaction for atomicity: if column insertion fails, we don't leave
-            // existing columns marked as ended.
+            // existing columns marked as ended. The counter lock first, as every holder of
+            // it takes it ([`lock_catalog_names`]).
             let mut tx = self.pool.begin().await?;
+            lock_catalog_names(&mut tx).await?;
             let table_begin_snapshot: i64 =
                 sqlx::query_scalar("SELECT begin_snapshot FROM ducklake_table WHERE table_id = ?")
                     .bind(table_id)
@@ -6398,13 +6408,28 @@ impl MetadataWriter for MySqlMetadataWriter {
         if rows.is_empty() {
             return Ok(());
         }
+        let pending = crate::metadata_writer::PENDING_SNAPSHOT;
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog_names(&mut tx).await?;
+            // Schema row before table row, the order a commit stamps them in, so a release
+            // never holds a table row while waiting on its schema.
+            for schema_id in [
+                rows.schema.as_ref().map(|row| row.id),
+                rows.taken_schema.as_ref().map(|row| row.id),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                sqlx::query("SELECT schema_id FROM ducklake_schema WHERE schema_id = ? FOR UPDATE")
+                    .bind(schema_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            }
             if let Some(table) = &rows.table {
                 sqlx::query(crate::metadata_writer::RELEASE_TABLE_SQL)
                     .bind(table.id)
-                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+                    .bind(pending)
                     .bind(&table.uuid)
                     .execute(&mut *tx)
                     .await?;
@@ -6412,11 +6437,31 @@ impl MetadataWriter for MySqlMetadataWriter {
             if let Some(schema) = &rows.schema {
                 sqlx::query(crate::metadata_writer::RELEASE_SCHEMA_SQL)
                     .bind(schema.id)
-                    .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+                    .bind(pending)
                     .bind(&schema.uuid)
                     .bind(schema.id)
                     .execute(&mut *tx)
                     .await?;
+            }
+            for (sql, taken) in [
+                (
+                    crate::metadata_writer::HAND_BACK_TABLE_SQL,
+                    &rows.taken_table,
+                ),
+                (
+                    crate::metadata_writer::HAND_BACK_SCHEMA_SQL,
+                    &rows.taken_schema,
+                ),
+            ] {
+                if let Some(taken) = taken {
+                    sqlx::query(sql)
+                        .bind(&taken.previous)
+                        .bind(taken.id)
+                        .bind(pending)
+                        .bind(&taken.uuid)
+                        .execute(&mut *tx)
+                        .await?;
+                }
             }
             tx.commit().await?;
             Ok(())

@@ -172,9 +172,12 @@ pub struct StartedRows {
 }
 
 impl StartedRows {
-    /// Whether the start inserted no row: nothing to release.
+    /// Whether the start inserted no row and took none up: nothing to release or hand back.
     pub fn is_empty(&self) -> bool {
-        self.schema.is_none() && self.table.is_none()
+        self.schema.is_none()
+            && self.table.is_none()
+            && self.taken_schema.is_none()
+            && self.taken_table.is_none()
     }
 }
 
@@ -206,6 +209,29 @@ pub(crate) const TAKE_UP_TABLE_SQL_DUCKDB: &str =
 pub(crate) const TAKE_UP_SCHEMA_SQL_DUCKDB: &str =
     "UPDATE ducklake_schema SET schema_uuid = CAST(? AS UUID)
      WHERE schema_id = ? AND begin_snapshot = ?";
+
+/// [`MetadataWriter::release_started_rows`]'s hand-back of a row the start took up: its UUID
+/// put back, only while it is still pending and still carries this take-up's own, so the write
+/// that held it before (another start, or an earlier stage of the same transaction) owns it
+/// again. Bound: the previous UUID (NULL for none), the id, [`PENDING_SNAPSHOT`], this
+/// take-up's UUID.
+#[cfg(any(feature = "write-sqlite", feature = "host-sqlite", feature = "write-mysql"))]
+pub(crate) const HAND_BACK_TABLE_SQL: &str = "UPDATE ducklake_table SET table_uuid = ?
+     WHERE table_id = ? AND begin_snapshot = ? AND table_uuid = ?";
+/// [`HAND_BACK_TABLE_SQL`] for a schema row.
+#[cfg(any(feature = "write-sqlite", feature = "host-sqlite", feature = "write-mysql"))]
+pub(crate) const HAND_BACK_SCHEMA_SQL: &str = "UPDATE ducklake_schema SET schema_uuid = ?
+     WHERE schema_id = ? AND begin_snapshot = ? AND schema_uuid = ?";
+/// [`HAND_BACK_TABLE_SQL`] for a DuckDB catalog.
+#[cfg(feature = "write-duckdb")]
+pub(crate) const HAND_BACK_TABLE_SQL_DUCKDB: &str =
+    "UPDATE ducklake_table SET table_uuid = CAST(? AS UUID)
+     WHERE table_id = ? AND begin_snapshot = ? AND table_uuid = CAST(? AS UUID)";
+/// [`HAND_BACK_SCHEMA_SQL`] for a DuckDB catalog.
+#[cfg(feature = "write-duckdb")]
+pub(crate) const HAND_BACK_SCHEMA_SQL_DUCKDB: &str =
+    "UPDATE ducklake_schema SET schema_uuid = CAST(? AS UUID)
+     WHERE schema_id = ? AND begin_snapshot = ? AND schema_uuid = CAST(? AS UUID)";
 
 /// [`MetadataWriter::release_started_rows`]'s SQL, `?` placeholders. The table row: still
 /// pending and still carrying its inserter's UUID. Bound: the id, [`PENDING_SNAPSHOT`], the
@@ -5298,7 +5324,9 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// row still pending and still carrying the UUID its start gave it is removed — one another
     /// write's start has taken up since has another UUID and is left to that write, and one a
     /// commit has published is not pending — and a schema row only while no live table row is
-    /// in it. Never fails a write over: the caller reports its own error.
+    /// in it. A row the start took up instead is handed back: its previous UUID restored while
+    /// it still carries this take-up's, so the write that held it before may release it.
+    /// Never fails a write over: the caller reports its own error.
     ///
     /// The default removes nothing, as for a backend whose starts insert no pending row.
     fn release_started_rows(&self, _rows: &StartedRows) -> Result<()> {

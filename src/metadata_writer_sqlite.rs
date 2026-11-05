@@ -8550,6 +8550,26 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .execute(&mut *tx)
                     .await?;
             }
+            for (sql, taken) in [
+                (
+                    crate::metadata_writer::HAND_BACK_TABLE_SQL,
+                    &rows.taken_table,
+                ),
+                (
+                    crate::metadata_writer::HAND_BACK_SCHEMA_SQL,
+                    &rows.taken_schema,
+                ),
+            ] {
+                if let Some(taken) = taken {
+                    sqlx::query(sql)
+                        .bind(&taken.previous)
+                        .bind(taken.id)
+                        .bind(crate::metadata_writer::PENDING_SNAPSHOT)
+                        .bind(&taken.uuid)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
             commit(tx).await
         })
     }

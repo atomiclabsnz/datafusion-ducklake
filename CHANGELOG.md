@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pending rows sets `started: StartedRows::default()` (#15).
 - `get_or_create_table` leaves a new table unpublished until `set_columns` gives it columns,
   on SQLite, DuckDB and MySQL catalogs (#15).
+- Don't write one catalog from this release and an older one at once: the older writer's take-up
+  of a pending row goes unmarked, and its commit then fails "row not found" (#15).
 - **Breaking:** `WriteMode` has a `CreateOrReplace` variant; exhaustive matches need its arm.
 - `DuckLakeSchema::register_table` refuses a view or an external table instead of making an empty table of its columns (ferrion#611).
 - DuckDB 1.5.6 is the bundled engine (`duckdb ~1.10506.1`) and the oracle (CI's CLI,

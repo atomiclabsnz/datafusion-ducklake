@@ -3481,9 +3481,6 @@ impl<'a> DuckLakeWriteTransaction<'a> {
 }
 
 impl DuckLakeWriteTransaction<'_> {
-    /// Stage the empty new table of a [`WriteMode::CreateOrReplace`] of no rows, which every
-    /// `stage_write*` does where another mode stages nothing for no rows: the replace still
-    /// drops the old table and creates the new one, as official's does.
     /// Adds a stage. A row an earlier stage's start inserted and this stage's start took up —
     /// still carrying that earlier start's UUID, so no other write took it up in between —
     /// stays this transaction's: its release moves to this stage, which a dropped or refused
@@ -3511,14 +3508,19 @@ impl DuckLakeWriteTransaction<'_> {
             let rows = &mut earlier.release.rows;
             if let Some(table) = adopt(&mut rows.table, started.taken_table.as_ref()) {
                 prepared.release.rows.table = Some(table);
+                prepared.release.rows.taken_table = None;
             }
             if let Some(schema) = adopt(&mut rows.schema, started.taken_schema.as_ref()) {
                 prepared.release.rows.schema = Some(schema);
+                prepared.release.rows.taken_schema = None;
             }
         }
         self.writes.push(prepared);
     }
 
+    /// Stage the empty new table of a [`WriteMode::CreateOrReplace`] of no rows, which every
+    /// `stage_write*` does where another mode stages nothing for no rows: the replace still
+    /// drops the old table and creates the new one, as official's does.
     fn stage_empty_replace(
         &mut self,
         schema_name: &str,

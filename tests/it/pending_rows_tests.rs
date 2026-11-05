@@ -295,9 +295,29 @@ async fn a_refused_commit_leaves_no_pending_rows() {
     }
 }
 
-/// The local filesystem, refusing every upload.
+/// The local filesystem, refusing every upload after its first `allowed`.
 #[derive(Debug)]
-struct RefusingStore(LocalFileSystem);
+struct RefusingStore {
+    inner: LocalFileSystem,
+    allowed: std::sync::atomic::AtomicUsize,
+}
+
+impl RefusingStore {
+    fn after(allowed: usize) -> Self {
+        Self {
+            inner: LocalFileSystem::new(),
+            allowed: allowed.into(),
+        }
+    }
+
+    fn admit(&self) -> object_store::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.allowed
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .map(|_| ())
+            .map_err(|_| refused())
+    }
+}
 
 impl std::fmt::Display for RefusingStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -316,19 +336,21 @@ fn refused() -> object_store::Error {
 impl ObjectStore for RefusingStore {
     async fn put_opts(
         &self,
-        _location: &ObjectPath,
-        _payload: object_store::PutPayload,
-        _opts: object_store::PutOptions,
+        location: &ObjectPath,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
-        Err(refused())
+        self.admit()?;
+        self.inner.put_opts(location, payload, opts).await
     }
 
     async fn put_multipart_opts(
         &self,
-        _location: &ObjectPath,
-        _opts: object_store::PutMultipartOptions,
+        location: &ObjectPath,
+        opts: object_store::PutMultipartOptions,
     ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-        Err(refused())
+        self.admit()?;
+        self.inner.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(
@@ -336,28 +358,28 @@ impl ObjectStore for RefusingStore {
         location: &ObjectPath,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
-        self.0.get_opts(location, options).await
+        self.inner.get_opts(location, options).await
     }
 
     fn delete_stream(
         &self,
         locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
-        self.0.delete_stream(locations)
+        self.inner.delete_stream(locations)
     }
 
     fn list(
         &self,
         prefix: Option<&ObjectPath>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
-        self.0.list(prefix)
+        self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(
         &self,
         prefix: Option<&ObjectPath>,
     ) -> object_store::Result<object_store::ListResult> {
-        self.0.list_with_delimiter(prefix).await
+        self.inner.list_with_delimiter(prefix).await
     }
 
     async fn copy_opts(
@@ -366,7 +388,7 @@ impl ObjectStore for RefusingStore {
         to: &ObjectPath,
         options: object_store::CopyOptions,
     ) -> object_store::Result<()> {
-        self.0.copy_opts(from, to, options).await
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -374,9 +396,7 @@ impl ObjectStore for RefusingStore {
 async fn a_failed_upload_leaves_no_pending_rows() {
     let lake = Lake::sqlite();
     let metadata: Arc<dyn MetadataWriter> = lake.sqlite_writer(0).await;
-    let writer =
-        DuckLakeTableWriter::new(metadata, Arc::new(RefusingStore(LocalFileSystem::new())))
-            .unwrap();
+    let writer = DuckLakeTableWriter::new(metadata, Arc::new(RefusingStore::after(0))).unwrap();
     writer
         .create_table("fresh", "t", &[batch(&[1, 2])])
         .await
@@ -386,6 +406,50 @@ async fn a_failed_upload_leaves_no_pending_rows() {
         .unwrap();
     session.write_batch(&batch(&[1])).unwrap();
     session.finish().await.unwrap_err();
+    assert_eq!(lake.pending_rows(), Vec::<String>::new());
+    assert_eq!(lake.every_snapshot(), ["0: "]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_that_took_a_row_up_and_failed_hands_it_back() {
+    // The first write makes the rows, the second takes them up and fails its upload: the rows
+    // are the first's again, and its abort removes them.
+    let lake = Lake::sqlite();
+    let metadata: Arc<dyn MetadataWriter> = lake.sqlite_writer(0).await;
+    let writer = DuckLakeTableWriter::new(metadata, Arc::new(RefusingStore::after(0))).unwrap();
+    let mut first = writer
+        .begin_write("fresh", "t", &schema(), WriteMode::Append)
+        .unwrap();
+    first.write_batch(&batch(&[1])).unwrap();
+    let mut second = writer
+        .begin_write("fresh", "t", &schema(), WriteMode::Append)
+        .unwrap();
+    second.write_batch(&batch(&[2])).unwrap();
+    second.finish().await.unwrap_err();
+    first.abort().await.unwrap();
+    assert_eq!(lake.pending_rows(), Vec::<String>::new());
+    assert_eq!(lake.every_snapshot(), ["0: "]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_stage_that_took_a_row_up_and_failed_leaves_the_transaction_its_rows() {
+    // Stage 1 makes the rows; stage 2 takes them up, then its upload fails before it is staged.
+    // The transaction, dropped, still removes them.
+    let lake = Lake::sqlite();
+    let metadata: Arc<dyn MetadataWriter> = lake.sqlite_writer(0).await;
+    let writer = DuckLakeTableWriter::new(metadata, Arc::new(RefusingStore::after(1))).unwrap();
+    {
+        let mut transaction = writer.transaction();
+        transaction
+            .stage_write("fresh", "t", &schema(), WriteMode::Append, &[batch(&[1])])
+            .await
+            .unwrap();
+        transaction
+            .stage_write("fresh", "t", &schema(), WriteMode::Append, &[batch(&[2])])
+            .await
+            .unwrap_err();
+        assert_eq!(lake.pending_rows(), ["schema fresh", "table t"]);
+    }
     assert_eq!(lake.pending_rows(), Vec::<String>::new());
     assert_eq!(lake.every_snapshot(), ["0: "]);
 }

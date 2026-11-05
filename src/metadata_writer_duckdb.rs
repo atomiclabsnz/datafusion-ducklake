@@ -5869,6 +5869,20 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 params![schema.id, pending, schema.uuid, schema.id],
             )?;
         }
+        for (sql, taken) in [
+            (
+                crate::metadata_writer::HAND_BACK_TABLE_SQL_DUCKDB,
+                &rows.taken_table,
+            ),
+            (
+                crate::metadata_writer::HAND_BACK_SCHEMA_SQL_DUCKDB,
+                &rows.taken_schema,
+            ),
+        ] {
+            if let Some(taken) = taken {
+                tx.execute(sql, params![taken.previous, taken.id, pending, taken.uuid])?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
