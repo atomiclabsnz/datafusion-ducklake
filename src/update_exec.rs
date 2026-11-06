@@ -289,7 +289,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 datafusion::execution::memory_pool::MemoryConsumer::new("DuckLakeUpdateExec")
                     .register(context.memory_pool());
 
-            let read = async {
+            // Boxed, as is the commit below: a session is kilobytes, and this
+            // future nests in every caller's.
+            let read = Box::pin(async {
                 let out_schema = table.update_output_schema();
                 for scan in &scans {
                     let mut batches = datafusion::physical_plan::execute_stream(
@@ -346,7 +348,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     }
                 }
                 Ok::<(), DataFusionError>(())
-            }
+            })
             .await;
             if let Err(e) = read {
                 versions.abort().await;
@@ -564,7 +566,7 @@ pub(crate) async fn commit_row_versions(
         NewVersions::Held(batches) => (batches, None),
         NewVersions::Written(session) => (Vec::new(), Some(*session)),
     };
-    let committed = commit_new_versions(
+    let committed = Box::pin(commit_new_versions(
         commit,
         updated_batches,
         &mut session,
@@ -572,7 +574,7 @@ pub(crate) async fn commit_row_versions(
         pending_deletes,
         superseded_inlined,
         total_updated,
-    )
+    ))
     .await;
     // Still here only when the commit failed before it took the session over.
     if let Some(session) = session {
