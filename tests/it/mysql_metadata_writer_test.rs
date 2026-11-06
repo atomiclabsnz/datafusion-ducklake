@@ -582,7 +582,7 @@ async fn mysql_writer_roundtrip_write_then_read() {
     assert_eq!(nested_structure[0].column_name, "bids");
     assert_eq!(
         nested_structure[0].column_type,
-        "list<struct<price:decimal(38, 16),count:uint32>>"
+        "list<struct<price:decimal(38,16),count:uint32>>"
     );
 
     let nested_rows = sqlx::query(
@@ -624,7 +624,7 @@ async fn mysql_writer_roundtrip_write_then_read() {
             (
                 nested_setup.field_ids[2],
                 "price".into(),
-                "decimal(38, 16)".into(),
+                "decimal(38,16)".into(),
                 Some(nested_setup.field_ids[1]),
             ),
             (

@@ -1033,6 +1033,37 @@ async fn lock_catalog_names(tx: &mut sqlx::Transaction<'_, sqlx::MySql>) -> Resu
     Ok(())
 }
 
+/// Record data file `data_file_id` as Parquet, as DuckDB records every file it writes (#27):
+/// where the catalog has `file_format` (DuckDB's does; this crate's own schema has not).
+/// `has_format` keeps the answer for the commit's other files.
+async fn mark_parquet(
+    tx: &mut sqlx::MySqlConnection,
+    data_file_id: i64,
+    has_format: &mut Option<bool>,
+) -> Result<()> {
+    let has = match *has_format {
+        Some(has) => has,
+        None => {
+            let found: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.columns
+                 WHERE table_schema = DATABASE() AND table_name = 'ducklake_data_file'
+                   AND column_name = 'file_format'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            *has_format = Some(found > 0);
+            found > 0
+        },
+    };
+    if has {
+        sqlx::query("UPDATE ducklake_data_file SET file_format = 'parquet' WHERE data_file_id = ?")
+            .bind(data_file_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Whether the catalog's `table` has `column`: a catalog DuckDB made has `schema_uuid` and
 /// `table_uuid`; this crate's own schema has neither.
 async fn has_column(
@@ -1627,7 +1658,8 @@ async fn record_table_write_changes(
     table_name: &str,
     mode: WriteMode,
     has_deletes: bool,
-    inlined: bool,
+    // `Some(true)` an inlined insert, `Some(false)` files, `None` no rows (a fileless commit).
+    inserted: Option<bool>,
     commit_metadata: &SnapshotCommitMetadata,
 ) -> Result<()> {
     let replaced_existing_data: bool = sqlx::query_scalar(
@@ -1662,7 +1694,7 @@ async fn record_table_write_changes(
 
     let write_changes = table_storage_changes(
         table_id,
-        Some(inlined),
+        inserted,
         has_deletes || (mode == WriteMode::Replace && replaced_existing_data),
         replaced_inlined,
     );
@@ -2477,6 +2509,17 @@ async fn finalize_table_snapshot(
                 .to_string(),
         ));
     }
+    let used: Vec<i64> =
+        sqlx::query_scalar("SELECT DISTINCT column_id FROM ducklake_column WHERE table_id = ?")
+            .bind(table_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    crate::metadata_writer::refuse_reused_column_ids(
+        &proposed,
+        &existing_catalog_columns,
+        &committed_ids,
+        &used,
+    )?;
     // A row the write's start made is pending until here: it takes this commit's snapshot.
     // Read once from the table's live row, and updated only when pending, so an append to a
     // committed table pays nothing.
@@ -2512,6 +2555,14 @@ async fn finalize_table_snapshot(
         .execute(&mut **tx)
         .await?;
     }
+    // Another write published the table since this one began: its start saw no columns.
+    crate::metadata_writer::refuse_columns_of_a_concurrent_create(
+        table_begin != pending && table_begin > base_snapshot,
+        &existing_catalog_columns,
+        &existing_nullability,
+        &proposed,
+        column_ids,
+    )?;
     let is_ddl = current.is_empty()
         || catalog_columns_differ(
             &existing_catalog_columns,
@@ -2807,6 +2858,7 @@ async fn commit_staged_files(
     let mut total_advance = 0i64;
     let mut total_records = 0i64;
     let mut total_bytes = 0i64;
+    let mut file_format = None;
     for (file, data_file_id) in files.iter().zip(data_file_ids) {
         let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
         sqlx::query(
@@ -2826,6 +2878,7 @@ async fn commit_staged_files(
         .bind(snapshot_id)
         .execute(&mut **tx)
         .await?;
+        mark_parquet(tx, data_file_id, &mut file_format).await?;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
         insert_partition_metadata(tx, write.table_id, data_file_id, file).await?;
         next_row_id += row_ids.advance;
@@ -4185,13 +4238,17 @@ impl MetadataWriter for MySqlMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            // Reserve a contiguous column_id block from the monotonic counter and
-            // insert with explicit ids, keeping the allocator authoritative.
+            // The columns take ids past the table's highest, as DuckDB numbers a table's
+            // columns (#27); the crate's counter is kept past them too. Read under the
+            // counter lock taken above, so no other writer adds one meanwhile.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
-            let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
-            let first_column_id = last_column_id - n + 1;
-            let field_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
+            reserve_ids(&mut tx, "next_column_id", n).await?;
+            let first: i64 = sqlx::query_scalar(crate::metadata_writer::NEXT_TABLE_COLUMN_ID_SQL)
+                .bind(table_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let field_ids = crate::metadata_writer::fresh_column_ids(first, catalog_columns.len());
             for (column, column_id) in catalog_columns.iter().zip(field_ids.iter()) {
                 let parent_id = column.parent_index.map(|index| field_ids[index]);
                 sqlx::query(
@@ -4216,6 +4273,22 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(&column.default_value_dialect)
                 .execute(&mut *tx)
                 .await?;
+            }
+
+            // Setting a table's columns is DDL: the snapshot takes a new schema version, as
+            // DuckDB's `CREATE TABLE` and `ALTER TABLE` give it, so a DuckDB that attached the
+            // lake before reloads its catalog and sees the table (#27).
+            let schema_version = bump_schema_version(&mut tx, snapshot_id).await?;
+            let recorded: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM ducklake_schema_versions
+                 WHERE table_id = ? AND begin_snapshot = ?",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if recorded == 0 {
+                record_schema_version(&mut tx, snapshot_id, schema_version, table_id).await?;
             }
 
             if publishes {
@@ -4355,6 +4428,8 @@ impl MetadataWriter for MySqlMetadataWriter {
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
+            let mut file_format = None;
+            mark_parquet(&mut tx, data_file_id, &mut file_format).await?;
 
             // Persist the file's zone maps + refresh the roll-up.
             insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
@@ -4391,7 +4466,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 table_name,
                 mode,
                 false,
-                false,
+                Some(false),
                 commit_metadata,
             )
             .await?;
@@ -4508,6 +4583,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             // Explicit ids from the shared next_file_id counter (never the
             // auto-increment) keep every insert path in one id space.
             let data_file_ids = reserve_file_ids(&mut tx, file_count).await?;
+            let mut file_format = None;
             for (file, data_file_id) in files.iter().zip(data_file_ids) {
                 let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
                 sqlx::query(
@@ -4527,6 +4603,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
+                mark_parquet(&mut tx, data_file_id, &mut file_format).await?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
@@ -4563,7 +4640,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 table_name,
                 mode,
                 false,
-                false,
+                Some(false),
                 commit_metadata,
             )
             .await?;
@@ -4789,6 +4866,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             )
             .await?;
             // Each file draws its own row ids from the advancing counter.
+            let mut file_format = None;
             for file in files {
                 let next_row_id: i64 = sqlx::query_scalar(
                     "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?",
@@ -4815,6 +4893,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
+                mark_parquet(&mut tx, data_file_id, &mut file_format).await?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
@@ -4841,7 +4920,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 table_name,
                 mode,
                 !deletes.is_empty(),
-                false,
+                Some(false),
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
@@ -5104,6 +5183,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 )
             })?;
             let output_ids = reserve_file_ids(&mut tx, output_count).await?;
+            let mut file_format = None;
             for (output, data_file_id) in outputs.iter().zip(output_ids) {
                 let begin_snapshot = output.begin_snapshot.unwrap_or(snapshot_id);
                 sqlx::query(
@@ -5124,6 +5204,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(output.partial_max)
                 .execute(&mut *tx)
                 .await?;
+                mark_parquet(&mut tx, data_file_id, &mut file_format).await?;
                 insert_file_column_stats(
                     &mut tx,
                     table_id,
@@ -5206,6 +5287,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     reserve_file_ids(&mut tx, output_count).await?
                 };
                 let mut added_bytes = 0;
+                let mut file_format = None;
                 for (out, data_file_id) in table.files.iter().zip(output_ids) {
                     sqlx::query(
                         "INSERT INTO ducklake_data_file
@@ -5225,6 +5307,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .bind(out.partial_max)
                     .execute(&mut *tx)
                     .await?;
+                    mark_parquet(&mut tx, data_file_id, &mut file_format).await?;
                     insert_file_column_stats(
                         &mut tx,
                         table.table_id,
@@ -5692,7 +5775,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 table_name,
                 mode,
                 false,
-                true,
+                Some(true),
                 commit_metadata,
             )
             .await?;
@@ -6313,7 +6396,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 table_name,
                 mode,
                 false,
-                false,
+                None,
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
@@ -6767,15 +6850,12 @@ impl MetadataWriter for MySqlMetadataWriter {
             let mut tx = self.pool.begin().await?;
             lock_catalog_names(&mut tx).await?;
 
-            // Reserve the column ids first so the counter UPDATE takes the write
-            // lock up front. These ids match the staged parquet field ids.
+            // The counter UPDATE first takes the write lock up front. The ids a new column
+            // takes are its table's own (below); the counter stays past every id, so a
+            // release that draws from it reuses none.
             let catalog_columns = catalog_column_defs(columns)?;
             let n = catalog_columns.len() as i64;
-            let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
-            // Freshly reserved ids. Only a genuinely-new column actually consumes
-            // one below; an existing column keeps its current id, so some of these
-            // may go unused (harmless monotonic-counter gaps).
-            let fresh_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
+            reserve_ids(&mut tx, "next_column_id", n).await?;
 
             // The catalog head this write is based on; a Replace commit aborts if
             // another writer published a newer generation of the table past it.
@@ -6886,6 +6966,18 @@ impl MetadataWriter for MySqlMetadataWriter {
                     parent_column,
                 });
             }
+            // Offered ids: past the table's highest column id, as DuckDB numbers a table's
+            // columns (#27). Only a genuinely new column takes one; an existing column keeps
+            // its id. These are the staged Parquet field ids.
+            let first: i64 = sqlx::query_scalar(crate::metadata_writer::NEXT_TABLE_COLUMN_ID_SQL)
+                .bind(table_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let fresh_ids = crate::metadata_writer::offered_column_ids(
+                &catalog_columns,
+                &existing_catalog_columns,
+                first,
+            )?;
             let field_ids =
                 assign_column_ids(&catalog_columns, &existing_catalog_columns, &fresh_ids)?;
 

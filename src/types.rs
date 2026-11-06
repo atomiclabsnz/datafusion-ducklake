@@ -541,7 +541,8 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
 
         // Decimal types
         DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
-            Ok(format!("decimal({}, {})", precision, scale))
+            // DuckDB's spelling, with no space (#27); readers take either.
+            Ok(format!("decimal({precision},{scale})"))
         },
 
         // Null type - map to varchar as there's no direct equivalent
@@ -3237,7 +3238,7 @@ mod tests {
 
     #[test]
     fn test_arbitrarily_composed_nested_types() {
-        let type_name = "list<struct<levels:list<struct<price:decimal(38, 16)>>,attrs:map<varchar,list<int32>>>>";
+        let type_name = "list<struct<levels:list<struct<price:decimal(38,16)>>,attrs:map<varchar,list<int32>>>>";
         let arrow = ducklake_to_arrow_type(type_name).unwrap();
         assert_eq!(arrow_to_ducklake_type(&arrow).unwrap(), type_name);
 
@@ -3344,11 +3345,11 @@ mod tests {
     fn test_arrow_to_ducklake_decimal() {
         assert_eq!(
             arrow_to_ducklake_type(&DataType::Decimal128(10, 2)).unwrap(),
-            "decimal(10, 2)"
+            "decimal(10,2)"
         );
         assert_eq!(
             arrow_to_ducklake_type(&DataType::Decimal256(40, 5)).unwrap(),
-            "decimal(40, 5)"
+            "decimal(40,5)"
         );
     }
 

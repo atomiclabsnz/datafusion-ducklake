@@ -12,13 +12,9 @@
 //! What is normalised, and why. Each side's own draws: a snapshot's time, the UUIDs, a Parquet
 //! file's name and byte sizes (two Parquet writers). And what this crate's table creation writes
 //! differently from DuckDB's in every mode — `WriteMode::Create` writes the same rows
-//! (`no_prior_table` asserts it), so none of it is this mode's:
+//! (`no_prior_table` asserts it), so none of it is this mode's; `catalog_rows_oracle_tests`
+//! pins each:
 //! - its own `next_column_id` / `next_file_id` counters in `ducklake_metadata`;
-//! - a table's column ids and orders, counted here from its first (DuckDB numbers each table's
-//!   columns from 1; this crate draws ids from one counter across tables, and orders by id);
-//! - a column's `default_value_type`/`default_value_dialect` (DuckDB writes `literal`/`duckdb`,
-//!   this crate NULL), a decimal's spelling (`decimal(2, 1)` beside `decimal(2,1)`), a table's
-//!   `table_uuid` (NULL here) and a data file's `file_format` (NULL here);
 //! - the head snapshot's `next_catalog_id` / `next_file_id` watermarks: a write's start raises
 //!   the head's past the pending table row it makes, and an inlined insert does not take a file
 //!   id here as DuckDB's does. DuckDB going on writing the lake checks they stay past every id.
@@ -105,9 +101,6 @@ fn dump(catalog: &Path) -> Vec<String> {
         .unwrap();
     let uuid =
         regex::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap();
-    // A table's column ids counted from 1, as DuckDB numbers them.
-    let first = "(SELECT min(f.column_id) FROM c.ducklake_column f WHERE f.table_id = x.table_id)";
-    let column_id = format!("column_id - {first} + 1 AS column_id");
     let mut rows = Vec::new();
     for table in tables {
         let sql = match table.as_str() {
@@ -121,31 +114,15 @@ fn dump(catalog: &Path) -> Vec<String> {
                     .to_string()
             },
             "ducklake_data_file" => {
-                "SELECT * EXCLUDE (path, file_size_bytes, footer_size, file_format)
-                 FROM c.ducklake_data_file x"
+                "SELECT * EXCLUDE (path, file_size_bytes, footer_size) FROM c.ducklake_data_file x"
                     .to_string()
             },
             "ducklake_table_stats" => {
                 "SELECT * EXCLUDE (file_size_bytes) FROM c.ducklake_table_stats x".to_string()
             },
-            "ducklake_table" => "SELECT * EXCLUDE (table_uuid) FROM c.ducklake_table x".to_string(),
-            "ducklake_column" => format!(
-                "SELECT * EXCLUDE (default_value_type, default_value_dialect)
-                          REPLACE ({column_id},
-                                   column_order - (SELECT min(f.column_order)
-                                                   FROM c.ducklake_column f
-                                                   WHERE f.table_id = x.table_id) + 1
-                                       AS column_order,
-                                   parent_column - {first} + 1 AS parent_column,
-                                   replace(column_type, ', ', ',') AS column_type)
-                 FROM c.ducklake_column x"
-            ),
-            "ducklake_file_column_stats" => format!(
-                "SELECT * EXCLUDE (column_size_bytes) REPLACE ({column_id})
-                 FROM c.ducklake_file_column_stats x"
-            ),
-            "ducklake_table_column_stats" | "ducklake_column_tag" => {
-                format!("SELECT * REPLACE ({column_id}) FROM c.\"{table}\" x")
+            "ducklake_file_column_stats" => {
+                "SELECT * EXCLUDE (column_size_bytes) FROM c.ducklake_file_column_stats x"
+                    .to_string()
             },
             _ => format!("SELECT * FROM c.\"{table}\" x"),
         };

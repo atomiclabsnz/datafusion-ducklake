@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A new table's column ids count from 1, and a new column takes its table's next id, as DuckDB
+  numbers them; existing columns keep their ids (#27).
+- Two writes adding different columns to one table at once: the later commit is now a
+  conflict to retry, as DuckDB's is (#27).
+- Catalog rows as DuckDB 1.5.6 writes them: a column without a default is `NULL`/`literal`/
+  `duckdb`, a decimal is `decimal(p,s)`, a data file's `file_format` is `parquet` (#27).
 - **Breaking:** `WriteSetupResult` has a `started` field; a `MetadataWriter` that inserts no
   pending rows sets `started: StartedRows::default()` (#15).
 - `get_or_create_table` leaves a new table unpublished until `set_columns` gives it columns,
@@ -256,6 +262,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An empty SQL `CREATE TABLE` records no insert in its snapshot (#27).
+- `set_columns` gives its snapshot a new schema version, so a DuckDB already attached sees the
+  table (#27).
 - A write that does not commit removes the pending schema and table rows its start made, unless
   another write took them up (catalogs with `schema_uuid` / `table_uuid`, #15).
 - MySQL: concurrent starts and `get_or_create_*` of one new name insert one row, not two (#15).

@@ -941,9 +941,9 @@ impl DuckdbMetadataWriter {
             let data_file_id = reserve_file_ids(&tx, 1)?[0];
             tx.execute(
                 "INSERT INTO ducklake_data_file
-                     (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                     (file_format, data_file_id, table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES ('parquet', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     data_file_id,
                     table_id,
@@ -977,7 +977,7 @@ impl DuckdbMetadataWriter {
             table_name,
             mode,
             !deletes.is_empty(),
-            false,
+            Some(false),
             &SnapshotCommitMetadata::default(),
         )?;
         let schema_id = tx.query_row(
@@ -1567,7 +1567,8 @@ fn record_table_write_changes(
     table_name: &str,
     mode: WriteMode,
     has_deletes: bool,
-    inlined: bool,
+    // `Some(true)` an inlined insert, `Some(false)` files, `None` no rows (a fileless commit).
+    inserted: Option<bool>,
     commit_metadata: &SnapshotCommitMetadata,
 ) -> Result<()> {
     let replaced_existing_data: bool = tx.query_row(
@@ -1596,7 +1597,7 @@ fn record_table_write_changes(
 
     let write_changes = table_storage_changes(
         table_id,
-        Some(inlined),
+        inserted,
         has_deletes || (mode == WriteMode::Replace && replaced_existing_data),
         replaced_inlined,
     );
@@ -2514,6 +2515,18 @@ fn finalize_table_snapshot(
                 .to_string(),
         ));
     }
+    let used = {
+        let mut statement =
+            tx.prepare("SELECT DISTINCT column_id FROM ducklake_column WHERE table_id = ?")?;
+        let ids = statement.query_map(params![table_id], |row| row.get::<_, i64>(0))?;
+        ids.collect::<std::result::Result<Vec<_>, duckdb::Error>>()?
+    };
+    crate::metadata_writer::refuse_reused_column_ids(
+        &proposed,
+        &existing_catalog_columns,
+        &committed_ids,
+        &used,
+    )?;
 
     // A row the write's start made is pending until here: it takes this commit's snapshot.
     // Read once from the table's live row (a renamed table has ended versions under the same
@@ -2543,6 +2556,14 @@ fn finalize_table_snapshot(
             params![snapshot_id, table_id, pending],
         )?;
     }
+    // Another write published the table since this one began: its start saw no columns.
+    crate::metadata_writer::refuse_columns_of_a_concurrent_create(
+        table_begin != pending && table_begin > base_snapshot,
+        &existing_catalog_columns,
+        &existing_nullability,
+        &proposed,
+        column_ids,
+    )?;
     let is_ddl = current.is_empty()
         || catalog_columns_differ(
             &existing_catalog_columns,
@@ -2813,9 +2834,9 @@ fn commit_staged_files(
         let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
         let data_file_id: i64 = tx.query_row(
             "INSERT INTO ducklake_data_file
-                 (table_id, path, path_is_relative, file_size_bytes,
+                 (file_format, table_id, path, path_is_relative, file_size_bytes,
                   footer_size, record_count, row_id_start, begin_snapshot)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
+             VALUES ('parquet', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
             params![
                 write.table_id,
                 file.path.as_str(),
@@ -3957,13 +3978,17 @@ impl MetadataWriter for DuckdbMetadataWriter {
             params![snapshot_id, table_id],
         )?;
 
-        // Reserve a contiguous column_id block from the monotonic counter and
-        // insert with explicit ids, keeping the allocator authoritative.
+        // The columns take ids past the table's highest, as DuckDB numbers a table's columns
+        // (#27); the crate's counter is kept past them too.
         let catalog_columns = catalog_column_defs(columns)?;
         let n = catalog_columns.len() as i64;
-        let last_column_id = reserve_ids(&tx, "next_column_id", n)?;
-        let first_column_id = last_column_id - n + 1;
-        let column_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
+        reserve_ids(&tx, "next_column_id", n)?;
+        let first: i64 = tx.query_row(
+            crate::metadata_writer::NEXT_TABLE_COLUMN_ID_SQL,
+            params![table_id],
+            |row| row.get(0),
+        )?;
+        let column_ids = crate::metadata_writer::fresh_column_ids(first, catalog_columns.len());
         for (column, column_id) in catalog_columns.iter().zip(column_ids.iter()) {
             let parent_id = column.parent_index.map(|index| column_ids[index]);
             tx.execute(
@@ -3988,6 +4013,20 @@ impl MetadataWriter for DuckdbMetadataWriter {
                     column.default_value_dialect.as_deref()
                 ],
             )?;
+        }
+
+        // Setting a table's columns is DDL: the snapshot takes a new schema version, as DuckDB's
+        // `CREATE TABLE` and `ALTER TABLE` give it, so a DuckDB that attached the lake before
+        // reloads its catalog and sees the table (#27).
+        let schema_version = bump_schema_version(&tx, snapshot_id)?;
+        let recorded: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM ducklake_schema_versions
+                            WHERE table_id = ? AND begin_snapshot = ?)",
+            params![table_id, snapshot_id],
+            |row| row.get(0),
+        )?;
+        if !recorded {
+            record_schema_version(&tx, snapshot_id, schema_version, table_id)?;
         }
 
         if publishes {
@@ -4099,9 +4138,9 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // per-column stats rows to, in the same transaction.
         let data_file_id: i64 = tx.query_row(
             "INSERT INTO ducklake_data_file
-                 (table_id, path, path_is_relative, file_size_bytes,
+                 (file_format, table_id, path, path_is_relative, file_size_bytes,
                   footer_size, record_count, row_id_start, begin_snapshot)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
+             VALUES ('parquet', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
             params![
                 table_id,
                 file.path.as_str(),
@@ -4143,7 +4182,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             table_name,
             mode,
             false,
-            false,
+            Some(false),
             commit_metadata,
         )?;
         let schema_id: i64 = tx.query_row(
@@ -4244,9 +4283,9 @@ impl MetadataWriter for DuckdbMetadataWriter {
             let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
             let data_file_id: i64 = tx.query_row(
                 "INSERT INTO ducklake_data_file
-                     (table_id, path, path_is_relative, file_size_bytes,
+                     (file_format, table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
+                 VALUES ('parquet', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
                 params![
                     table_id,
                     file.path.as_str(),
@@ -4288,7 +4327,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             table_name,
             mode,
             false,
-            false,
+            Some(false),
             commit_metadata,
         )?;
         let schema_id: i64 = tx.query_row(
@@ -4503,7 +4542,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             table_name,
             mode,
             false,
-            true,
+            Some(true),
             commit_metadata,
         )?;
         let schema_id: i64 = tx.query_row(
@@ -5084,9 +5123,9 @@ impl MetadataWriter for DuckdbMetadataWriter {
             let begin_snapshot = output.begin_snapshot.unwrap_or(snapshot_id);
             tx.execute(
                 "INSERT INTO ducklake_data_file
-                     (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                     (file_format, data_file_id, table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot, partial_max)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES ('parquet', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     data_file_id,
                     table_id,
@@ -5170,9 +5209,9 @@ impl MetadataWriter for DuckdbMetadataWriter {
             for (out, data_file_id) in table.files.iter().zip(output_ids) {
                 tx.execute(
                     "INSERT INTO ducklake_data_file
-                         (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                         (file_format, data_file_id, table_id, path, path_is_relative, file_size_bytes,
                           footer_size, record_count, row_id_start, begin_snapshot, partial_max)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES ('parquet', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         data_file_id,
                         table.table_id,
@@ -5767,7 +5806,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             table_name,
             mode,
             false,
-            false,
+            None,
             &SnapshotCommitMetadata::default(),
         )?;
         let schema_id: i64 = tx.query_row(
@@ -6020,14 +6059,11 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let mut conn = self.connection();
         let tx = conn.transaction()?;
 
-        // Reserve the column ids first. These match the staged parquet field ids.
+        // The crate's column counter is kept past every id a new column takes (its table's
+        // own, below), so a release that draws from it reuses none.
         let catalog_columns = catalog_column_defs(columns)?;
         let n = catalog_columns.len() as i64;
-        let last_column_id = reserve_ids(&tx, "next_column_id", n)?;
-        // Freshly reserved ids. Only a genuinely-new column consumes one below; an
-        // existing column keeps its current id, so some may go unused (harmless
-        // monotonic-counter gaps).
-        let fresh_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
+        reserve_ids(&tx, "next_column_id", n)?;
 
         // The catalog head this write is based on; a Replace commit aborts if
         // another writer published a newer generation of the table past it.
@@ -6140,6 +6176,18 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 parent_column,
             });
         }
+        // Offered ids: past the table's highest column id, as DuckDB numbers a table's columns
+        // (#27). Only a genuinely new column takes one. These are the staged Parquet field ids.
+        let first: i64 = tx.query_row(
+            crate::metadata_writer::NEXT_TABLE_COLUMN_ID_SQL,
+            params![table_id],
+            |row| row.get(0),
+        )?;
+        let fresh_ids = crate::metadata_writer::offered_column_ids(
+            &catalog_columns,
+            &existing_catalog_columns,
+            first,
+        )?;
         let field_ids = assign_column_ids(&catalog_columns, &existing_catalog_columns, &fresh_ids)?;
 
         // Data-write policy: a data write — Replace OR Append — must NOT change a
@@ -6367,7 +6415,7 @@ mod tests {
                 (
                     setup.field_ids[2],
                     "price".into(),
-                    "decimal(38, 16)".into(),
+                    "decimal(38,16)".into(),
                     Some(setup.field_ids[1]),
                 ),
                 (
