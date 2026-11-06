@@ -315,8 +315,11 @@ pub(crate) enum Staged {
 pub(crate) struct StagedParts {
     tail: Bytes,
     part_bytes: usize,
-    /// `None` when no part was sent: the whole file is `tail`.
+    /// The upload the sent parts went to: `None` when no part was sent (the
+    /// whole file is `tail`), and once it is complete.
     upload: Option<Box<dyn MultipartUpload>>,
+    /// Bytes sent in parts before the file was finished; zero means `tail` is
+    /// the whole file.
     sent: u64,
     parts: u64,
     /// The footer as the writer returned it, when the file was finished
@@ -407,7 +410,10 @@ impl Staged {
                 row_count,
                 leaves,
             ),
-            Staged::Parts(parts) => match (&parts.metadata, &parts.upload) {
+            // Whether a part was sent, not whether the upload is still held: an
+            // upload is taken once it completes, and the tail alone is then not
+            // the file.
+            Staged::Parts(parts) => match (&parts.metadata, parts.sent == 0) {
                 (Some(metadata), _) => {
                     crate::stats_collect::collect_own_written_column_stats_from_metadata(
                         Arc::clone(metadata),
@@ -418,14 +424,14 @@ impl Staged {
                     )
                 },
                 // Nothing sent: the tail is the whole file.
-                (None, None) => crate::stats_collect::collect_own_written_column_stats_from(
+                (None, true) => crate::stats_collect::collect_own_written_column_stats_from(
                     parts.tail.clone(),
                     "<part-staged file>",
                     column_ids,
                     row_count,
                     leaves,
                 ),
-                (None, Some(_)) => {
+                (None, false) => {
                     tracing::warn!(
                         "a part-staged file was finished without its footer metadata; \
                          writing it without column stats"
@@ -492,11 +498,16 @@ impl StagedParts {
         object_store: &Arc<dyn ObjectStore>,
         object_path: &ObjectPath,
     ) -> Result<()> {
-        if self.upload.is_none() {
+        if self.sent == 0 {
             object_store
                 .put(object_path, PutPayload::from(self.tail.clone()))
                 .await?;
             return Ok(());
+        }
+        if self.upload.is_none() {
+            return Err(crate::error::DuckLakeError::Internal(
+                "a part-staged data file was uploaded twice".to_string(),
+            ));
         }
         let mut sink = PartsSink {
             buffer: Vec::new(),
@@ -514,9 +525,9 @@ impl StagedParts {
                 "a data file's multipart upload was lost".to_string(),
             ));
         };
+        // `sent` and `parts` stay what was sent before the file was finished:
+        // `len` is `sent` plus the tail.
         upload.complete().await?;
-        self.sent = sink.sent;
-        self.parts = sink.parts;
         Ok(())
     }
 }
