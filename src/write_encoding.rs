@@ -353,7 +353,12 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
     /// first row group it is still buffering, and the encoded row group in
     /// progress ([`ArrowWriter::memory_size`]).
     pub(crate) fn memory_size(&self) -> usize {
-        self.buffered_bytes + self.writer.as_ref().map_or(0, ArrowWriter::memory_size)
+        match &self.writer {
+            Some(writer) => writer.memory_size(),
+            // `buffered_bytes` is not reset when the file opens: it counts only
+            // while the rows are still buffered.
+            None => self.buffered_bytes,
+        }
     }
 
     /// The sink, to read how much it holds. `None` only if opening the file
@@ -532,6 +537,28 @@ mod tests {
         let parent = batch(0, 20_000);
         let slice = parent.slice(0, 1_000);
         assert!(sliced_memory_size(&slice) * 10 < parent.get_array_memory_size());
+    }
+
+    /// Once its file opens, a writer's memory is the row group in progress, not
+    /// the rows it buffered before opening (which it has written on).
+    #[test]
+    fn an_open_writer_does_not_count_the_rows_it_buffered() {
+        let base = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1000))
+            .build();
+        let mut writer = RowGroupSampledWriter::new(Vec::new(), schema(), base);
+        let rows = batch(0, 1500);
+        writer.write(&rows).unwrap();
+        assert!(
+            writer.writer.is_some(),
+            "the first row group opened the file"
+        );
+        assert!(
+            writer.memory_size() < sliced_memory_size(&rows) / 2,
+            "{} bytes held, {} buffered before opening",
+            writer.memory_size(),
+            sliced_memory_size(&rows)
+        );
     }
 
     /// A batch of long strings in a view column counts their bytes, not only its
