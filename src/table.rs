@@ -5128,31 +5128,13 @@ impl DuckLakeTable {
         predicate: Option<&Arc<dyn PhysicalExpr>>,
         assignments: &[(usize, Arc<dyn PhysicalExpr>)],
     ) -> DataFusionResult<FileUpdateOutput> {
-        // Assignment expressions may yield NULL even when the catalog field is
-        // NOT NULL. Keep this intermediate batch permissive so DuckLake's shared
-        // validator can report the catalog column path before any delete file is
-        // authored; the writer still uses `physical_schema` as the target schema.
-        let mut out_fields: Vec<Arc<Field>> = self
-            .physical_schema
-            .fields()
-            .iter()
-            .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
-            .collect();
-        out_fields.push(Arc::new(rowid_field()));
-        let out_schema = Arc::new(Schema::new(out_fields));
-
+        let out_schema = self.update_output_schema();
         let mut updated_batches: Vec<RecordBatch> = Vec::new();
         let mut new_positions: Vec<i64> = Vec::new();
 
         for batch in batches {
-            let Some(rewritten) = rewrite_scanned_batch(
-                &self.physical_schema,
-                &out_schema,
-                scan,
-                batch,
-                predicate,
-                assignments,
-            )?
+            let Some(rewritten) =
+                self.apply_update_to_batch(scan, &out_schema, batch, predicate, assignments)?
             else {
                 continue;
             };
@@ -5160,20 +5142,69 @@ impl DuckLakeTable {
             new_positions.extend(rewritten.positions);
         }
 
-        let matched_count = new_positions.len();
         let mut matched_positions = new_positions;
         matched_positions.sort_unstable();
-        let mut cumulative: HashSet<i64> = scan.existing_parquet_deletes.keys().copied().collect();
-        cumulative.extend(matched_positions.iter().copied());
-        let mut cumulative_positions: Vec<i64> = cumulative.into_iter().collect();
-        cumulative_positions.sort_unstable();
-
         Ok(FileUpdateOutput {
             updated_batches,
-            matched_count,
             matched_positions,
-            cumulative_positions,
         })
+    }
+
+    /// The schema of an `UPDATE`'s rewritten rows: the physical columns, each
+    /// nullable, then the rowid. Assignment expressions may yield NULL even when
+    /// the catalog field is NOT NULL. Keep this intermediate batch permissive so
+    /// DuckLake's shared validator can report the catalog column path before any
+    /// delete file is authored; the writer still uses `physical_schema` as the
+    /// target schema.
+    #[cfg(feature = "write")]
+    pub(crate) fn update_output_schema(&self) -> SchemaRef {
+        let mut out_fields: Vec<Arc<Field>> = self
+            .physical_schema
+            .fields()
+            .iter()
+            .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
+            .collect();
+        out_fields.push(Arc::new(rowid_field()));
+        Arc::new(Schema::new(out_fields))
+    }
+
+    /// One scanned `batch` of `scan`'s source file rewritten as
+    /// [`Self::apply_update_to_batches`] rewrites each: the matched rows'
+    /// new versions in `out_schema` ([`Self::update_output_schema`]) and their
+    /// positions, or `None` when none matched. For an `UPDATE` that writes its
+    /// new versions as it reads the file, rather than holding them.
+    #[cfg(feature = "write")]
+    pub(crate) fn apply_update_to_batch(
+        &self,
+        scan: &UpdateSourceScan,
+        out_schema: &SchemaRef,
+        batch: &RecordBatch,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+        assignments: &[(usize, Arc<dyn PhysicalExpr>)],
+    ) -> DataFusionResult<Option<RewrittenBatch>> {
+        rewrite_scanned_batch(
+            &self.physical_schema,
+            out_schema,
+            scan,
+            batch,
+            predicate,
+            assignments,
+        )
+    }
+
+    /// The mask an `UPDATE` leaves on `scan`'s file, for a writer that does not
+    /// stage row mutations: the positions of the rows it rewrote there, unioned
+    /// with what the file's live delete file already masks, sorted.
+    #[cfg(feature = "write")]
+    pub(crate) fn cumulative_positions(
+        scan: &UpdateSourceScan,
+        new_positions: Vec<i64>,
+    ) -> Vec<i64> {
+        let mut cumulative: HashSet<i64> = scan.existing_parquet_deletes.keys().copied().collect();
+        cumulative.extend(new_positions);
+        let mut cumulative_positions: Vec<i64> = cumulative.into_iter().collect();
+        cumulative_positions.sort_unstable();
+        cumulative_positions
     }
 
     /// Rewrite the visible inlined rows of `inlined` that `predicate` matches,
@@ -5506,13 +5537,8 @@ pub(crate) struct FileUpdateOutput {
     /// Rewritten row versions, `[physical columns..., rowid]`, carrying each
     /// row's original rowid. Empty when no rows matched.
     pub(crate) updated_batches: Vec<RecordBatch>,
-    /// Number of rows this update rewrote in the source file.
-    pub(crate) matched_count: usize,
     /// Physical positions of the rewritten rows (sorted).
     pub(crate) matched_positions: Vec<i64>,
-    /// Physical positions to mask on the source file afterwards: the rows this
-    /// update supersedes unioned with any already-deleted rows (sorted).
-    pub(crate) cumulative_positions: Vec<i64>,
 }
 
 #[async_trait]

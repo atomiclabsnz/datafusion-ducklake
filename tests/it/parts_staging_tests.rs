@@ -64,6 +64,8 @@ struct PartsStore {
     parts: Arc<AtomicUsize>,
     opened: AtomicUsize,
     fault: Option<Fault>,
+    /// Every read: its path and how many parts had been sent when it began.
+    reads: Mutex<Vec<(String, usize)>>,
 }
 
 impl PartsStore {
@@ -74,6 +76,7 @@ impl PartsStore {
             parts: Arc::default(),
             opened: AtomicUsize::new(0),
             fault,
+            reads: Mutex::default(),
         }
     }
 
@@ -187,6 +190,11 @@ impl ObjectStore for PartsStore {
         location: &ObjectPath,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
+        let sent = parts_of(&self.events());
+        self.reads
+            .lock()
+            .unwrap()
+            .push((location.to_string(), sent));
         self.inner.get_opts(location, options).await
     }
 
@@ -960,7 +968,7 @@ async fn a_dropped_session_aborts_its_open_upload_in_the_background() {
     }
 }
 
-// ---- ADR-0037 slice 3: a SQL `INSERT` streams into its session ----
+// ---- ADR-0037 slice 3: SQL `INSERT` and `UPDATE` stream into their sessions ----
 
 /// A session context over `lake` through SQL: its catalog as `lake`, writing
 /// under `options(Parts)` (rolling small files, nothing inlined), its store the
@@ -1196,4 +1204,115 @@ async fn a_sql_insert_past_the_pool_is_refused_and_leaves_nothing() {
     );
     assert_eq!(lake.parquet_on_disk(), Vec::<std::path::PathBuf>::new());
     assert!(lake.files().await.is_empty());
+}
+
+/// `lake.main.t` holding `batches(30)` through SQL, in several files.
+async fn seeded(fault: Option<Fault>) -> (Lake, datafusion::prelude::SessionContext) {
+    let lake = Lake::new(fault).await;
+    let ctx = sql_ctx(&lake, None).await;
+    empty_table(&ctx).await;
+    register_source(&ctx, &lake, 30, None);
+    run(&ctx, "INSERT INTO lake.main.t SELECT * FROM src")
+        .await
+        .unwrap();
+    // A fresh context, so the UPDATE plans at the head.
+    let ctx = sql_ctx(&lake, None).await;
+    (lake, ctx)
+}
+
+/// DuckDB's count, sum of ids, sum of rowids and min id.
+fn duckdb_rows(lake: &Lake) -> (i64, i64, i64, i64) {
+    let oracle = duckdb::Connection::open_in_memory().unwrap();
+    oracle
+        .execute_batch(&format!(
+            "LOAD ducklake; LOAD sqlite; \
+             ATTACH 'ducklake:sqlite:{}' AS lake (DATA_PATH '{}/', READ_ONLY);",
+            lake.catalog().display(),
+            lake.data().display()
+        ))
+        .unwrap();
+    oracle
+        .query_row(
+            "SELECT count(*), sum(id)::BIGINT, sum(rowid)::BIGINT, min(id) FROM lake.main.t",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+}
+
+/// An `UPDATE` of every row streams its new versions into its session: its
+/// last source file is read only after parts of the new files have gone out.
+/// Every row keeps its row id and DuckDB reads the new values.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sql_update_streams_its_new_versions_into_parts() {
+    let (lake, ctx) = seeded(None).await;
+    let sources: Vec<String> = lake
+        .files()
+        .await
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert!(sources.len() >= 3, "{sources:?}");
+    let (rows, ids, rowids, _) = duckdb_rows(&lake);
+    let parts_before = parts_of(&lake.store.events());
+    lake.store.reads.lock().unwrap().clear();
+
+    assert_eq!(
+        run(&ctx, "UPDATE lake.main.t SET id = id + 100000")
+            .await
+            .unwrap(),
+        60_000
+    );
+
+    let reads = lake.store.reads.lock().unwrap().clone();
+    let last_source = sources.last().unwrap();
+    let last_read = reads
+        .iter()
+        .filter(|(path, _)| path.ends_with(last_source.as_str()))
+        .map(|(_, sent)| *sent)
+        .max()
+        .unwrap_or_else(|| panic!("{last_source} is read: {reads:?}"));
+    assert!(
+        last_read > parts_before,
+        "new versions went out before the last source file was read: \
+         {parts_before} parts before the update, {reads:?}"
+    );
+    assert_eq!(
+        duckdb_rows(&lake),
+        (rows, ids + 100_000 * rows, rowids, 100_000),
+        "every row updated, its row id kept"
+    );
+}
+
+/// An `UPDATE` that fails mid-stream, after parts of its new file went out (a NULL into
+/// the NOT NULL `id`, met in a late batch), leaves the table as it was: no snapshot, the
+/// upload it opened aborted, only the files it started from. (A refused part aborts its
+/// own upload; this is the failure the session's own abort is for.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sql_update_that_fails_mid_stream_leaves_the_table_as_it_was() {
+    let (lake, ctx) = seeded(None).await;
+    let files = lake.files().await;
+    let on_disk = lake.parquet_on_disk().len();
+    let snapshots = lake.snapshot_count().await;
+    let seed_parts = parts_of(&lake.store.events());
+    let before = duckdb_rows(&lake);
+    let error = run(
+        &ctx,
+        "UPDATE lake.main.t SET id = CASE WHEN id > 50000 THEN NULL ELSE id + 100000 END",
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().to_lowercase().contains("null"), "{error}");
+    let events = lake.store.events();
+    assert!(
+        parts_of(&events) > seed_parts,
+        "the update sent parts before it failed: {events:?}"
+    );
+    let (opened, completed, aborted) = counts(&events);
+    assert!(aborted >= 1, "the update's upload is aborted: {events:?}");
+    assert_eq!(opened, completed + aborted, "{events:?}");
+    assert_eq!(lake.files().await, files);
+    assert_eq!(lake.parquet_on_disk().len(), on_disk);
+    assert_eq!(lake.snapshot_count().await, snapshots);
+    assert_eq!(duckdb_rows(&lake), before);
 }
