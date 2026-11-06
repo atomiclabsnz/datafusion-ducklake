@@ -283,11 +283,10 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             let mut superseded_inlined: Vec<InlinedRowRef> = Vec::new();
             let mut total_updated: u64 = 0;
             // The superseded positions are held until the commit, which makes the
-            // deletes of them: charged to the pool as they are taken, so an update
-            // too large to hold them is refused rather than outgrowing it.
-            let positions_held =
-                datafusion::execution::memory_pool::MemoryConsumer::new("DuckLakeUpdateExec")
-                    .register(context.memory_pool());
+            // deletes of them: charged to the pool by what they allocate, as they
+            // are taken, so an update too large to hold them is refused rather
+            // than outgrowing it.
+            let mut positions_held = HeldPositions::new(context.memory_pool());
 
             // Boxed, as is the commit below: a session is kilobytes, and this
             // future nests in every caller's.
@@ -298,7 +297,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                         Arc::clone(&scan.scan),
                         context.clone(),
                     )?;
-                    let mut positions = Vec::new();
+                    let mut positions: Vec<i64> = Vec::new();
                     while let Some(batch) = batches.try_next().await? {
                         let Some(rewritten) = table.apply_update_to_batch(
                             scan,
@@ -310,9 +309,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                         else {
                             continue;
                         };
-                        positions_held
-                            .try_grow(rewritten.positions.len() * std::mem::size_of::<i64>())?;
-                        positions.extend(rewritten.positions);
+                        positions_held.extend(&mut positions, rewritten.positions)?;
                         versions.push(rewritten.batch).await?;
                     }
                     if positions.is_empty() {
@@ -321,10 +318,11 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     total_updated += positions.len() as u64;
                     if inline_capable {
                         positions.sort_unstable();
+                        positions_held.retain(positions.capacity());
                         superseded_positions.push((scan, positions));
                         continue;
                     }
-                    let cumulative = DuckLakeTable::cumulative_positions(scan, positions);
+                    let cumulative = positions_held.cumulative(scan, positions)?;
                     pending_deletes.push((
                         scan.data_file_id,
                         scan.delete_file_id,
@@ -362,6 +360,24 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 return Ok(RecordBatch::try_new(output_schema, vec![count])?);
             }
 
+            // The session's charge is held until the commit settles it.
+            let (new_versions, session_held) = versions.finish();
+            // What the commit's deletes allocate per file, for the largest:
+            // charged before it, beside the positions and the session.
+            let deletes_held = datafusion::execution::memory_pool::MemoryConsumer::new(
+                "DuckLakeUpdateExec deletes",
+            )
+            .register(context.memory_pool());
+            deletes_held.try_grow(delete_working_set(
+                superseded_positions
+                    .iter()
+                    .map(|(scan, positions)| (scan.source_path.as_str(), positions.len()))
+                    .chain(
+                        pending_deletes
+                            .iter()
+                            .map(|(_, _, path, positions)| (path.as_str(), positions.len())),
+                    ),
+            ))?;
             commit_row_versions(
                 &RowVersionCommit {
                     table: &table,
@@ -373,7 +389,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     inline_capable,
                     inline_limit,
                 },
-                versions.finish(),
+                new_versions,
                 superseded_positions,
                 pending_deletes,
                 superseded_inlined,
@@ -381,7 +397,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             )
             .await?;
             // Held until the deletes made of them are committed.
-            drop(positions_held);
+            drop((positions_held, deletes_held, session_held));
             let count: ArrayRef = Arc::new(UInt64Array::from(vec![total_updated]));
             Ok(RecordBatch::try_new(output_schema, vec![count])?)
         });
@@ -391,6 +407,90 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             stream.map_err(|e: DataFusionError| e),
         )))
     }
+}
+
+/// The superseded positions an `UPDATE` holds until its commit, charged to the
+/// pool by what they allocate rather than by their count: a vector's capacity,
+/// and while it grows, its old allocation beside the new one; for a writer
+/// that does not stage row mutations, the set and the vector a file's
+/// cumulative mask is made through.
+struct HeldPositions {
+    reservation: datafusion::execution::memory_pool::MemoryReservation,
+    /// Bytes of the vectors kept for the commit.
+    retained: usize,
+}
+
+const POSITION_BYTES: usize = std::mem::size_of::<i64>();
+
+/// A hash set's bytes an entry, its control byte and load factor included
+/// (an `i64` set holds about 10; 16 bounds it).
+const SET_ENTRY_BYTES: usize = 16;
+
+impl HeldPositions {
+    fn new(pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>) -> Self {
+        Self {
+            reservation: datafusion::execution::memory_pool::MemoryConsumer::new(
+                "DuckLakeUpdateExec positions",
+            )
+            .register(pool),
+            retained: 0,
+        }
+    }
+
+    /// Append `new` to the open file's `positions`, growing it by doubling,
+    /// with the growth charged first: both allocations are live while the
+    /// vector moves.
+    fn extend(&mut self, positions: &mut Vec<i64>, new: Vec<i64>) -> DataFusionResult<()> {
+        let needed = positions.len() + new.len();
+        if needed > positions.capacity() {
+            let old = positions.capacity();
+            let grown = (old * 2).max(needed);
+            self.reservation
+                .try_resize(self.retained + (old + grown) * POSITION_BYTES)?;
+            positions.reserve_exact(grown - positions.len());
+            self.reservation
+                .resize(self.retained + positions.capacity() * POSITION_BYTES);
+        }
+        positions.extend(new);
+        Ok(())
+    }
+
+    /// Keep a finished file's positions, `capacity` of them allocated, for the
+    /// commit.
+    fn retain(&mut self, capacity: usize) {
+        self.retained += capacity * POSITION_BYTES;
+        self.reservation.resize(self.retained);
+    }
+
+    /// The cumulative mask of `scan`'s file ([`DuckLakeTable::cumulative_positions`]),
+    /// its set and vector charged while it is made, the mask kept for the commit.
+    fn cumulative(
+        &mut self,
+        scan: &UpdateSourceScan,
+        positions: Vec<i64>,
+    ) -> DataFusionResult<Vec<i64>> {
+        let entries = positions.len() + scan.existing_parquet_deletes.len();
+        self.reservation.try_resize(
+            self.retained
+                + positions.capacity() * POSITION_BYTES
+                + entries * (SET_ENTRY_BYTES + POSITION_BYTES),
+        )?;
+        let cumulative = DuckLakeTable::cumulative_positions(scan, positions);
+        self.retained += cumulative.capacity() * POSITION_BYTES;
+        self.reservation.resize(self.retained);
+        Ok(cumulative)
+    }
+}
+
+/// What the commit allocates to write the largest of `files`' delete files
+/// (each its data file's path and its positions' count): the `file_path`
+/// column (the path a row), the positions and their snapshots copied into
+/// the batch, the copy the delete's info keeps, and the encoded file.
+fn delete_working_set<'a>(files: impl Iterator<Item = (&'a str, usize)>) -> usize {
+    files
+        .map(|(path, positions)| positions * (path.len() + 4 + 5 * POSITION_BYTES))
+        .max()
+        .unwrap_or(0)
 }
 
 /// What [`commit_row_versions`] commits for: the target table as read, the
@@ -520,12 +620,20 @@ impl<'a> NewVersionSink<'a> {
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
-    /// Every new version taken: the held ones, or the session they went into.
-    fn finish(self) -> NewVersions {
-        match self.session {
+    /// Every new version taken: the held ones, or the session they went into,
+    /// and the charge for them, for the caller to hold until the commit
+    /// settles the session.
+    fn finish(
+        self,
+    ) -> (
+        NewVersions,
+        datafusion::execution::memory_pool::MemoryReservation,
+    ) {
+        let versions = match self.session {
             Some(session) => NewVersions::Written(session),
             None => NewVersions::Held(self.held),
-        }
+        };
+        (versions, self.charged)
     }
 
     /// Abandon the new versions: a session begun is aborted, which removes what

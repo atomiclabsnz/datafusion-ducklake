@@ -1359,6 +1359,163 @@ const POSITIONS_POOL: usize = 400 * 1024;
 
 // ---- #34 review round 1 ----
 
+/// A memory pool that refuses nothing and records, per consumer name, what is
+/// reserved now and at its peak; and, each time a consumer named `watched`
+/// grows, what every consumer held at that moment.
+#[derive(Debug, Default)]
+struct Tracking {
+    state: Mutex<TrackingState>,
+}
+
+#[derive(Debug, Default)]
+struct TrackingState {
+    now: std::collections::HashMap<String, usize>,
+    peak: std::collections::HashMap<String, usize>,
+    watched: Vec<std::collections::HashMap<String, usize>>,
+}
+
+const WATCHED: &str = "DuckLakeUpdateExec deletes";
+
+impl Tracking {
+    fn change(&self, name: &str, grow: usize, shrink: usize) {
+        let mut state = self.state.lock().unwrap();
+        let now = state.now.entry(name.to_string()).or_default();
+        *now = *now + grow - shrink;
+        let value = *now;
+        let peak = state.peak.entry(name.to_string()).or_default();
+        *peak = (*peak).max(value);
+        if grow > 0 && name == WATCHED {
+            let snapshot = state.now.clone();
+            state.watched.push(snapshot);
+        }
+    }
+
+    fn peak(&self, name: &str) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .peak
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+impl std::fmt::Display for Tracking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tracking")
+    }
+}
+
+impl datafusion::execution::memory_pool::MemoryPool for Tracking {
+    fn name(&self) -> &str {
+        "tracking"
+    }
+
+    fn grow(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        additional: usize,
+    ) {
+        self.change(reservation.consumer().name(), additional, 0);
+    }
+
+    fn shrink(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        shrink: usize,
+    ) {
+        self.change(reservation.consumer().name(), 0, shrink);
+    }
+
+    fn try_grow(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        additional: usize,
+    ) -> datafusion::error::Result<()> {
+        self.change(reservation.consumer().name(), additional, 0);
+        Ok(())
+    }
+
+    fn reserved(&self) -> usize {
+        self.state.lock().unwrap().now.values().sum()
+    }
+}
+
+/// An UPDATE's charge covers what it holds, and holds until its commit: the
+/// superseded positions are charged at least their bytes (by capacity, with
+/// a growth's two allocations), and when the commit's delete working set is
+/// charged, at least the largest delete file's positions, path column and
+/// copies, the positions and the new versions' session are still charged.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_charges_what_it_holds_until_its_commit() {
+    let (lake, _) = seeded(None).await;
+    let pool = Arc::new(Tracking::default());
+    let ctx = sql_ctx_on(
+        &lake,
+        datafusion::execution::runtime_env::RuntimeEnvBuilder::new().with_memory_pool(pool.clone()),
+    )
+    .await;
+    assert_eq!(
+        run(
+            &ctx,
+            "UPDATE lake.main.t SET id = id + 100000 WHERE id % 2 = 0"
+        )
+        .await
+        .unwrap(),
+        30_000
+    );
+    let pool_db = SqlitePool::connect(&url(&lake.temp)).await.unwrap();
+    let (largest,): (i64,) = sqlx::query_as(
+        "SELECT max(delete_count) FROM ducklake_delete_file WHERE end_snapshot IS NULL",
+    )
+    .fetch_one(&pool_db)
+    .await
+    .unwrap();
+    let (path,): (i64,) = sqlx::query_as(
+        "SELECT max(length(path)) FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .fetch_one(&pool_db)
+    .await
+    .unwrap();
+    pool_db.close().await;
+    assert!(largest >= 5_000, "a delete file per source file: {largest}");
+    let held = 30_000 * 8;
+    // More than their bytes: a vector's capacity, and while it grows, both of
+    // its allocations (by doubling, the last growth of the last file alone is
+    // half again its positions).
+    assert!(
+        pool.peak("DuckLakeUpdateExec positions") >= held * 5 / 4,
+        "positions charged {} for {held} bytes of them",
+        pool.peak("DuckLakeUpdateExec positions")
+    );
+    // The batch a delete file is written from: the positions copied twice
+    // (the column, the info), their snapshots, a path a row.
+    let deletes = largest as usize * (3 * 8 + path as usize);
+    assert!(
+        pool.peak(WATCHED) >= deletes,
+        "the commit's deletes charged {} for at least {deletes}",
+        pool.peak(WATCHED)
+    );
+    let state = pool.state.lock().unwrap();
+    let at_commit = state
+        .watched
+        .first()
+        .expect("the commit charged its deletes");
+    assert!(
+        at_commit
+            .get("DuckLakeUpdateExec positions")
+            .copied()
+            .unwrap_or(0)
+            >= held,
+        "positions still charged at the commit: {at_commit:?}"
+    );
+    assert!(
+        at_commit.get("DuckLakeUpdateExec").copied().unwrap_or(0) > 0,
+        "the session still charged at the commit: {at_commit:?}"
+    );
+}
+
 /// A partitioned table's INSERT still collects its input, and charges it to
 /// the pool as a streamed one charges its session: past the pool it is refused
 /// (`ResourcesExhausted`), and the table is left as it was.
