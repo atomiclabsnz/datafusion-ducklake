@@ -35,6 +35,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, Rows, SortField};
 use parquet::arrow::ArrowWriter;
+use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::{DEFAULT_MAX_ROW_GROUP_ROW_COUNT, WriterProperties, WriterVersion};
 use parquet::schema::types::ColumnPath;
 
@@ -318,7 +319,37 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
             .map_or(0, ArrowWriter::in_progress_size)
     }
 
-    /// Write the footer and return the sink.
+    /// The sink, to take finished bytes out of it between writes (never to write
+    /// into: the writer's offsets would no longer match its bytes).
+    /// `None` only if opening the file failed part-way.
+    pub(crate) fn sink_mut(&mut self) -> Option<&mut W> {
+        match (&mut self.writer, &mut self.pending) {
+            (Some(writer), _) => Some(writer.inner_mut()),
+            (None, Some((sink, _, _))) => Some(sink),
+            (None, None) => None,
+        }
+    }
+
+    /// Write the footer and return the sink with the footer's metadata, as
+    /// [`ArrowWriter::close`] returns it. The sink is taken out of the finished
+    /// writer (its default left in its place), because `ArrowWriter::into_inner`
+    /// after a `finish` would write the footer a second time.
+    pub(crate) fn finish(mut self) -> Result<(W, ParquetMetaData)>
+    where
+        W: Default,
+    {
+        if self.writer.is_none() {
+            self.open()?;
+        }
+        let mut writer = self.writer.take().ok_or_else(closed)?;
+        let metadata = writer.finish()?;
+        let sink = std::mem::take(writer.inner_mut());
+        Ok((sink, metadata))
+    }
+
+    /// Write the footer and return the sink. The writer itself uses
+    /// [`Self::finish`], which keeps the footer's metadata.
+    #[cfg(test)]
     pub(crate) fn into_inner(mut self) -> Result<W> {
         if self.writer.is_none() {
             self.open()?;

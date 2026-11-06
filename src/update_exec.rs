@@ -539,7 +539,8 @@ pub(crate) async fn commit_row_versions(
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     while let Some(batch) = updated_batches.try_next().await? {
         session
-            .write_batch(&batch)
+            .write_batch_async(&batch)
+            .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
     }
     // The session removes the delete files with its own when the commit
@@ -577,7 +578,8 @@ async fn write_rewritten_files(
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     while let Some(batch) = batches.try_next().await? {
         session
-            .write_batch(&batch)
+            .write_batch_async(&batch)
+            .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
     }
     session

@@ -6,37 +6,81 @@
 //! default wherever there is a filesystem.
 //!
 //! [`Staging::Memory`] holds the encoded bytes in memory and uploads them with a
-//! single `put`. It is the only staging on `wasm32` (`wasm32-unknown-unknown` has
-//! no filesystem: `std::fs` compiles there and fails every call), and it is
-//! available everywhere so the same path can be tested natively. A staged file is
+//! single `put`. It is available everywhere (`wasm32-unknown-unknown` has no
+//! filesystem: `std::fs` compiles there and fails every call). A staged file is
 //! bounded by the writer's `target_file_size`, which is how a caller bounds the
-//! memory this costs. The single `put` is also what keeps the upload free of
-//! spawned tasks: `object_store`'s multipart writer spawns one per part, and a
-//! browser has no tokio runtime to run them on.
+//! memory this costs.
+//!
+//! [`Staging::Parts`] sends a file out as it is encoded: the Parquet writer encodes
+//! into a buffer, and once the buffer holds a part, an async caller
+//! ([`StageWriter::put_full_parts`], reached through `write_batch_async`) awaits
+//! [`MultipartUpload::put_part`] for it inline. The footer goes as the last part,
+//! and `complete` makes the object. An open file then costs about one row group's
+//! encoded pages plus one part, however large the file. It is the default on
+//! `wasm32`. A file smaller than one part is never opened as an upload and goes
+//! out in one `put`. The file's statistics come from the `ParquetMetaData` the
+//! writer returns, since its bytes are gone by the time it is finished.
+//!
+//! Neither in-memory staging spawns a task: `object_store`'s own multipart writer
+//! (`WriteMultipart`) spawns one per part, and a browser has no tokio runtime to
+//! run them on. A part is awaited where it is produced instead.
 
 use std::io::Write;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{MultipartUpload, ObjectStore, ObjectStoreExt, PutPayload};
+use parquet::file::metadata::ParquetMetaData;
 
 use crate::Result;
 use crate::metadata_writer::ColumnStat;
 use crate::stats_collect::WrittenLeafStats;
 
 /// How a writer stages each Parquet file before upload.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Staging {
     /// A local temporary file, streamed out through a multipart upload.
-    /// Not available on `wasm32`.
+    /// Not available on `wasm32`. The default elsewhere.
     #[cfg(not(target_arch = "wasm32"))]
-    #[default]
     File,
-    /// The encoded bytes in memory, uploaded with one `put`. The default on
-    /// `wasm32`.
-    #[cfg_attr(target_arch = "wasm32", default)]
+    /// The encoded bytes in memory, uploaded with one `put`.
     Memory,
+    /// The encoded bytes go out in parts of `part_bytes` while the file is
+    /// written, through one multipart upload per file, by a caller that writes
+    /// through `write_batch_async`; the footer is the last part. The default on
+    /// `wasm32` ([`Staging::DEFAULT_PART_BYTES`]).
+    ///
+    /// A caller that writes through the synchronous `write_batch` gets no parts
+    /// until the file is finished, and so holds the file whole as
+    /// [`Staging::Memory`] does. S3 refuses a part other than the last below
+    /// 5 MiB, so a store that is S3 wants `part_bytes` of at least that. Values
+    /// below 1 are taken as 1.
+    Parts {
+        /// The size of every part but the last.
+        part_bytes: usize,
+    },
+}
+
+impl Staging {
+    /// The part size of the `wasm32` default: 8 MiB, above S3's 5 MiB minimum
+    /// and small beside a tab's memory pool.
+    pub const DEFAULT_PART_BYTES: usize = 8 * 1024 * 1024;
+}
+
+impl Default for Staging {
+    fn default() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Staging::File
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Staging::Parts {
+                part_bytes: Staging::DEFAULT_PART_BYTES,
+            }
+        }
+    }
 }
 
 /// The sink a Parquet writer encodes into.
@@ -48,6 +92,90 @@ pub(crate) enum StageWriter {
         temp: tempfile::NamedTempFile,
     },
     Memory(Vec<u8>),
+    Parts(PartsSink),
+}
+
+/// A [`Staging::Parts`] file being written: the bytes not yet sent, and the
+/// upload the sent ones went to.
+pub(crate) struct PartsSink {
+    buffer: Vec<u8>,
+    part_bytes: usize,
+    /// Opened by the first part sent; `None` while the file is below one part.
+    upload: Option<Box<dyn MultipartUpload>>,
+    /// Bytes sent in parts so far.
+    sent: u64,
+    /// Parts sent so far.
+    parts: u64,
+}
+
+impl std::fmt::Debug for PartsSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartsSink")
+            .field("buffered", &self.buffer.len())
+            .field("part_bytes", &self.part_bytes)
+            .field("uploading", &self.upload.is_some())
+            .field("sent", &self.sent)
+            .field("parts", &self.parts)
+            .finish()
+    }
+}
+
+impl PartsSink {
+    /// Send every whole part the buffer holds, opening the upload at the first.
+    async fn put_full_parts(
+        &mut self,
+        object_store: &Arc<dyn ObjectStore>,
+        object_path: &ObjectPath,
+    ) -> Result<()> {
+        if self.buffer.len() < self.part_bytes {
+            return Ok(());
+        }
+        let whole = self.buffer.len() - self.buffer.len() % self.part_bytes;
+        let rest = self.buffer.split_off(whole);
+        let full = Bytes::from(std::mem::replace(&mut self.buffer, rest));
+        self.put(object_store, object_path, full).await
+    }
+
+    /// Send `bytes` in parts of `part_bytes` (the last may be shorter).
+    async fn put(
+        &mut self,
+        object_store: &Arc<dyn ObjectStore>,
+        object_path: &ObjectPath,
+        bytes: Bytes,
+    ) -> Result<()> {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let end = (offset + self.part_bytes).min(bytes.len());
+            let part = bytes.slice(offset..end);
+            if self.upload.is_none() {
+                self.upload = Some(object_store.put_multipart(object_path).await?);
+            }
+            let Some(upload) = self.upload.as_mut() else {
+                // Unreachable: set just above.
+                return Err(crate::error::DuckLakeError::Internal(
+                    "a multipart upload was not opened".to_string(),
+                ));
+            };
+            if let Err(error) = upload.put_part(PutPayload::from(part)).await {
+                self.abort().await;
+                return Err(error.into());
+            }
+            self.sent += (end - offset) as u64;
+            self.parts += 1;
+            offset = end;
+        }
+        Ok(())
+    }
+
+    /// Abort the upload, if one was opened. Best effort: a failure is logged,
+    /// since the caller is already failing or abandoning the write.
+    async fn abort(&mut self) {
+        if let Some(mut upload) = self.upload.take()
+            && let Err(error) = upload.abort().await
+        {
+            tracing::warn!(error = %error, "failed to abort a data file's multipart upload");
+        }
+    }
 }
 
 impl StageWriter {
@@ -63,7 +191,54 @@ impl StageWriter {
                 }
             },
             Staging::Memory => StageWriter::Memory(Vec::new()),
+            Staging::Parts {
+                part_bytes,
+            } => StageWriter::Parts(PartsSink {
+                buffer: Vec::new(),
+                part_bytes: part_bytes.max(1),
+                upload: None,
+                sent: 0,
+                parts: 0,
+            }),
         })
+    }
+
+    /// Send every whole part this file holds to `object_path`, awaiting each
+    /// inline (no task is spawned). A no-op for a staging other than
+    /// [`Staging::Parts`]. A failed part aborts the upload.
+    pub(crate) async fn put_full_parts(
+        &mut self,
+        object_store: &Arc<dyn ObjectStore>,
+        object_path: &ObjectPath,
+    ) -> Result<()> {
+        match self {
+            StageWriter::Parts(sink) => sink.put_full_parts(object_store, object_path).await,
+            _ => Ok(()),
+        }
+    }
+
+    /// Abort the multipart upload a [`Staging::Parts`] file opened, if any.
+    pub(crate) async fn abort(&mut self) {
+        if let StageWriter::Parts(sink) = self {
+            sink.abort().await;
+        }
+    }
+
+    /// [`Self::finish`], keeping the footer's `metadata` for a staging whose
+    /// bytes may already be gone ([`Staging::Parts`]): its statistics are taken
+    /// from it rather than from a footer read back.
+    pub(crate) fn finish_with_metadata(self, metadata: ParquetMetaData) -> Result<Staged> {
+        match self {
+            StageWriter::Parts(sink) => Ok(Staged::Parts(StagedParts {
+                tail: Bytes::from(sink.buffer),
+                part_bytes: sink.part_bytes,
+                upload: sink.upload,
+                sent: sink.sent,
+                parts: sink.parts,
+                metadata: Some(Arc::new(metadata)),
+            })),
+            other => other.finish(),
+        }
     }
 
     /// Everything written so far, complete: a file's buffer is flushed and its
@@ -80,7 +255,23 @@ impl StageWriter {
                 Staged::File(temp.into_temp_path())
             },
             StageWriter::Memory(bytes) => Staged::Memory(Bytes::from(bytes)),
+            StageWriter::Parts(sink) => Staged::Parts(StagedParts {
+                tail: Bytes::from(sink.buffer),
+                part_bytes: sink.part_bytes,
+                upload: sink.upload,
+                sent: sink.sent,
+                parts: sink.parts,
+                metadata: None,
+            }),
         })
+    }
+}
+
+impl Default for StageWriter {
+    /// An empty in-memory sink: what a finished writer is left holding once its
+    /// own sink is taken out of it.
+    fn default() -> Self {
+        StageWriter::Memory(Vec::new())
     }
 }
 
@@ -93,6 +284,7 @@ impl Write for StageWriter {
                 ..
             } => file.write(buf),
             StageWriter::Memory(bytes) => bytes.write(buf),
+            StageWriter::Parts(sink) => sink.buffer.write(buf),
         }
     }
 
@@ -103,7 +295,7 @@ impl Write for StageWriter {
                 file,
                 ..
             } => file.flush(),
-            StageWriter::Memory(_) => Ok(()),
+            StageWriter::Memory(_) | StageWriter::Parts(_) => Ok(()),
         }
     }
 }
@@ -115,6 +307,34 @@ pub(crate) enum Staged {
     #[cfg(not(target_arch = "wasm32"))]
     File(tempfile::TempPath),
     Memory(Bytes),
+    Parts(StagedParts),
+}
+
+/// A finished [`Staging::Parts`] file: the parts already sent, and the tail (at
+/// least the footer) still to send.
+pub(crate) struct StagedParts {
+    tail: Bytes,
+    part_bytes: usize,
+    /// `None` when no part was sent: the whole file is `tail`.
+    upload: Option<Box<dyn MultipartUpload>>,
+    sent: u64,
+    parts: u64,
+    /// The footer as the writer returned it, when the file was finished
+    /// through [`StageWriter::finish_with_metadata`].
+    metadata: Option<Arc<ParquetMetaData>>,
+}
+
+impl std::fmt::Debug for StagedParts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedParts")
+            .field("tail", &self.tail.len())
+            .field("part_bytes", &self.part_bytes)
+            .field("uploading", &self.upload.is_some())
+            .field("sent", &self.sent)
+            .field("parts", &self.parts)
+            .field("metadata", &self.metadata.is_some())
+            .finish()
+    }
 }
 
 impl Staged {
@@ -124,7 +344,18 @@ impl Staged {
             #[cfg(not(target_arch = "wasm32"))]
             Staged::File(path) => std::fs::metadata(path)?.len(),
             Staged::Memory(bytes) => bytes.len() as u64,
+            Staged::Parts(parts) => parts.sent + parts.tail.len() as u64,
         })
+    }
+
+    /// How many parts were sent before the file was finished: zero for a
+    /// staging other than [`Staging::Parts`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn parts_sent(&self) -> u64 {
+        match self {
+            Staged::Parts(parts) => parts.parts,
+            _ => 0,
+        }
     }
 
     /// The Parquet footer's Thrift metadata length, from the file's last 8 bytes.
@@ -141,7 +372,13 @@ impl Staged {
                 file.seek(SeekFrom::End(-8))?;
                 file.read_exact(&mut tail)?;
             },
-            Staged::Memory(bytes) => {
+            // The footer is written after the last part is sent, so the tail
+            // always ends with the whole 8-byte trailer.
+            Staged::Memory(bytes)
+            | Staged::Parts(StagedParts {
+                tail: bytes,
+                ..
+            }) => {
                 if bytes.len() < 8 {
                     return Err(too_small());
                 }
@@ -170,6 +407,32 @@ impl Staged {
                 row_count,
                 leaves,
             ),
+            Staged::Parts(parts) => match (&parts.metadata, &parts.upload) {
+                (Some(metadata), _) => {
+                    crate::stats_collect::collect_own_written_column_stats_from_metadata(
+                        Arc::clone(metadata),
+                        "<part-staged file>",
+                        column_ids,
+                        row_count,
+                        leaves,
+                    )
+                },
+                // Nothing sent: the tail is the whole file.
+                (None, None) => crate::stats_collect::collect_own_written_column_stats_from(
+                    parts.tail.clone(),
+                    "<part-staged file>",
+                    column_ids,
+                    row_count,
+                    leaves,
+                ),
+                (None, Some(_)) => {
+                    tracing::warn!(
+                        "a part-staged file was finished without its footer metadata; \
+                         writing it without column stats"
+                    );
+                    Vec::new()
+                },
+            },
         }
     }
 
@@ -180,9 +443,11 @@ impl Staged {
     /// a copy failure the multipart upload is aborted, so no partial object is
     /// left; on a failure to complete it deliberately is not (see
     /// `stream_to_upload`). Memory is one `put`, which leaves either the whole
-    /// object or none.
+    /// object or none. Parts sends the rest of the file and completes its upload,
+    /// or, when no part was sent, is one `put`; a failed part aborts the upload,
+    /// a failed `complete` does not (the object may exist; the caller removes it).
     pub(crate) async fn upload(
-        &self,
+        &mut self,
         object_store: &Arc<dyn ObjectStore>,
         object_path: &ObjectPath,
     ) -> std::io::Result<()> {
@@ -202,7 +467,57 @@ impl Staged {
                 .await
                 .map(|_| ())
                 .map_err(std::io::Error::other),
+            Staged::Parts(parts) => parts
+                .upload(object_store, object_path)
+                .await
+                .map_err(std::io::Error::other),
         }
+    }
+
+    /// Abort the multipart upload a [`Staging::Parts`] file opened, if any: for a
+    /// finished file abandoned before [`Self::upload`].
+    pub(crate) async fn abort(&mut self) {
+        if let Staged::Parts(parts) = self
+            && let Some(mut upload) = parts.upload.take()
+            && let Err(error) = upload.abort().await
+        {
+            tracing::warn!(error = %error, "failed to abort a data file's multipart upload");
+        }
+    }
+}
+
+impl StagedParts {
+    async fn upload(
+        &mut self,
+        object_store: &Arc<dyn ObjectStore>,
+        object_path: &ObjectPath,
+    ) -> Result<()> {
+        if self.upload.is_none() {
+            object_store
+                .put(object_path, PutPayload::from(self.tail.clone()))
+                .await?;
+            return Ok(());
+        }
+        let mut sink = PartsSink {
+            buffer: Vec::new(),
+            part_bytes: self.part_bytes,
+            upload: self.upload.take(),
+            sent: self.sent,
+            parts: self.parts,
+        };
+        sink.put(object_store, object_path, self.tail.clone())
+            .await?;
+        let Some(mut upload) = sink.upload.take() else {
+            // Unreachable: `put` keeps the upload unless it failed, and then
+            // returned the error above.
+            return Err(crate::error::DuckLakeError::Internal(
+                "a data file's multipart upload was lost".to_string(),
+            ));
+        };
+        upload.complete().await?;
+        self.sent = sink.sent;
+        self.parts = sink.parts;
+        Ok(())
     }
 }
 
@@ -251,4 +566,158 @@ pub(crate) fn footer_size_from_tail(buffer: &[u8]) -> Result<i64> {
     let metadata_len =
         u32::from_le_bytes([footer_bytes[0], footer_bytes[1], footer_bytes[2], footer_bytes[3]]);
     Ok(i64::from(metadata_len))
+}
+
+#[cfg(all(test, feature = "write"))]
+mod tests {
+    use std::collections::HashMap;
+
+    use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, StructArray};
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use arrow::record_batch::RecordBatch;
+    use object_store::memory::InMemory;
+    use parquet::file::properties::WriterProperties;
+
+    use super::*;
+    use crate::write_encoding::RowGroupSampledWriter;
+
+    fn id(field: Field, id: i64) -> Field {
+        field.with_metadata(HashMap::from([(
+            "PARQUET:field_id".to_string(),
+            id.to_string(),
+        )]))
+    }
+
+    fn schema() -> Arc<Schema> {
+        let inner = Fields::from(vec![
+            id(Field::new("a", DataType::Int64, true), 4),
+            id(Field::new("b", DataType::Utf8, true), 5),
+        ]);
+        Arc::new(Schema::new(vec![
+            id(Field::new("id", DataType::Int64, false), 1),
+            id(Field::new("name", DataType::Utf8, true), 2),
+            id(Field::new("s", DataType::Struct(inner.clone()), true), 3),
+            id(Field::new("v", DataType::Float64, true), 6),
+        ]))
+    }
+
+    fn batch(lo: i64) -> RecordBatch {
+        let ids: Vec<i64> = (lo..lo + 1000).collect();
+        let names: Vec<Option<String>> = ids
+            .iter()
+            .map(|i| (i % 7 != 0).then(|| format!("name-{}", i * 31 % 9973)))
+            .collect();
+        let a: ArrayRef = Arc::new(Int64Array::from_iter(
+            ids.iter().map(|i| (i % 5 != 0).then_some(-i)),
+        ));
+        let b: ArrayRef = Arc::new(StringArray::from_iter(
+            ids.iter()
+                .map(|i| (i % 3 != 0).then(|| format!("b{}", i % 101))),
+        ));
+        let DataType::Struct(fields) = schema().field(2).data_type().clone() else {
+            unreachable!()
+        };
+        let s = StructArray::new(fields, vec![a, b], None);
+        let v = Float64Array::from_iter(ids.iter().map(|i| match i {
+            i if i % 13 == 0 => None,
+            2_500 => Some(f64::NAN),
+            i => Some(*i as f64 / 3.0),
+        }));
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(s),
+                Arc::new(v),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A part-staged file sends its parts while it is written, not at the end;
+    /// the object is exactly the bytes the writer produced; and the statistics
+    /// taken from the footer the writer returned equal those of the footer read
+    /// back from the stored object, nested fields and NaN included.
+    #[tokio::test]
+    async fn parts_go_out_while_writing_and_stats_equal_the_footer_read_back() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = ObjectPath::from("t/file.parquet");
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(500))
+            .build();
+        let mut writer = RowGroupSampledWriter::new(
+            StageWriter::new(Staging::Parts {
+                part_bytes: 4 * 1024,
+            })
+            .unwrap(),
+            schema(),
+            props,
+        );
+        let mut leaves = crate::stats_collect::WrittenLeafStats::default();
+        let mut rows = 0;
+        let mut sent_while_writing = Vec::new();
+        for b in 0..20 {
+            let batch = batch(b * 1000);
+            leaves.accumulate(&batch, batch.num_columns());
+            writer.write(&batch).unwrap();
+            rows += batch.num_rows() as i64;
+            let sink = writer.sink_mut().unwrap();
+            sink.put_full_parts(&store, &path).await.unwrap();
+            let StageWriter::Parts(parts) = sink else {
+                unreachable!()
+            };
+            assert!(
+                parts.buffer.len() < parts.part_bytes,
+                "only a part's tail is held"
+            );
+            sent_while_writing.push(parts.parts);
+        }
+        assert!(
+            store.head(&path).await.is_err(),
+            "no object before the upload completes"
+        );
+        let (sink, metadata) = writer.finish().unwrap();
+        let mut staged = sink.finish_with_metadata(metadata).unwrap();
+        let parts = staged.parts_sent();
+        assert!(parts >= 10, "{parts} parts sent before finish");
+        assert!(
+            sent_while_writing
+                .windows(2)
+                .filter(|w| w[1] > w[0])
+                .count()
+                >= 10,
+            "parts went out batch by batch: {sent_while_writing:?}"
+        );
+
+        let column_ids = [1, 2, 3, 6];
+        let from_metadata = staged.own_column_stats(&column_ids, rows, &leaves);
+        let size = staged.len().unwrap();
+        let footer = staged.footer_size().unwrap();
+        staged.upload(&store, &path).await.unwrap();
+
+        let stored = store.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(stored.len() as u64, size);
+        assert_eq!(footer_size_from_tail(&stored).unwrap(), footer);
+        let read_back = crate::stats_collect::collect_own_written_column_stats_from(
+            stored,
+            "read back",
+            &column_ids,
+            rows,
+            &leaves,
+        );
+        assert_eq!(
+            from_metadata
+                .iter()
+                .map(|s| s.column_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4, 5, 6],
+            "a stat per scalar column and nested field, by field id"
+        );
+        assert!(
+            from_metadata.iter().any(|s| s.contains_nan == Some(true)),
+            "{from_metadata:?}"
+        );
+        assert_eq!(format!("{from_metadata:?}"), format!("{read_back:?}"));
+    }
 }

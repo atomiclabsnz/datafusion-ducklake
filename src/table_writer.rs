@@ -196,7 +196,7 @@ pub struct DuckLakeWriteOptions {
     /// writer default ([`DEFAULT_UPLOAD_CONCURRENCY`]). Clamped to at least 1.
     pub upload_concurrency: Option<usize>,
     /// Where each Parquet file is staged before upload; `None` leaves the writer
-    /// default ([`Staging::default`]: a temporary file, or memory on `wasm32`).
+    /// default ([`Staging::default`]: a temporary file, or parts on `wasm32`).
     pub staging: Option<Staging>,
     /// Whether inserts honor the table's active sort order where the catalog
     /// stores no `sort_on_insert` setting: a stored table, schema or
@@ -904,9 +904,11 @@ impl DuckLakeTableWriter {
     }
 
     /// Stage each Parquet file in a local temporary file ([`Staging::File`], the
-    /// default where there is a filesystem) or in memory ([`Staging::Memory`], the
-    /// only staging on `wasm32`). Memory staging holds up to `target_file_size`
-    /// bytes per file in flight; see [`crate::staging`].
+    /// default where there is a filesystem), in memory ([`Staging::Memory`]), or
+    /// send it out in parts as it is encoded ([`Staging::Parts`], the default on
+    /// `wasm32`). Memory staging holds up to `target_file_size` bytes per file in
+    /// flight; parts staging about a row group and a part, for a caller that
+    /// writes through `write_batch_async`; see [`crate::staging`].
     #[must_use]
     pub fn with_staging(mut self, staging: Staging) -> Self {
         self.staging = staging;
@@ -1969,7 +1971,7 @@ impl DuckLakeTableWriter {
         let mut writer =
             ArrowWriter::try_new(StageWriter::new(self.staging)?, schema, Some(props))?;
         writer.write(&batch)?;
-        let staged = writer.into_inner()?.finish()?;
+        let mut staged = writer.into_inner()?.finish()?;
         let file_size = staged.len()? as i64;
         let footer_size = staged.footer_size()?;
         staged.upload(&self.object_store, &object_path).await?;
@@ -2035,15 +2037,26 @@ impl DuckLakeTableWriter {
             self.staging,
         );
         let mut files = Vec::new();
-        for batch in batches {
-            if let Some(staged) = roller.write(batch)? {
+        let outcome: Result<()> = async {
+            for batch in batches {
+                if let Some(staged) = roller.write(batch)? {
+                    written.push(staged.object_path.clone());
+                    files.push(
+                        upload_staged_file(staged, &self.object_store, stats_column_ids).await?,
+                    );
+                }
+                roller.put_parts(&self.object_store).await?;
+            }
+            if let Some(staged) = roller.finish()? {
                 written.push(staged.object_path.clone());
                 files.push(upload_staged_file(staged, &self.object_store, stats_column_ids).await?);
             }
+            Ok(())
         }
-        if let Some(staged) = roller.finish()? {
-            written.push(staged.object_path.clone());
-            files.push(upload_staged_file(staged, &self.object_store, stats_column_ids).await?);
+        .await;
+        if let Err(error) = outcome {
+            roller.abort().await;
+            return Err(error);
         }
         Ok(files)
     }
@@ -2213,21 +2226,30 @@ impl DuckLakeTableWriter {
         );
         let mut row_count: i64 = 0;
         let mut leaf_stats = crate::stats_collect::WrittenLeafStats::default();
-        while let Some(batch) = batches.next().await {
-            let batch = batch?;
-            if batch.num_columns() != schema_with_ids.fields().len() {
-                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                    "write_compacted_file: batch has {} columns, expected {}",
-                    batch.num_columns(),
-                    schema_with_ids.fields().len()
-                )));
+        let written: Result<()> = async {
+            while let Some(batch) = batches.next().await {
+                let batch = batch?;
+                if batch.num_columns() != schema_with_ids.fields().len() {
+                    return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                        "write_compacted_file: batch has {} columns, expected {}",
+                        batch.num_columns(),
+                        schema_with_ids.fields().len()
+                    )));
+                }
+                let batch_with_ids = apply_field_ids(&batch, schema_with_ids.clone())?;
+                leaf_stats.accumulate(&batch, stats_column_ids.len());
+                writer.write(&batch_with_ids)?;
+                row_count += batch.num_rows() as i64;
+                put_full_parts(&mut writer, &self.object_store, &object_path).await?;
             }
-            let batch_with_ids = apply_field_ids(&batch, schema_with_ids.clone())?;
-            leaf_stats.accumulate(&batch, stats_column_ids.len());
-            writer.write(&batch_with_ids)?;
-            row_count += batch.num_rows() as i64;
+            Ok(())
         }
-        let staged = writer.into_inner()?.finish()?;
+        .await;
+        if let Err(error) = written {
+            abort_parts(&mut writer).await;
+            return Err(error);
+        }
+        let mut staged = finalize_writer(writer)?;
         let file_size = staged.len()? as i64;
         let footer_size = staged.footer_size()?;
         staged.upload(&self.object_store, &object_path).await?;
@@ -3459,13 +3481,23 @@ impl DuckLakeTableWriter {
             self.staging,
         );
         let mut files: Vec<DataFileInfo> = Vec::new();
-        for batch in batches {
-            if let Some(staged) = roller.write(batch)? {
+        let outcome: Result<()> = async {
+            for batch in batches {
+                if let Some(staged) = roller.write(batch)? {
+                    files.push(upload_staged_file(staged, &self.object_store, column_ids).await?);
+                }
+                // A part-staged file sends what it has encoded while it is written.
+                roller.put_parts(&self.object_store).await?;
+            }
+            if let Some(staged) = roller.finish()? {
                 files.push(upload_staged_file(staged, &self.object_store, column_ids).await?);
             }
+            Ok(())
         }
-        if let Some(staged) = roller.finish()? {
-            files.push(upload_staged_file(staged, &self.object_store, column_ids).await?);
+        .await;
+        if let Err(error) = outcome {
+            roller.abort().await;
+            return Err(error);
         }
         Ok(files)
     }
@@ -4651,6 +4683,22 @@ impl RollingFileWriter {
         self.open.is_some()
     }
 
+    /// Send the whole parts the open file holds ([`Staging::Parts`]); a no-op for
+    /// another staging, or with no file open.
+    async fn put_parts(&mut self, object_store: &Arc<dyn ObjectStore>) -> Result<()> {
+        match &mut self.open {
+            Some(open) => put_full_parts(&mut open.writer, object_store, &open.object_path).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Abandon the open file, aborting the multipart upload it opened, if any.
+    async fn abort(&mut self) {
+        if let Some(mut open) = self.open.take() {
+            abort_parts(&mut open.writer).await;
+        }
+    }
+
     /// Open the next file. Its encoding is chosen from its first row group; see
     /// [`crate::write_encoding`].
     fn open_file(&mut self) -> Result<OpenFile> {
@@ -4686,7 +4734,7 @@ impl RollingFileWriter {
 /// await to roll a file.
 #[tracing::instrument(name = "ducklake.finalize_open_file", level = "info", skip_all)]
 fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
-    let staged = file.writer.into_inner()?.finish()?;
+    let staged = finalize_writer(file.writer)?;
     Ok(StagedFile {
         staged,
         catalog_path: file.catalog_path,
@@ -4694,6 +4742,33 @@ fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
         row_count: file.row_count,
         leaf_stats: file.leaf_stats,
     })
+}
+
+/// Write the footer and complete the staging, keeping the footer's metadata: a
+/// part-staged file's statistics come from it, since its bytes are already sent.
+fn finalize_writer(writer: RowGroupSampledWriter<StageWriter>) -> Result<Staged> {
+    let (sink, metadata) = writer.finish()?;
+    sink.finish_with_metadata(metadata)
+}
+
+/// Send the whole parts `writer`'s file holds to `object_path`
+/// ([`Staging::Parts`]), awaited inline; a no-op for another staging.
+async fn put_full_parts(
+    writer: &mut RowGroupSampledWriter<StageWriter>,
+    object_store: &Arc<dyn ObjectStore>,
+    object_path: &ObjectPath,
+) -> Result<()> {
+    match writer.sink_mut() {
+        Some(sink) => sink.put_full_parts(object_store, object_path).await,
+        None => Ok(()),
+    }
+}
+
+/// Abort the multipart upload `writer`'s file opened, if any.
+async fn abort_parts(writer: &mut RowGroupSampledWriter<StageWriter>) {
+    if let Some(sink) = writer.sink_mut() {
+        sink.abort().await;
+    }
 }
 
 /// Upload a finished staging file and harvest its per-column stats, returning the
@@ -4707,7 +4782,7 @@ fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
 /// rule to reclaim. See [`Staged::upload`].
 #[tracing::instrument(name = "ducklake.upload_staged_file", level = "info", skip_all)]
 async fn upload_staged_file(
-    staged: StagedFile,
+    mut staged: StagedFile,
     object_store: &Arc<dyn ObjectStore>,
     column_ids: &[i64],
 ) -> Result<DataFileInfo> {
@@ -4851,6 +4926,21 @@ impl PartitionSink {
             }
         }
         Ok(())
+    }
+
+    /// Send the whole parts each open partition file holds ([`Staging::Parts`]).
+    async fn put_parts(&mut self) -> Result<()> {
+        for (_, roller) in &mut self.open {
+            roller.put_parts(&self.uploads.object_store).await?;
+        }
+        Ok(())
+    }
+
+    /// Abandon every open partition file, aborting the uploads they opened.
+    async fn abort_open(&mut self) {
+        for (_, mut roller) in std::mem::take(&mut self.open) {
+            roller.abort().await;
+        }
     }
 
     /// Hand a finished file of the partition `values` to the uploads.
@@ -5188,7 +5278,10 @@ impl StagedUploads {
     /// `started` is cleared and `settled` set only once the removal has finished,
     /// so a drop part-way through still awaits the rest and removes everything.
     async fn remove_started(&mut self) -> Vec<String> {
-        self.waiting.clear();
+        // A part-staged file not yet started has an upload open with parts in it.
+        while let Some((_, mut staged)) = self.waiting.pop_front() {
+            staged.staged.abort().await;
+        }
         while let Some((_, task)) = self.running.last_mut() {
             let _ = task.await;
             self.running.pop();
@@ -5542,13 +5635,34 @@ impl TableWriteSession {
     /// `upload_concurrency` finished files plus the one being written, and a
     /// partitioned one at most `upload_concurrency` plus its open partition files
     /// (`max_open_partitions`) — however large the write. A single-file session
-    /// uploads only at `finish`, so for it this is `write_batch`.
+    /// uploads its one file at `finish`.
+    ///
+    /// Under [`Staging::Parts`] it also sends each open file's encoded bytes, a
+    /// part at a time, to that file's multipart upload, so an open file holds
+    /// about a row group and a part rather than the whole file; a single-file
+    /// session's file goes out the same way. A failed part aborts its upload; the
+    /// session must then be dropped or [aborted](Self::abort).
     pub async fn write_batch_async(&mut self, batch: &RecordBatch) -> Result<()> {
         self.write_batch(batch)?;
+        self.put_parts().await?;
         if self.roller.is_some() {
             self.rolled.wait_for_room().await?;
         } else if let Some(sink) = &mut self.partition_sink {
             sink.uploads.wait_for_room().await?;
+        }
+        Ok(())
+    }
+
+    /// Send the whole parts every open file holds ([`Staging::Parts`]).
+    async fn put_parts(&mut self) -> Result<()> {
+        if let Some(roller) = &mut self.roller {
+            return roller.put_parts(&self.object_store).await;
+        }
+        if let Some(sink) = &mut self.partition_sink {
+            return sink.put_parts().await;
+        }
+        if let Some(writer) = &mut self.writer {
+            return put_full_parts(writer, &self.object_store, &self.object_path).await;
         }
         Ok(())
     }
@@ -5560,6 +5674,16 @@ impl TableWriteSession {
     /// the session does the same in the background; this is the form to use when
     /// the caller needs the removal finished, or its failures reported.
     pub async fn abort(mut self) -> Result<()> {
+        // Open files first: their multipart uploads made no object yet.
+        if let Some(roller) = &mut self.roller {
+            roller.abort().await;
+        }
+        if let Some(writer) = &mut self.writer {
+            abort_parts(writer).await;
+        }
+        if let Some(sink) = &mut self.partition_sink {
+            sink.abort_open().await;
+        }
         let mut failures = self.rolled.remove_started().await;
         if let Some(sink) = &mut self.partition_sink {
             failures.extend(sink.uploads.remove_started().await);
@@ -6153,7 +6277,7 @@ impl TableWriteSession {
         })?;
 
         // Finalise the parquet footer and complete its staging.
-        let staged = writer.into_inner()?.finish()?;
+        let mut staged = finalize_writer(writer)?;
         let file_size = staged.len()? as i64;
         let footer_size = staged.footer_size()?;
 

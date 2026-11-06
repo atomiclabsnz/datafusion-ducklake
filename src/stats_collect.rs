@@ -534,6 +534,38 @@ pub(crate) fn collect_own_written_column_stats_from(
     )
 }
 
+/// [`collect_own_written_column_stats`] for a file whose footer is `metadata`,
+/// as the writer returned it when it closed the file
+/// (`crate::staging::Staging::Parts`, whose bytes are already sent). The same
+/// computation a footer read back feeds, from the same Arrow schema
+/// reconstruction a reader makes. `label` names it in a warning.
+#[cfg(feature = "write")]
+pub(crate) fn collect_own_written_column_stats_from_metadata(
+    metadata: std::sync::Arc<parquet::file::metadata::ParquetMetaData>,
+    label: &str,
+    column_ids: &[i64],
+    row_count: i64,
+    leaves: &WrittenLeafStats,
+) -> Vec<ColumnStat> {
+    let stats = parquet::arrow::arrow_reader::ArrowReaderMetadata::try_new(
+        metadata,
+        parquet::arrow::arrow_reader::ArrowReaderOptions::default(),
+    )
+    .map_err(|e| crate::error::DuckLakeError::Internal(format!("parquet metadata: {e}")))
+    .map(|reader| {
+        compute(
+            reader.schema(),
+            reader.metadata(),
+            column_ids,
+            row_count,
+            &leaves.nan_flags,
+            Some(&leaves.bounds),
+            NestedLeafIds::FileFieldIds,
+        )
+    });
+    or_warn(stats, label)
+}
+
 fn collect(
     path: &Path,
     column_ids: &[i64],
