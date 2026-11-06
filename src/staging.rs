@@ -109,6 +109,51 @@ pub(crate) struct PartsSink {
     sent: u64,
     /// Parts sent so far.
     parts: u64,
+    /// Set while bytes taken from `buffer` are not yet acknowledged as a part:
+    /// a [`Self::put_full_parts`] cancelled mid-await (its future dropped) has
+    /// lost them, so the file can only be aborted, and finishing it is refused.
+    cancelled: bool,
+}
+
+impl Drop for PartsSink {
+    /// A file dropped with its upload open (a write that failed or was
+    /// abandoned before its file was finished) has its upload aborted in the
+    /// background where there is a tokio runtime to run the abort on; see
+    /// [`abort_in_background`].
+    fn drop(&mut self) {
+        if let Some(upload) = self.upload.take() {
+            abort_in_background(upload);
+        }
+    }
+}
+
+/// Abort `upload`, which its owner dropped before completing or aborting it. A
+/// drop cannot await, so the abort runs as a task on the current tokio
+/// runtime, best effort. With no runtime (a browser) it is only dropped: there
+/// is nothing to spawn on, and an OPFS upload removes its temporary file when it
+/// drops. An S3 upload left so keeps its parts until a bucket lifecycle rule
+/// clears them. The awaited forms (`TableWriteSession::abort`, and every error
+/// path of a write that can await) abort explicitly and do not rely on this.
+fn abort_in_background(mut upload: Box<dyn MultipartUpload>) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn(async move {
+                if let Err(error) = upload.abort().await {
+                    tracing::warn!(error = %error, "failed to abort a dropped data file's multipart upload");
+                }
+            });
+        },
+        Err(_) => tracing::debug!(
+            "a data file's multipart upload was dropped with no runtime to abort it on"
+        ),
+    }
+}
+
+fn cancelled_part() -> crate::error::DuckLakeError {
+    crate::error::DuckLakeError::Internal(
+        "a data file's part upload was cancelled before it completed; the file can only be aborted"
+            .to_string(),
+    )
 }
 
 impl std::fmt::Debug for PartsSink {
@@ -119,12 +164,18 @@ impl std::fmt::Debug for PartsSink {
             .field("uploading", &self.upload.is_some())
             .field("sent", &self.sent)
             .field("parts", &self.parts)
+            .field("cancelled", &self.cancelled)
             .finish()
     }
 }
 
 impl PartsSink {
     /// Send every whole part the buffer holds, opening the upload at the first.
+    ///
+    /// Not cancel-safe, and it says so: the bytes leave the buffer before their
+    /// part is acknowledged. A call whose future is dropped mid-await marks the
+    /// file `cancelled`, and its finish is then refused; the file must be
+    /// aborted.
     async fn put_full_parts(
         &mut self,
         object_store: &Arc<dyn ObjectStore>,
@@ -133,10 +184,37 @@ impl PartsSink {
         if self.buffer.len() < self.part_bytes {
             return Ok(());
         }
+        if self.cancelled {
+            return Err(cancelled_part());
+        }
         let whole = self.buffer.len() - self.buffer.len() % self.part_bytes;
         let rest = self.buffer.split_off(whole);
         let full = Bytes::from(std::mem::replace(&mut self.buffer, rest));
-        self.put(object_store, object_path, full).await
+        self.cancelled = true;
+        self.put(object_store, object_path, full).await?;
+        self.cancelled = false;
+        Ok(())
+    }
+
+    /// The finished file, unless a part was lost to a cancelled
+    /// [`Self::put_full_parts`].
+    fn into_staged(mut self, metadata: Option<Arc<ParquetMetaData>>) -> Result<Staged> {
+        if self.cancelled {
+            return Err(cancelled_part());
+        }
+        Ok(Staged::Parts(StagedParts {
+            tail: Bytes::from(std::mem::take(&mut self.buffer)),
+            part_bytes: self.part_bytes,
+            upload: self.upload.take(),
+            sent: self.sent,
+            parts: self.parts,
+            metadata,
+        }))
+    }
+
+    /// Whether a part was lost to a cancelled [`Self::put_full_parts`].
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 
     /// Send `bytes` in parts of `part_bytes` (the last may be shorter).
@@ -202,6 +280,7 @@ impl StageWriter {
                 upload: None,
                 sent: 0,
                 parts: 0,
+                cancelled: false,
             }),
         })
     }
@@ -220,6 +299,21 @@ impl StageWriter {
         }
     }
 
+    /// Whether a [`Staging::Parts`] file lost a part to a cancelled send, so it
+    /// can only be aborted.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self, StageWriter::Parts(sink) if sink.is_cancelled())
+    }
+
+    /// Mark a [`Staging::Parts`] file as having lost a part to a cancelled send:
+    /// a unit test's way to make its finish fail.
+    #[cfg(test)]
+    pub(crate) fn cancel_for_test(&mut self) {
+        if let StageWriter::Parts(sink) = self {
+            sink.cancelled = true;
+        }
+    }
+
     /// Abort the multipart upload a [`Staging::Parts`] file opened, if any.
     pub(crate) async fn abort(&mut self) {
         if let StageWriter::Parts(sink) = self {
@@ -232,14 +326,7 @@ impl StageWriter {
     /// from it rather than from a footer read back.
     pub(crate) fn finish_with_metadata(self, metadata: ParquetMetaData) -> Result<Staged> {
         match self {
-            StageWriter::Parts(sink) => Ok(Staged::Parts(StagedParts {
-                tail: Bytes::from(sink.buffer),
-                part_bytes: sink.part_bytes,
-                upload: sink.upload,
-                sent: sink.sent,
-                parts: sink.parts,
-                metadata: Some(Arc::new(metadata)),
-            })),
+            StageWriter::Parts(sink) => sink.into_staged(Some(Arc::new(metadata))),
             other => other.finish(),
         }
     }
@@ -258,14 +345,7 @@ impl StageWriter {
                 Staged::File(temp.into_temp_path())
             },
             StageWriter::Memory(bytes) => Staged::Memory(Bytes::from(bytes)),
-            StageWriter::Parts(sink) => Staged::Parts(StagedParts {
-                tail: Bytes::from(sink.buffer),
-                part_bytes: sink.part_bytes,
-                upload: sink.upload,
-                sent: sink.sent,
-                parts: sink.parts,
-                metadata: None,
-            }),
+            StageWriter::Parts(sink) => sink.into_staged(None)?,
         })
     }
 }
@@ -328,6 +408,17 @@ pub(crate) struct StagedParts {
     /// The footer as the writer returned it, when the file was finished
     /// through [`StageWriter::finish_with_metadata`].
     metadata: Option<Arc<ParquetMetaData>>,
+}
+
+impl Drop for StagedParts {
+    /// A finished file dropped before its upload completed (a write abandoned
+    /// with files still queued) has its upload aborted in the background where
+    /// there is a runtime; see [`abort_in_background`].
+    fn drop(&mut self) {
+        if let Some(upload) = self.upload.take() {
+            abort_in_background(upload);
+        }
+    }
 }
 
 impl std::fmt::Debug for StagedParts {
@@ -518,6 +609,7 @@ impl StagedParts {
             upload: self.upload.take(),
             sent: self.sent,
             parts: self.parts,
+            cancelled: false,
         };
         sink.put(object_store, object_path, self.tail.clone())
             .await?;

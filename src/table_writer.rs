@@ -2249,7 +2249,13 @@ impl DuckLakeTableWriter {
             abort_parts(&mut writer).await;
             return Err(error);
         }
-        let mut staged = finalize_writer(writer)?;
+        let mut staged = match finalize_writer(&mut writer) {
+            Ok(staged) => staged,
+            Err(error) => {
+                abort_parts(&mut writer).await;
+                return Err(error);
+            },
+        };
         let file_size = staged.len()? as i64;
         let footer_size = staged.footer_size()?;
         staged.upload(&self.object_store, &object_path).await?;
@@ -4663,19 +4669,20 @@ impl RollingFileWriter {
         // (`FileSize() > file_size_bytes`), so a write landing exactly on the target
         // stays in one file.
         if open.writer.bytes_written() + open.writer.in_progress_size() > self.target_file_size {
-            return Ok(Some(finalize_open_file(
-                self.open.take().expect("file open"),
-            )?));
+            return Ok(Some(finalize_open_file(&mut self.open)?));
         }
         Ok(None)
     }
 
     /// Finish the trailing (or only) file, if any rows were written.
+    ///
+    /// On a failure the file stays open, so [`Self::abort`] still aborts its
+    /// upload.
     fn finish(&mut self) -> Result<Option<StagedFile>> {
-        match self.open.take() {
-            Some(open) => Ok(Some(finalize_open_file(open)?)),
-            None => Ok(None),
+        if self.open.is_none() {
+            return Ok(None);
         }
+        Ok(Some(finalize_open_file(&mut self.open)?))
     }
 
     /// Whether a file is currently in progress (any rows written since the last roll).
@@ -4729,12 +4736,22 @@ impl RollingFileWriter {
     }
 }
 
-/// Write the parquet footer and complete its staging (a file's buffered bytes are
-/// flushed and its descriptor released). Synchronous, so a streaming write needs no
-/// await to roll a file.
+/// Write the parquet footer of the file `open` holds and complete its staging (a
+/// file's buffered bytes are flushed and its descriptor released), taking it out
+/// of `open`. Synchronous, so a streaming write needs no await to roll a file.
+///
+/// The file is taken only once its footer is written: on a failure it stays in
+/// `open`, so its owner can still abort the multipart upload a part-staged file
+/// opened, which a file taken first and then failed would drop.
 #[tracing::instrument(name = "ducklake.finalize_open_file", level = "info", skip_all)]
-fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
-    let staged = finalize_writer(file.writer)?;
+fn finalize_open_file(open: &mut Option<OpenFile>) -> Result<StagedFile> {
+    let file = open
+        .as_mut()
+        .ok_or_else(|| crate::error::DuckLakeError::Internal("no data file is open".to_string()))?;
+    let staged = finalize_writer(&mut file.writer)?;
+    let file = open
+        .take()
+        .ok_or_else(|| crate::error::DuckLakeError::Internal("no data file is open".to_string()))?;
     #[cfg(test)]
     FOOTERS_WRITTEN.with(|count| count.set(count.get() + 1));
     Ok(StagedFile {
@@ -4755,9 +4772,40 @@ thread_local! {
 
 /// Write the footer and complete the staging, keeping the footer's metadata: a
 /// part-staged file's statistics come from it, since its bytes are already sent.
-fn finalize_writer(writer: RowGroupSampledWriter<StageWriter>) -> Result<Staged> {
+///
+/// A part-staged file that lost a part to a cancelled send is refused before its
+/// footer is written, and the writer keeps its sink on any failure, so its
+/// owner can abort the upload ([`abort_parts`]).
+fn finalize_writer(writer: &mut RowGroupSampledWriter<StageWriter>) -> Result<Staged> {
+    if writer.sink_mut().is_some_and(|sink| sink.is_cancelled()) {
+        return Err(crate::error::DuckLakeError::Internal(
+            "a data file's part upload was cancelled before it completed; the file can only be \
+             aborted"
+                .to_string(),
+        ));
+    }
     let (sink, metadata) = writer.finish()?;
     sink.finish_with_metadata(metadata)
+}
+
+/// [`RollingFileWriter::finish`] for a session's roller, whose earlier files
+/// `uploads` holds: on a failure the open file's upload is aborted and every file
+/// `uploads` started is removed (and its queued ones aborted) before the error
+/// is returned, rather than left to a drop that cannot await.
+async fn finish_roller(
+    roller: &mut RollingFileWriter,
+    uploads: &mut StagedUploads,
+) -> Result<Option<StagedFile>> {
+    match roller.finish() {
+        Ok(staged) => Ok(staged),
+        Err(error) => {
+            roller.abort().await;
+            for failure in uploads.remove_started().await {
+                tracing::warn!(error = %failure, "failed to remove a data file of a failed write");
+            }
+            Err(error)
+        },
+    }
 }
 
 /// Send the whole parts `writer`'s file holds to `object_path`
@@ -4894,8 +4942,15 @@ impl PartitionSink {
                     // is complete on disk, and start its upload. That partition
                     // simply gets another file if more of its rows arrive.
                     let (evicted_values, mut evicted) = self.open.remove(0);
-                    if let Some(staged) = evicted.finish()? {
-                        self.stage(evicted_values, staged);
+                    match evicted.finish() {
+                        Ok(Some(staged)) => self.stage(evicted_values, staged),
+                        Ok(None) => {},
+                        // Back among the open files, so the session's abort still
+                        // aborts its upload.
+                        Err(error) => {
+                            self.open.insert(0, (evicted_values, evicted));
+                            return Err(error);
+                        },
                     }
                 }
                 let rel = if self.hive_file_pattern {
@@ -4961,9 +5016,23 @@ impl PartitionSink {
     /// Finish every open file and wait for every upload, returning the files to
     /// commit — each [`DataFileInfo`] stamped with its partition.
     async fn finish_uploads(&mut self) -> Result<UploadedFiles> {
-        for (values, mut roller) in std::mem::take(&mut self.open) {
-            if let Some(staged) = roller.finish()? {
-                self.stage(values, staged);
+        let mut open = std::mem::take(&mut self.open).into_iter();
+        while let Some((values, mut roller)) = open.next() {
+            match roller.finish() {
+                Ok(Some(staged)) => self.stage(values, staged),
+                Ok(None) => {},
+                // Abort this file's upload and every other open one, and remove
+                // what was uploaded: nothing of this write is committed.
+                Err(error) => {
+                    roller.abort().await;
+                    for (_, mut roller) in open {
+                        roller.abort().await;
+                    }
+                    for failure in self.uploads.remove_started().await {
+                        tracing::warn!(error = %failure, "failed to remove a data file of a failed write");
+                    }
+                    return Err(error);
+                },
             }
         }
         let mut uploaded = self.uploads.finish().await?;
@@ -5309,7 +5378,11 @@ impl Drop for StagedUploads {
     /// the runtime the uploads ran on; if that runtime has shut down, the removal
     /// never runs and the objects stay as orphans. [`TableWriteSession::abort`] is
     /// the form that finishes the removal before it returns. Files not yet started
-    /// need nothing: their local copies are removed as they drop.
+    /// need no removal: a temporary file's local copy is removed as it drops, and a
+    /// part-staged file's open upload is aborted by its own drop, in the background
+    /// where there is a runtime and only dropped where there is none
+    /// (`crate::staging`'s `abort_in_background`). The awaited paths abort them
+    /// explicitly ([`Self::remove_started`]).
     fn drop(&mut self) {
         if self.settled || self.started.is_empty() {
             return;
@@ -5833,7 +5906,7 @@ impl TableWriteSession {
         // Rolling: finish the in-progress file, upload every file this session
         // produced, and commit them in ONE snapshot.
         if let Some(mut roller) = self.roller.take() {
-            if let Some(staged) = roller.finish()? {
+            if let Some(staged) = finish_roller(&mut roller, &mut self.rolled).await? {
                 self.rolled.add(staged);
             }
             let uploaded = self.rolled.finish().await?;
@@ -6231,7 +6304,7 @@ impl TableWriteSession {
             }
         } else if let Some(mut roller) = self.roller.take() {
             // `finish` writes the last file's parquet footer locally.
-            if let Some(staged) = roller.finish()? {
+            if let Some(staged) = finish_roller(&mut roller, &mut self.rolled).await? {
                 self.rolled.add(staged);
             }
             let uploaded = self.rolled.finish().await?;
@@ -6281,12 +6354,21 @@ impl TableWriteSession {
     /// [`finish`](Self::finish) and [`finish_with_deletes`](Self::finish_with_deletes).
     #[tracing::instrument(name = "ducklake.upload_staged", level = "info", skip_all)]
     async fn upload_staged(&mut self) -> Result<(DataFileInfo, ObjectPath)> {
-        let writer = self.writer.take().ok_or_else(|| {
+        let writer = self.writer.as_mut().ok_or_else(|| {
             crate::error::DuckLakeError::Internal("Writer already closed".to_string())
         })?;
 
-        // Finalise the parquet footer and complete its staging.
-        let mut staged = finalize_writer(writer)?;
+        // Finalise the parquet footer and complete its staging. On a failure the
+        // writer still holds a part-staged file's upload, which is aborted.
+        let staged = finalize_writer(writer);
+        let mut staged = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                abort_parts(writer).await;
+                return Err(error);
+            },
+        };
+        self.writer = None;
         let file_size = staged.len()? as i64;
         let footer_size = staged.footer_size()?;
 
@@ -6485,6 +6567,10 @@ mod tests {
         }
 
         async fn abort(&mut self) -> object_store::Result<()> {
+            self.parts
+                .lock()
+                .unwrap()
+                .push((format!("abort {}", self.path), usize::MAX));
             self.inner.abort().await
         }
     }
@@ -6550,6 +6636,74 @@ mod tests {
         ) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
         }
+    }
+
+    /// A rolled file whose footer cannot be written (here: it lost a part to a
+    /// cancelled send) stays open in its roller, so the roller's abort aborts the
+    /// multipart upload it opened. Taken out before the footer, it would be
+    /// dropped with the upload still open.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_file_whose_footer_fails_stays_open_to_abort_its_upload() {
+        let parts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store: Arc<dyn ObjectStore> = Arc::new(FooterClockStore {
+            inner: object_store::memory::InMemory::new(),
+            parts: Arc::clone(&parts),
+        });
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1000))
+            .build();
+        let mut roller = RollingFileWriter::new(
+            "t".to_string(),
+            None,
+            Arc::new(build_schema_with_field_ids(&schema, &[1]).unwrap()),
+            1,
+            props,
+            usize::MAX,
+            None,
+            Staging::Parts {
+                part_bytes: 1024,
+            },
+        );
+        for b in 0..5i64 {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow::array::Int64Array::from_iter_values(
+                    b * 2000..(b + 1) * 2000,
+                ))],
+            )
+            .unwrap();
+            assert!(roller.write(&batch).unwrap().is_none());
+            roller.put_parts(&store).await.unwrap();
+        }
+        let path = {
+            let parts = parts.lock().unwrap();
+            assert!(parts.len() >= 2, "{parts:?}");
+            parts[0].0.clone()
+        };
+        if let Some(open) = roller.open.as_mut()
+            && let Some(sink) = open.writer.sink_mut()
+        {
+            sink.cancel_for_test();
+        }
+
+        let error = roller.finish().unwrap_err();
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(
+            roller.has_open_file(),
+            "the failed file is still the roller's"
+        );
+        roller.abort().await;
+        let aborted = format!("abort {path}");
+        assert!(
+            parts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(event, _)| *event == aborted),
+            "the open upload was aborted: {:?}",
+            parts.lock().unwrap()
+        );
     }
 
     /// A tab's CTAS path ([`DuckLakeTableWriter::create_table`], through

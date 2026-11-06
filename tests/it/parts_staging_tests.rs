@@ -21,8 +21,10 @@ use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
 use tempfile::TempDir;
 
+use datafusion_ducklake::partition::PartitionTransform;
 use datafusion_ducklake::{
-    DuckLakeTableWriter, DuckLakeWriteOptions, SqliteMetadataWriter, Staging, WriteMode,
+    DuckLakeTableWriter, DuckLakeWriteOptions, MetadataWriter, SqliteMetadataWriter, Staging,
+    WriteMode,
 };
 
 /// Parts this small make a file of a few hundred KiB go out in many of them.
@@ -40,23 +42,38 @@ enum Event {
 
 type Log = Arc<Mutex<Vec<Event>>>;
 
-/// A store over the local filesystem that logs every write, and can fail the
-/// Nth part.
+/// What the store does to one part.
+#[derive(Debug, Clone, Copy)]
+enum Fault {
+    /// Refuses the Nth part sent, counting every upload's.
+    Fail(usize),
+    /// Never answers the `part`th part (from 1) of the `upload`th upload opened
+    /// (from 1), so the write sending it can only be cancelled.
+    Hang {
+        upload: usize,
+        part: usize,
+    },
+}
+
+/// A store over the local filesystem that logs every write, and can fail or
+/// hang the Nth part.
 #[derive(Debug)]
 struct PartsStore {
     inner: Arc<dyn ObjectStore>,
     log: Log,
     parts: Arc<AtomicUsize>,
-    fail_part: Option<usize>,
+    opened: AtomicUsize,
+    fault: Option<Fault>,
 }
 
 impl PartsStore {
-    fn new(fail_part: Option<usize>) -> Self {
+    fn new(fault: Option<Fault>) -> Self {
         Self {
             inner: Arc::new(LocalFileSystem::new()),
             log: Arc::default(),
             parts: Arc::default(),
-            fail_part,
+            opened: AtomicUsize::new(0),
+            fault,
         }
     }
 
@@ -77,20 +94,33 @@ struct LoggedUpload {
     path: String,
     log: Log,
     parts: Arc<AtomicUsize>,
-    fail_part: Option<usize>,
+    /// This upload's place in open order, from 1, and its parts sent so far.
+    index: usize,
+    own_parts: usize,
+    fault: Option<Fault>,
 }
 
 #[async_trait::async_trait]
 impl MultipartUpload for LoggedUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let part = self.parts.fetch_add(1, Ordering::SeqCst) + 1;
-        if self.fail_part == Some(part) {
-            return Box::pin(async {
-                Err(object_store::Error::Generic {
-                    store: "PartsStore",
-                    source: "injected part failure".into(),
-                })
-            });
+        self.own_parts += 1;
+        match self.fault {
+            Some(Fault::Fail(n)) if n == part => {
+                return Box::pin(async {
+                    Err(object_store::Error::Generic {
+                        store: "PartsStore",
+                        source: "injected part failure".into(),
+                    })
+                });
+            },
+            Some(Fault::Hang {
+                upload,
+                part,
+            }) if upload == self.index && part == self.own_parts => {
+                return Box::pin(futures::future::pending());
+            },
+            _ => {},
         }
         self.log
             .lock()
@@ -146,7 +176,9 @@ impl ObjectStore for PartsStore {
             path: location.to_string(),
             log: Arc::clone(&self.log),
             parts: Arc::clone(&self.parts),
-            fail_part: self.fail_part,
+            index: self.opened.fetch_add(1, Ordering::SeqCst) + 1,
+            own_parts: 0,
+            fault: self.fault,
         }))
     }
 
@@ -255,7 +287,7 @@ struct Lake {
 }
 
 impl Lake {
-    async fn new(fail_part: Option<usize>) -> Self {
+    async fn new(fault: Option<Fault>) -> Self {
         let temp = TempDir::new().unwrap();
         let data = temp.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
@@ -279,7 +311,7 @@ impl Lake {
         Self {
             temp,
             writer: Arc::new(writer),
-            store: Arc::new(PartsStore::new(fail_part)),
+            store: Arc::new(PartsStore::new(fault)),
         }
     }
 
@@ -607,7 +639,7 @@ async fn create_table_sends_each_file_in_parts_as_it_rolls() {
 /// aborted session then leaves no object and no catalog row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_part_aborts_the_upload_and_leaves_nothing() {
-    let lake = Lake::new(Some(5)).await;
+    let lake = Lake::new(Some(Fault::Fail(5))).await;
     let mut session = lake
         .table_writer(Staging::Parts {
             part_bytes: PART_BYTES,
@@ -649,4 +681,270 @@ async fn a_refused_part_aborts_the_upload_and_leaves_nothing() {
     );
     assert_eq!(lake.parquet_on_disk(), Vec::<std::path::PathBuf>::new());
     assert!(lake.files().await.is_empty());
+}
+
+/// How many uploads were opened, completed and aborted.
+fn counts(events: &[Event]) -> (usize, usize, usize) {
+    let count = |f: fn(&Event) -> bool| events.iter().filter(|e| f(e)).count();
+    (
+        count(|e| matches!(e, Event::Open(_))),
+        count(|e| matches!(e, Event::Complete(_))),
+        count(|e| matches!(e, Event::Abort(_))),
+    )
+}
+
+/// A write whose part is cancelled mid-send (its future dropped, here by a
+/// timeout over a part the store never answers) has lost that part's bytes: its
+/// `finish` is refused rather than writing a file with a hole in it, and the
+/// refusal aborts the open file's upload and removes the files already
+/// uploaded, before it returns. Run on one thread, so nothing a drop might
+/// spawn runs before the checks.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cancelled_part_refuses_finish_and_aborts_every_upload() {
+    let lake = Lake::new(Some(Fault::Hang {
+        upload: 3,
+        part: 3,
+    }))
+    .await;
+    let mut session = lake
+        .table_writer(Staging::Parts {
+            part_bytes: PART_BYTES,
+        })
+        .begin_write("main", "t", &schema(), WriteMode::Create)
+        .unwrap();
+    let mut cancelled = false;
+    for batch in batches(30) {
+        let write = session.write_batch_async(&batch);
+        match tokio::time::timeout(std::time::Duration::from_millis(500), write).await {
+            Ok(written) => written.unwrap(),
+            Err(_) => {
+                cancelled = true;
+                break;
+            },
+        }
+    }
+    assert!(cancelled, "the third file's third part hangs");
+    let before = lake.store.events();
+    assert_eq!(counts(&before).0, 3, "{before:?}");
+
+    let error = session.finish().await.unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error}");
+
+    let events = lake.store.events();
+    let (opened, completed, aborted) = counts(&events);
+    assert!(
+        aborted >= 1,
+        "the open file's upload is aborted: {events:?}"
+    );
+    assert_eq!(
+        opened,
+        completed + aborted,
+        "every upload completed or aborted: {events:?}"
+    );
+    assert_eq!(
+        lake.parquet_on_disk(),
+        Vec::<std::path::PathBuf>::new(),
+        "no file and no half upload is left"
+    );
+    assert!(lake.files().await.is_empty());
+}
+
+/// With no tokio runtime on the thread, as a browser drives a write, a session
+/// under `Staging::Parts` still sends its parts while it writes and uploads its
+/// rolled files itself (`StagedUploads::upload_inline`): before `finish`, every
+/// file but the open one is complete and the open one has sent parts. DuckDB
+/// reads the lake.
+#[tokio::test(flavor = "multi_thread")]
+async fn parts_go_out_with_no_tokio_runtime() {
+    let lake = Lake::new(None).await;
+    let table_writer = lake.table_writer(Staging::Parts {
+        part_bytes: PART_BYTES,
+    });
+    let store = Arc::clone(&lake.store);
+    let (files, before) = std::thread::spawn(move || {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        futures::executor::block_on(async {
+            let mut session = table_writer
+                .begin_write("main", "t", &schema(), WriteMode::Create)
+                .unwrap();
+            for batch in batches(30) {
+                session.write_batch_async(&batch).await.unwrap();
+            }
+            let before = store.events();
+            (session.finish().await.unwrap().files_written, before)
+        })
+    })
+    .join()
+    .unwrap();
+
+    let (opened, completed, aborted) = counts(&before);
+    assert!(
+        files >= 3 && opened == files,
+        "{files} files, {opened} opened"
+    );
+    assert_eq!(
+        completed,
+        opened - 1,
+        "all but the open file uploaded: {before:?}"
+    );
+    assert_eq!(aborted, 0);
+    let Some(Event::Open(open_file)) = before.iter().rev().find(|e| matches!(e, Event::Open(_)))
+    else {
+        unreachable!()
+    };
+    assert!(
+        before
+            .iter()
+            .any(|e| matches!(e, Event::Part(path, _) if path == open_file)),
+        "the open file has sent parts"
+    );
+    assert_eq!(lake.duckdb_reads(), expected_reads(30));
+}
+
+fn partitioned_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("p", DataType::Int64, false),
+        Field::new("id", DataType::Int64, false),
+        Field::new("s", DataType::Utf8, false),
+    ]))
+}
+
+/// `count` batches of 2,000 rows, each holding all three partitions `p`.
+fn partitioned_batches(count: i64) -> Vec<RecordBatch> {
+    (0..count)
+        .map(|b| {
+            let ids: Vec<i64> = (b * 2000..(b + 1) * 2000).collect();
+            RecordBatch::try_new(
+                partitioned_schema(),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(ids.iter().map(|id| id % 3))),
+                    Arc::new(Int64Array::from(ids.clone())),
+                    Arc::new(StringArray::from_iter_values(
+                        ids.iter().map(|id| format!("s{}", id * 7919 % 100_003)),
+                    )),
+                ],
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+/// A partitioned session under `Staging::Parts` sends parts for every partition
+/// file it holds open: before `finish`, three files (one per partition) have
+/// sent parts and are not complete. DuckDB reads every partition back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partitioned_session_sends_every_open_files_parts() {
+    let lake = Lake::new(None).await;
+    let created = lake
+        .table_writer(Staging::Memory)
+        .create_table("main", "pt", &partitioned_batches(1)[..1])
+        .await
+        .unwrap();
+    lake.writer
+        .set_partition_spec(
+            created.table_id,
+            &[("p".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let mut options = options(Staging::Parts {
+        part_bytes: PART_BYTES,
+    });
+    // One file per partition for the whole write: open together throughout.
+    options.target_file_size = Some(64 * 1024 * 1024);
+    let store: Arc<dyn ObjectStore> = lake.store.clone();
+    let mut session = DuckLakeTableWriter::new(lake.writer.clone(), store)
+        .unwrap()
+        .with_options(&options)
+        .begin_write("main", "pt", &partitioned_schema(), WriteMode::Append)
+        .unwrap();
+    for batch in partitioned_batches(30) {
+        session.write_batch_async(&batch).await.unwrap();
+    }
+    let before = lake.store.events();
+    let mut streaming: Vec<&String> = before
+        .iter()
+        .filter_map(|e| match e {
+            Event::Part(path, _) if !before.contains(&Event::Complete(path.clone())) => Some(path),
+            _ => None,
+        })
+        .collect();
+    streaming.sort();
+    streaming.dedup();
+    assert_eq!(
+        streaming.len(),
+        3,
+        "each partition's open file has sent parts: {streaming:?}"
+    );
+    session.finish().await.unwrap();
+
+    let oracle = duckdb::Connection::open_in_memory().unwrap();
+    oracle
+        .execute_batch(&format!(
+            "LOAD ducklake; LOAD sqlite; \
+             ATTACH 'ducklake:sqlite:{}' AS lake (DATA_PATH '{}/', READ_ONLY);",
+            lake.catalog().display(),
+            lake.data().display()
+        ))
+        .unwrap();
+    let mut statement = oracle
+        .prepare("SELECT p, count(*), sum(id)::BIGINT FROM lake.main.pt GROUP BY p ORDER BY p")
+        .unwrap();
+    let rows: Vec<(i64, i64, i64)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    let mut expected = vec![(0, 0, 0), (1, 0, 0), (2, 0, 0)];
+    for batch in partitioned_batches(30)
+        .into_iter()
+        .chain(partitioned_batches(1).into_iter().take(1))
+    {
+        let ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for id in ids.iter().flatten() {
+            let row = &mut expected[(id % 3) as usize];
+            row.1 += 1;
+            row.2 += id;
+        }
+    }
+    assert_eq!(rows, expected);
+}
+
+/// A session dropped mid-write, without `abort`, has its open file's upload
+/// aborted by the file's own drop, on the runtime in the background: a drop
+/// cannot await. Nothing is left on disk once it has run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_session_aborts_its_open_upload_in_the_background() {
+    let lake = Lake::new(None).await;
+    let mut session = lake
+        .table_writer(Staging::Parts {
+            part_bytes: PART_BYTES,
+        })
+        .begin_write("main", "t", &schema(), WriteMode::Create)
+        .unwrap();
+    for batch in batches(5) {
+        session.write_batch_async(&batch).await.unwrap();
+    }
+    let (opened, completed, _) = counts(&lake.store.events());
+    assert!(opened > completed, "a file is open with parts sent");
+    drop(session);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let events = lake.store.events();
+        let (opened, completed, aborted) = counts(&events);
+        if opened == completed + aborted && lake.parquet_on_disk().is_empty() {
+            assert!(aborted >= 1, "{events:?}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dropped upload was never aborted: {events:?}, on disk {:?}",
+            lake.parquet_on_disk()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }

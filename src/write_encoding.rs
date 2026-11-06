@@ -334,16 +334,21 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
     /// [`ArrowWriter::close`] returns it. The sink is taken out of the finished
     /// writer (its default left in its place), because `ArrowWriter::into_inner`
     /// after a `finish` would write the footer a second time.
-    pub(crate) fn finish(mut self) -> Result<(W, ParquetMetaData)>
+    ///
+    /// Borrows rather than consumes: on a failure the writer keeps its sink, so
+    /// the caller can still abort what the sink holds (a part-staged file's
+    /// open upload). It is closed only once this succeeds.
+    pub(crate) fn finish(&mut self) -> Result<(W, ParquetMetaData)>
     where
         W: Default,
     {
         if self.writer.is_none() {
             self.open()?;
         }
-        let mut writer = self.writer.take().ok_or_else(closed)?;
+        let writer = self.writer.as_mut().ok_or_else(closed)?;
         let metadata = writer.finish()?;
         let sink = std::mem::take(writer.inner_mut());
+        self.writer = None;
         Ok((sink, metadata))
     }
 
