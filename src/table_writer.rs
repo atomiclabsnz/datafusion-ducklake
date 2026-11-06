@@ -4735,6 +4735,8 @@ impl RollingFileWriter {
 #[tracing::instrument(name = "ducklake.finalize_open_file", level = "info", skip_all)]
 fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
     let staged = finalize_writer(file.writer)?;
+    #[cfg(test)]
+    FOOTERS_WRITTEN.with(|count| count.set(count.get() + 1));
     Ok(StagedFile {
         staged,
         catalog_path: file.catalog_path,
@@ -4742,6 +4744,13 @@ fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
         row_count: file.row_count,
         leaf_stats: file.leaf_stats,
     })
+}
+
+// How many rolled files this thread has written the footer of: a unit test's
+// clock for whether a file's parts were sent before its footer.
+#[cfg(test)]
+thread_local! {
+    static FOOTERS_WRITTEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Write the footer and complete the staging, keeping the footer's metadata: a
@@ -6438,6 +6447,184 @@ fn apply_field_ids(batch: &RecordBatch, schema: SchemaRef) -> Result<RecordBatch
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store that records, for every part sent, its object and how many files
+    /// had had their footer written on this thread when it was sent.
+    #[derive(Debug)]
+    struct FooterClockStore {
+        inner: object_store::memory::InMemory,
+        parts: Arc<std::sync::Mutex<Vec<(String, usize)>>>,
+    }
+
+    impl std::fmt::Display for FooterClockStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FooterClockStore")
+        }
+    }
+
+    #[derive(Debug)]
+    struct FooterClockUpload {
+        inner: Box<dyn object_store::MultipartUpload>,
+        path: String,
+        parts: Arc<std::sync::Mutex<Vec<(String, usize)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::MultipartUpload for FooterClockUpload {
+        fn put_part(&mut self, data: object_store::PutPayload) -> object_store::UploadPart {
+            let footers = FOOTERS_WRITTEN.with(std::cell::Cell::get);
+            self.parts
+                .lock()
+                .unwrap()
+                .push((self.path.clone(), footers));
+            self.inner.put_part(data)
+        }
+
+        async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.inner.abort().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FooterClockStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            Ok(Box::new(FooterClockUpload {
+                inner: self.inner.put_multipart_opts(location, opts).await?,
+                path: location.to_string(),
+                parts: Arc::clone(&self.parts),
+            }))
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A tab's CTAS path ([`DuckLakeTableWriter::create_table`], through
+    /// `write_rolled_files`) under `Staging::Parts`: every file sends parts
+    /// before its footer is written, so a file is never held whole. Sent at the
+    /// roll instead, each part would be stamped with its own file's footer.
+    #[cfg(feature = "write-sqlite")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_table_sends_parts_before_each_footer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", temp.path().join("c.db").display());
+        let metadata = Arc::new(
+            crate::SqliteMetadataWriter::new_with_init(&url)
+                .await
+                .unwrap(),
+        );
+        metadata.set_data_path("/lake").unwrap();
+        let parts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = Arc::new(FooterClockStore {
+            inner: object_store::memory::InMemory::new(),
+            parts: Arc::clone(&parts),
+        });
+        let mut options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(0);
+        options.max_row_group_rows = Some(1000);
+        options.target_file_size = Some(48 * 1024);
+        options.staging = Some(Staging::Parts {
+            part_bytes: 8 * 1024,
+        });
+        let writer = DuckLakeTableWriter::new(metadata, store)
+            .unwrap()
+            .with_options(&options);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batches: Vec<RecordBatch> = (0..20i64)
+            .map(|b| {
+                let ids: Vec<i64> = (b * 2000..(b + 1) * 2000).collect();
+                let s: Vec<String> = ids
+                    .iter()
+                    .map(|i| format!("v{}", i * 7919 % 100_003))
+                    .collect();
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(arrow::array::Int64Array::from(ids)),
+                        Arc::new(StringArray::from(s)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let before = FOOTERS_WRITTEN.with(std::cell::Cell::get);
+        let written = writer.create_table("main", "t", &batches).await.unwrap();
+        assert!(written.files_written >= 3, "{written:?}");
+
+        let parts = parts.lock().unwrap().clone();
+        let mut files: Vec<String> = Vec::new();
+        for (path, _) in &parts {
+            if !files.contains(path) {
+                files.push(path.clone());
+            }
+        }
+        assert_eq!(files.len(), written.files_written);
+        for (k, file) in files.iter().enumerate() {
+            let sent_before_footer = parts
+                .iter()
+                .filter(|(path, footers)| path == file && *footers == before + k)
+                .count();
+            assert!(
+                sent_before_footer >= 2,
+                "file {k} sent {sent_before_footer} parts before its footer: {parts:?}"
+            );
+        }
+    }
 
     /// Staging a row mutation that fails validation removes the files the
     /// statement wrote for it; nothing references them.

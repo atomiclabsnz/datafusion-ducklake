@@ -36,42 +36,9 @@ enum Event {
     Complete(String),
     Abort(String),
     Put(String, usize),
-    /// The writer wrote a file's footer (its `ducklake.finalize_open_file` span).
-    Finalize,
 }
 
 type Log = Arc<Mutex<Vec<Event>>>;
-
-/// Logs each `ducklake.finalize_open_file` span the writer opens into the same
-/// log as the store's events, so a test sees where in a file's upload its footer
-/// was written. Set as the thread's default, around a call that does not spawn
-/// the writing.
-struct FinalizeLog(Log);
-
-const FINALIZE: &str = "ducklake.finalize_open_file";
-
-impl tracing::Subscriber for FinalizeLog {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        metadata.name() == FINALIZE
-    }
-
-    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        if span.metadata().name() == FINALIZE {
-            self.0.lock().unwrap().push(Event::Finalize);
-        }
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-    fn event(&self, _: &tracing::Event<'_>) {}
-
-    fn enter(&self, _: &tracing::span::Id) {}
-
-    fn exit(&self, _: &tracing::span::Id) {}
-}
 
 /// A store over the local filesystem that logs every write, and can fail the
 /// Nth part.
@@ -592,15 +559,12 @@ async fn parts_go_out_while_a_session_writes_and_the_footer_stats_agree() {
 #[tokio::test(flavor = "multi_thread")]
 async fn create_table_sends_each_file_in_parts_as_it_rolls() {
     let lake = Lake::new(None).await;
-    {
-        let _finalizes = tracing::subscriber::set_default(FinalizeLog(Arc::clone(&lake.store.log)));
-        lake.table_writer(Staging::Parts {
-            part_bytes: PART_BYTES,
-        })
-        .create_table("main", "t", &batches(30))
-        .await
-        .unwrap();
-    }
+    lake.table_writer(Staging::Parts {
+        part_bytes: PART_BYTES,
+    })
+    .create_table("main", "t", &batches(30))
+    .await
+    .unwrap();
 
     let events = lake.store.events();
     let opens: Vec<usize> = events
@@ -622,28 +586,8 @@ async fn create_table_sends_each_file_in_parts_as_it_rolls() {
         first_complete < *opens.last().unwrap(),
         "the first file is complete before the last is opened: {events:?}"
     );
-    // Each file's upload is open, with parts in it, before its footer is
-    // written: its parts went out while it was encoded, not after.
-    let finalizes: Vec<usize> = events
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| (*e == Event::Finalize).then_some(i))
-        .collect();
-    assert_eq!(
-        finalizes.len(),
-        files.len(),
-        "one footer per file: {events:?}"
-    );
-    for (open, finalize) in opens.iter().zip(&finalizes) {
-        let parts_before = events[*open..*finalize]
-            .iter()
-            .filter(|e| matches!(e, Event::Part(..)))
-            .count();
-        assert!(
-            open < finalize && parts_before >= 2,
-            "a file's parts precede its footer ({parts_before} did): {events:?}"
-        );
-    }
+    // That each file's parts precede its footer is `table_writer`'s unit test
+    // `create_table_sends_parts_before_each_footer`.
     // Every file but the last sent parts before its footer: a file's parts all
     // come before its completion, and a file holds several.
     for open in &opens {
