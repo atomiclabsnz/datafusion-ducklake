@@ -758,3 +758,45 @@ async fn a_manifest_id_of_a_dropped_column_is_refused_and_not_retryable() {
         "{error:?}"
     );
 }
+
+/// A manifest column of a live column's name under another id is refused as the manifest's
+/// error, not as a conflict to retry: the files' field id names no column of the table, and no
+/// retry changes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manifest_column_of_a_live_name_under_another_id_is_refused_and_not_retryable() {
+    let dir = TempDir::new().unwrap();
+    // The target's `t` gets `id` 1 and `a` 2.
+    let first = Source::new(
+        &dir.path().join("first"),
+        "CREATE TABLE lake.t (id INT, a INT); INSERT INTO lake.t VALUES (1, 1);",
+    );
+    let target = Target::new(dir.path()).await;
+    target
+        .import(
+            "t",
+            &first.head_manifest("t").await,
+            &ImportOptions::default(),
+        )
+        .await
+        .unwrap();
+    // A source whose `a` was dropped and added again, so has id 3.
+    let second = Source::new(
+        &dir.path().join("second"),
+        "CREATE TABLE lake.t (id INT, a INT);
+         ALTER TABLE lake.t DROP COLUMN a;
+         ALTER TABLE lake.t ADD COLUMN a INT;
+         INSERT INTO lake.t VALUES (2, 2);",
+    );
+    let mut options = ImportOptions::default();
+    options.allow_schema_evolution = true;
+    let error = target
+        .import("t", &second.head_manifest("t").await, &options)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, DuckLakeError::InvalidConfig(message)
+            if message.contains("'a' has id 3") && message.contains("has id 2")
+                && message.contains("Not retryable")),
+        "{error:?}"
+    );
+}

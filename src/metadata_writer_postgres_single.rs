@@ -970,6 +970,45 @@ async fn finalize_snapshot(
     .await
 }
 
+/// Refuse a commit whose write began on table `table_id_hint` when that table has since
+/// been dropped (perhaps making a view of its name) or renamed: its id is taken, so this is
+/// a conflict, as on the multi-catalog writer, not an insert that collides with the taken id
+/// nor a write into another table of the name. A new table's id was reserved (or, in a
+/// catalog the extension created, is a negative stand-in), and so is in no row: that passes.
+async fn refuse_write_into_a_changed_table(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id_hint: i64,
+    base_snapshot: i64,
+) -> Result<()> {
+    let (rows, live): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE end_snapshot IS NULL)
+         FROM ducklake_table WHERE table_id = $1",
+    )
+    .bind(table_id_hint)
+    .fetch_one(&mut **tx)
+    .await?;
+    if rows == 0 {
+        return Ok(());
+    }
+    // Official's words for the change, read off the snapshots since the base (a rename is an
+    // alter); failing that, by what is left of the table.
+    crate::metadata_writer_postgres::check_table_conflicts(
+        tx,
+        table_id_hint,
+        base_snapshot,
+        crate::metadata_writer::TableChanges::append(),
+    )
+    .await?;
+    Err(if live > 0 {
+        crate::DuckLakeError::Conflict(format!(
+            "Transaction conflict - attempting to insert into table with index \
+             \"{table_id_hint}\" - but another transaction has altered it"
+        ))
+    } else {
+        crate::metadata_writer::table_dropped_error(table_id_hint)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn finalize_table_snapshot(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1032,39 +1071,17 @@ async fn finalize_table_snapshot(
     .fetch_optional(&mut **tx)
     .await?
     {
+        // The name is another table's than the one the write began on: the write's table
+        // was dropped or renamed since, and another took its name (#32). With ids numbered
+        // per table the two tables' columns can have the same ids, so no column check tells
+        // them apart: the write is refused as the table's, as when no table has the name.
+        Some(id) if id != table_id_hint => {
+            refuse_write_into_a_changed_table(tx, table_id_hint, base_snapshot).await?;
+            id
+        },
         Some(id) => id,
         None => {
-            // The write began on a table another writer has since dropped (perhaps making a
-            // view of its name) or renamed: its id is taken, so this is a conflict, as on the
-            // multi-catalog writer, not an insert that collides with the taken id. A new
-            // table's id was reserved (or, in a catalog the extension created, is a negative
-            // stand-in), and so is in no row.
-            let (rows, live): (i64, i64) = sqlx::query_as(
-                "SELECT COUNT(*), COUNT(*) FILTER (WHERE end_snapshot IS NULL)
-                 FROM ducklake_table WHERE table_id = $1",
-            )
-            .bind(table_id_hint)
-            .fetch_one(&mut **tx)
-            .await?;
-            if rows > 0 {
-                // Official's words for the change, read off the snapshots since the base
-                // (a rename is an alter); failing that, by what is left of the table.
-                crate::metadata_writer_postgres::check_table_conflicts(
-                    tx,
-                    table_id_hint,
-                    base_snapshot,
-                    crate::metadata_writer::TableChanges::append(),
-                )
-                .await?;
-                return Err(if live > 0 {
-                    crate::DuckLakeError::Conflict(format!(
-                        "Transaction conflict - attempting to insert into table with index \
-                         \"{table_id_hint}\" - but another transaction has altered it"
-                    ))
-                } else {
-                    crate::metadata_writer::table_dropped_error(table_id_hint)
-                });
-            }
+            refuse_write_into_a_changed_table(tx, table_id_hint, base_snapshot).await?;
             // In a catalog the DuckDB extension created there is no sequence to have
             // reserved from: the id is allocated here, under the snapshot's lock.
             let table_id_hint =

@@ -6243,9 +6243,9 @@ impl MetadataWriter for SqliteMetadataWriter {
     ) -> Result<CommitIds> {
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
-            // The manifest's ids are its files' field ids, which no retry changes: a new column
-            // whose id a column of the table has or had is refused as the manifest's error, not
-            // as a conflict to retry.
+            // The manifest's ids are its files' field ids, which no retry changes: a column of
+            // the table's name under another id, or a new column whose id a column of the table
+            // has or had, is refused as the manifest's error, not as a conflict to retry.
             let live = sqlx::query(
                 "SELECT column_id, column_name, column_type, parent_column FROM ducklake_column
                  WHERE table_id = ? AND end_snapshot IS NULL",
@@ -6269,12 +6269,23 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .fetch_all(&mut *tx)
             .await?;
-            if let Some((name, id)) = crate::metadata_writer::reused_column_id(
-                &catalog_column_defs(columns)?,
-                &live,
-                column_ids,
-                &used,
-            )? {
+            let proposed = catalog_column_defs(columns)?;
+            let matched = assign_column_ids(&proposed, &live, column_ids)?;
+            if let Some((column, (id, live_id))) = proposed
+                .iter()
+                .zip(column_ids.iter().zip(&matched))
+                .find(|(_, (id, live_id))| id != live_id)
+            {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "manifest column '{}' has id {id}, but the table's column of that name has id \
+                     {live_id}: its files' field ids would not name it. Not retryable: the ids \
+                     are the files'; import into a table whose columns have the files' ids",
+                    column.name
+                )));
+            }
+            if let Some((name, id)) =
+                crate::metadata_writer::reused_column_id(&proposed, &live, column_ids, &used)?
+            {
                 return Err(crate::DuckLakeError::InvalidConfig(format!(
                     "manifest column '{name}' has id {id}, which another column of the table has \
                      or had: its files' field ids would name that column. Not retryable: the ids \

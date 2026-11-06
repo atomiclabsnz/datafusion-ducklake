@@ -1234,3 +1234,105 @@ async fn a_concurrent_create_with_the_same_columns_appends() {
         }
     }
 }
+
+/// The DuckDB writer, as [`two_creates`]: two writes in flight make one new table `n` of a
+/// DuckDB catalog this crate made, the first `(id, a)`, the second `second`'s columns. Returns
+/// the second's commit and `n`'s rows as DuckDB reads them after it.
+#[cfg(feature = "write-duckdb")]
+async fn two_creates_duckdb(
+    inlining: usize,
+    second: RecordBatch,
+) -> (
+    datafusion_ducklake::Result<datafusion_ducklake::WriteResult>,
+    Vec<String>,
+) {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let catalog = temp.path().join("catalog.ducklake").display().to_string();
+    let result = {
+        let metadata = datafusion_ducklake::DuckdbMetadataWriter::new_with_init(&catalog).unwrap();
+        metadata.set_data_path(data.to_str().unwrap()).unwrap();
+        metadata.create_snapshot().unwrap();
+        let metadata: Arc<dyn MetadataWriter> =
+            Arc::new(metadata.with_data_inlining_row_limit(inlining));
+        let writer = DuckLakeTableWriter::new(metadata, Arc::new(LocalFileSystem::new())).unwrap();
+        let first = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("a", DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+        let append = datafusion_ducklake::WriteMode::Append;
+        let mut one = writer
+            .begin_write("main", "n", &first.schema(), append)
+            .unwrap();
+        let mut two = writer
+            .begin_write("main", "n", &second.schema(), append)
+            .unwrap();
+        one.write_batch(&first).unwrap();
+        two.write_batch(&second).unwrap();
+        one.finish().await.unwrap();
+        two.finish().await
+    };
+    crate::common::ensure_ducklake_installed();
+    let connection = duckdb::Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(&format!(
+            "LOAD ducklake; ATTACH 'ducklake:{catalog}' AS lake (READ_ONLY);"
+        ))
+        .unwrap();
+    let read = rows(&connection, "SELECT * FROM lake.n ORDER BY id");
+    (result, read)
+}
+
+/// On the DuckDB writer too, a second create of the same new table is refused when its `a` is
+/// another type or it has no `a`, and appends when its columns are the first's.
+#[cfg(feature = "write-duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_concurrent_create_on_the_duckdb_writer_is_checked() {
+    for inlining in [0, 10] {
+        let (other_type, read) = two_creates_duckdb(
+            inlining,
+            id_and(
+                Some(Field::new("a", DataType::Utf8, true)),
+                Some(Arc::new(StringArray::from(vec!["hello"]))),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                other_type,
+                Err(datafusion_ducklake::DuckLakeError::Conflict(_))
+            ),
+            "another type, inlining {inlining}: {other_type:?}"
+        );
+        assert_eq!(read, ["1|10"]);
+
+        let (missing, read) = two_creates_duckdb(inlining, id_and(None, None)).await;
+        assert!(
+            matches!(
+                missing,
+                Err(datafusion_ducklake::DuckLakeError::Conflict(_))
+            ),
+            "no `a`, inlining {inlining}: {missing:?}"
+        );
+        assert_eq!(read, ["1|10"]);
+
+        let (same, read) = two_creates_duckdb(
+            inlining,
+            id_and(
+                Some(Field::new("a", DataType::Int32, true)),
+                Some(Arc::new(Int32Array::from(vec![20]))),
+            ),
+        )
+        .await;
+        same.unwrap();
+        assert_eq!(read, ["1|10", "2|20"]);
+    }
+}

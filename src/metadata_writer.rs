@@ -1817,8 +1817,8 @@ pub(crate) fn offered_column_ids(
         .collect())
 }
 
-/// Refuse a commit into a table another write created since this write began, unless this
-/// write's columns are exactly the ones that write gave it: the same columns, types,
+/// Refuse a commit into a table another write published (created, or renamed) since this
+/// write began, unless this write's columns are exactly the table's: the same columns, types,
 /// parents and top-level nullability (#32). Its start saw no live columns, so none of a
 /// start's checks of an existing table's columns (no type change, no new non-null column)
 /// ran, and with ids numbered per table a column of the same name has the same id in both
@@ -1835,8 +1835,8 @@ pub(crate) fn refuse_columns_of_a_concurrent_create(
         && !staged_columns_match(existing, existing_nullability, proposed, field_ids)
     {
         return Err(DuckLakeError::Conflict(
-            "another write created the table since this write began, with other columns; retry \
-             the write"
+            "the table was published (created, or renamed) by another write since this write \
+             began, with other columns; retry the write"
                 .to_string(),
         ));
     }
