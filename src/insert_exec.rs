@@ -266,6 +266,13 @@ impl ExecutionPlan for DuckLakeInsertExec {
         let output_schema = make_insert_count_schema();
 
         let stream = stream::once(async move {
+            // An encrypted catalog takes no Parquet this crate writes, so its
+            // insert is decided on the whole input (inlined, or refused): a
+            // session would refuse it at its start, rows it could inline too.
+            let streams = streams
+                && !writer
+                    .catalog_encrypted()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
             let mut input_stream = input.execute(0, Arc::clone(&context))?;
             let batches: Vec<RecordBatch> = if streams {
                 // Up to the first batch with rows: an input of none is answered
