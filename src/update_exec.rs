@@ -282,6 +282,12 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             let mut superseded_positions: Vec<(&UpdateSourceScan, Vec<i64>)> = Vec::new();
             let mut superseded_inlined: Vec<InlinedRowRef> = Vec::new();
             let mut total_updated: u64 = 0;
+            // The superseded positions are held until the commit, which makes the
+            // deletes of them: charged to the pool as they are taken, so an update
+            // too large to hold them is refused rather than outgrowing it.
+            let positions_held =
+                datafusion::execution::memory_pool::MemoryConsumer::new("DuckLakeUpdateExec")
+                    .register(context.memory_pool());
 
             let read = async {
                 let out_schema = table.update_output_schema();
@@ -302,6 +308,8 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                         else {
                             continue;
                         };
+                        positions_held
+                            .try_grow(rewritten.positions.len() * std::mem::size_of::<i64>())?;
                         positions.extend(rewritten.positions);
                         versions.push(rewritten.batch).await?;
                     }
@@ -370,6 +378,8 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 total_updated,
             )
             .await?;
+            // Held until the deletes made of them are committed.
+            drop(positions_held);
             let count: ArrayRef = Arc::new(UInt64Array::from(vec![total_updated]));
             Ok(RecordBatch::try_new(output_schema, vec![count])?)
         });

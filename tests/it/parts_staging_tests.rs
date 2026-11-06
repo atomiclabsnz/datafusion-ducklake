@@ -1316,3 +1316,35 @@ async fn a_sql_update_that_fails_mid_stream_leaves_the_table_as_it_was() {
     assert_eq!(lake.snapshot_count().await, snapshots);
     assert_eq!(duckdb_rows(&lake), before);
 }
+
+/// What an `UPDATE` holds is charged to its pool: the new versions' session and
+/// the superseded positions it keeps for the deletes (8 bytes a row). Past the
+/// pool it is refused as the pool's (`ResourcesExhausted`), and leaves the table
+/// as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sql_update_past_the_pool_is_refused_and_leaves_the_table_as_it_was() {
+    let (lake, _) = seeded(None).await;
+    let files = lake.files().await;
+    let snapshots = lake.snapshot_count().await;
+    let before = duckdb_rows(&lake);
+    // 60,000 positions are 480,000 bytes: past this pool, which the session's
+    // own row group and unsent part fit in.
+    let ctx = sql_ctx(&lake, Some(POSITIONS_POOL)).await;
+    let error = run(&ctx, "UPDATE lake.main.t SET id = id + 100000")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.find_root(),
+            datafusion::error::DataFusionError::ResourcesExhausted(_)
+        ),
+        "{error}"
+    );
+    let (opened, completed, aborted) = counts(&lake.store.events());
+    assert_eq!(opened, completed + aborted);
+    assert_eq!(lake.files().await, files);
+    assert_eq!(lake.snapshot_count().await, snapshots);
+    assert_eq!(duckdb_rows(&lake), before);
+}
+
+const POSITIONS_POOL: usize = 400 * 1024;
