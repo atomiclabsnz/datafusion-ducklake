@@ -1230,6 +1230,36 @@ impl DuckLakeTableWriter {
         )
     }
 
+    /// [`Self::begin_write`] for a write planned as unpartitioned (the SQL
+    /// `INSERT` that streams its input, `DuckLakeInsertExec`): a partition spec
+    /// that went live since is refused as a
+    /// [`Conflict`](crate::DuckLakeError::Conflict), as
+    /// `write_rows_unpartitioned_as_planned` refuses it, rather than splitting
+    /// the rows under a spec the plan never saw.
+    pub(crate) fn begin_write_unpartitioned_as_planned(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+    ) -> Result<TableWriteSession> {
+        let file_name = format!("{}.parquet", Uuid::new_v4());
+        self.begin_write_internal(
+            schema_name,
+            table_name,
+            arrow_schema,
+            None,
+            file_name.clone(),
+            file_name,
+            true,
+            false,
+            mode,
+            StreamPartitionMode::AsPlanned,
+            true,
+            true,
+        )
+    }
+
     /// Begin a streaming write session with a custom file path (registered as absolute).
     ///
     /// It never inlines: the caller chose the file the rows must land in.
@@ -1367,6 +1397,12 @@ impl DuckLakeTableWriter {
                          caller-determined file, but the table's partition spec requires rows \
                          to be split across one file per partition"
                         )));
+                    },
+                    StreamPartitionMode::AsPlanned => {
+                        return Err(crate::DuckLakeError::Conflict(
+                            "table gained a partition spec before write; retry the write"
+                                .to_string(),
+                        ));
                     },
                     StreamPartitionMode::Split => Some(PartitionSink {
                         key_names: spec.key_names(),
@@ -4686,6 +4722,13 @@ impl RollingFileWriter {
         Ok(Some(finalize_open_file(&mut self.open)?))
     }
 
+    /// The bytes the open file holds in memory ([`open_file_memory_size`]).
+    fn memory_size(&self) -> usize {
+        self.open
+            .as_ref()
+            .map_or(0, |open| open_file_memory_size(&open.writer))
+    }
+
     /// Whether a file is currently in progress (any rows written since the last roll).
     fn has_open_file(&self) -> bool {
         self.open.is_some()
@@ -4822,6 +4865,12 @@ async fn put_full_parts(
     }
 }
 
+/// The bytes `writer`'s open file holds in memory: the writer's own (a first
+/// row group being buffered, the row group in progress) and its staging's.
+fn open_file_memory_size(writer: &RowGroupSampledWriter<StageWriter>) -> usize {
+    writer.memory_size() + writer.sink().map_or(0, StageWriter::memory_size)
+}
+
 /// Abort the multipart upload `writer`'s file opened, if any.
 async fn abort_parts(writer: &mut RowGroupSampledWriter<StageWriter>) {
     if let Some(sink) = writer.sink_mut() {
@@ -4874,6 +4923,11 @@ enum StreamPartitionMode {
     Reject {
         entry_point: &'static str,
     },
+    /// Refuse as a conflict: the caller planned the write as unpartitioned (the
+    /// SQL `INSERT`), so a spec that went live since is the partition fence's
+    /// conflict, which the caller retries against the new spec, as
+    /// `write_rows_unpartitioned_as_planned` refuses it.
+    AsPlanned,
 }
 
 /// Routes a streaming write's rows into one parquet file per partition.
@@ -4991,6 +5045,16 @@ impl PartitionSink {
             }
         }
         Ok(())
+    }
+
+    /// The bytes the open partition files and the files awaiting upload hold in
+    /// memory.
+    fn memory_size(&self) -> usize {
+        self.open
+            .iter()
+            .map(|(_, roller)| roller.memory_size())
+            .sum::<usize>()
+            + self.uploads.memory_size()
     }
 
     /// Send the whole parts each open partition file holds ([`Staging::Parts`]).
@@ -5156,6 +5220,17 @@ impl StagedUploads {
         self.waiting.push_back((self.uploaded.len(), staged));
         self.uploaded.push(None);
         self.advance();
+    }
+
+    /// The bytes the finished files waiting for an upload slot hold in memory.
+    /// An upload already started holds its file in its task, out of reach here;
+    /// a writer with no runtime (a browser) starts none, so there every finished
+    /// file not yet uploaded is counted.
+    fn memory_size(&self) -> usize {
+        self.waiting
+            .iter()
+            .map(|(_, file)| file.staged.memory_size())
+            .sum()
     }
 
     /// Collect the uploads that have ended and start waiting files in their place.
@@ -5574,6 +5649,36 @@ impl TableWriteSession {
     /// [`DuckLakeTableWriter::begin_write`]).
     pub fn is_inlining(&self) -> bool {
         self.inline_buffer.is_some()
+    }
+
+    /// The bytes this session holds in memory: the rows it holds to inline,
+    /// and for each file it has open or finished and not yet uploaded, what
+    /// its writer and staging hold (a first row group being buffered, the row
+    /// group in progress, under [`Staging::Parts`] the bytes not yet sent as a
+    /// part, under [`Staging::Memory`] the whole file).
+    ///
+    /// What a caller charges to a memory pool after each write (ADR-0037 in
+    /// ferrion: one pool bounds a write's memory), and what falls as parts are
+    /// sent. Not counted: an upload already running on a tokio runtime, which
+    /// holds its file in its task.
+    pub fn memory_size(&self) -> usize {
+        let inline = self.inline_buffer.as_ref().map_or(0, |buffer| {
+            buffer
+                .batches
+                .iter()
+                .map(RecordBatch::get_array_memory_size)
+                .sum()
+        });
+        let single = self.writer.as_ref().map_or(0, open_file_memory_size);
+        let rolling = self
+            .roller
+            .as_ref()
+            .map_or(0, RollingFileWriter::memory_size);
+        let partitioned = self
+            .partition_sink
+            .as_ref()
+            .map_or(0, PartitionSink::memory_size);
+        inline + single + rolling + self.rolled.memory_size() + partitioned
     }
 
     /// Write the held rows to the Parquet output, once they exceed the limit

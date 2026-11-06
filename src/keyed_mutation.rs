@@ -519,7 +519,7 @@ impl<'a> KeyedMutation<'a> {
                 inline_capable: true,
                 inline_limit: context.inline_limit,
             },
-            updated_batches,
+            crate::update_exec::NewVersions::Held(updated_batches),
             superseded_positions,
             Vec::new(),
             superseded_inlined,

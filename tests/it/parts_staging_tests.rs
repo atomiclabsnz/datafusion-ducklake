@@ -64,6 +64,8 @@ struct PartsStore {
     parts: Arc<AtomicUsize>,
     opened: AtomicUsize,
     fault: Option<Fault>,
+    /// Every read: its path and how many parts had been sent when it began.
+    reads: Mutex<Vec<(String, usize)>>,
 }
 
 impl PartsStore {
@@ -74,6 +76,7 @@ impl PartsStore {
             parts: Arc::default(),
             opened: AtomicUsize::new(0),
             fault,
+            reads: Mutex::default(),
         }
     }
 
@@ -187,6 +190,11 @@ impl ObjectStore for PartsStore {
         location: &ObjectPath,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
+        let sent = parts_of(&self.events());
+        self.reads
+            .lock()
+            .unwrap()
+            .push((location.to_string(), sent));
         self.inner.get_opts(location, options).await
     }
 
@@ -370,6 +378,17 @@ impl Lake {
                     .collect()
             })
             .collect()
+    }
+
+    /// How many snapshots the catalog holds.
+    async fn snapshot_count(&self) -> i64 {
+        let pool = SqlitePool::connect(&url(&self.temp)).await.unwrap();
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM ducklake_snapshot")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        count
     }
 
     /// The live data files' paths, with the size the catalog records.
@@ -947,4 +966,724 @@ async fn a_dropped_session_aborts_its_open_upload_in_the_background() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+}
+
+// ---- ADR-0037 slice 3: SQL `INSERT` and `UPDATE` stream into their sessions ----
+
+/// A session context over `lake` through SQL: its catalog as `lake`, writing
+/// under `options(Parts)` (rolling small files, nothing inlined), its store the
+/// logging one; `pool` bounds the operators' memory when given.
+async fn sql_ctx(lake: &Lake, pool: Option<usize>) -> datafusion::prelude::SessionContext {
+    let mut runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new();
+    if let Some(bytes) = pool {
+        runtime = runtime.with_memory_limit(bytes, 1.0);
+    }
+    sql_ctx_on(lake, runtime).await
+}
+
+/// [`sql_ctx`] over the pool `runtime` gives.
+async fn sql_ctx_on(
+    lake: &Lake,
+    runtime: datafusion::execution::runtime_env::RuntimeEnvBuilder,
+) -> datafusion::prelude::SessionContext {
+    let url = url(&lake.temp);
+    let provider = datafusion_ducklake::SqliteMetadataProvider::new(&url)
+        .await
+        .unwrap();
+    let catalog =
+        datafusion_ducklake::DuckLakeCatalog::with_writer(Arc::new(provider), lake.writer.clone())
+            .unwrap()
+            .with_write_options(options(Staging::Parts {
+                part_bytes: PART_BYTES,
+            }));
+    // One partition, as a tab runs: above it a `RepartitionExec` would drain the
+    // source on a task of its own, ahead of the write.
+    let ctx = datafusion::prelude::SessionContext::new_with_config_rt(
+        datafusion::prelude::SessionConfig::new().with_target_partitions(1),
+        runtime.build_arc().unwrap(),
+    );
+    let store: Arc<dyn ObjectStore> = lake.store.clone();
+    ctx.runtime_env().register_object_store(
+        datafusion::execution::object_store::ObjectStoreUrl::local_filesystem().as_ref(),
+        store,
+    );
+    ctx.register_catalog("lake", Arc::new(catalog));
+    ctx
+}
+
+/// A source that yields `batches` one at a time and, as each is asked for,
+/// records how many parts the store had been sent; `fail_after` ends it with an
+/// error in place of that batch instead.
+#[derive(Debug)]
+struct Recorded {
+    batches: Vec<RecordBatch>,
+    store: Arc<PartsStore>,
+    seen: Arc<Mutex<Vec<usize>>>,
+    fail_after: Option<usize>,
+}
+
+impl datafusion::physical_plan::streaming::PartitionStream for Recorded {
+    fn schema(&self) -> &arrow::datatypes::SchemaRef {
+        self.batches[0].schema_ref()
+    }
+
+    fn execute(
+        &self,
+        _ctx: Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::execution::SendableRecordBatchStream {
+        use futures::StreamExt as _;
+        let store = Arc::clone(&self.store);
+        let seen = Arc::clone(&self.seen);
+        let fail_after = self.fail_after;
+        let batches = self
+            .batches
+            .clone()
+            .into_iter()
+            .enumerate()
+            .map(move |(i, batch)| {
+                seen.lock().unwrap().push(parts_of(&store.events()));
+                if fail_after == Some(i) {
+                    return Err(datafusion::error::DataFusionError::Execution(
+                        "the source failed mid-stream".into(),
+                    ));
+                }
+                Ok(batch)
+            });
+        Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                schema(),
+                futures::stream::iter(batches).boxed(),
+            ),
+        )
+    }
+}
+
+/// Register `src` over `batches(count)` in `ctx`, returning what it records.
+fn register_source(
+    ctx: &datafusion::prelude::SessionContext,
+    lake: &Lake,
+    count: i64,
+    fail_after: Option<usize>,
+) -> Arc<Mutex<Vec<usize>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let source = Recorded {
+        batches: batches(count),
+        store: Arc::clone(&lake.store),
+        seen: Arc::clone(&seen),
+        fail_after,
+    };
+    let table =
+        datafusion::catalog::streaming::StreamingTable::try_new(schema(), vec![Arc::new(source)])
+            .unwrap();
+    ctx.register_table("src", Arc::new(table)).unwrap();
+    seen
+}
+
+async fn run(
+    ctx: &datafusion::prelude::SessionContext,
+    sql: &str,
+) -> datafusion::error::Result<u64> {
+    let batches = ctx.sql(sql).await?.collect().await?;
+    Ok(batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt64Array>()
+        .unwrap()
+        .value(0))
+}
+
+/// The empty table `lake.main.t`, made through SQL.
+async fn empty_table(ctx: &datafusion::prelude::SessionContext) {
+    ctx.sql("CREATE TABLE lake.main.t (id BIGINT NOT NULL, name VARCHAR, v DOUBLE)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+}
+
+/// A SQL `INSERT … SELECT` into an unpartitioned, unsorted table streams its
+/// input into the write session: by the time the source is asked for its last
+/// batch, the earlier ones have gone out as parts. The catalog then holds what
+/// the collected path (`append_table`, which holds every row) writes for the same
+/// rows under the table's own write options, statistics included, and DuckDB
+/// reads it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sql_insert_streams_its_input_into_parts() {
+    let lake = Lake::new(None).await;
+    let ctx = sql_ctx(&lake, None).await;
+    empty_table(&ctx).await;
+    let seen = register_source(&ctx, &lake, 30, None);
+    assert_eq!(
+        run(&ctx, "INSERT INTO lake.main.t SELECT * FROM src")
+            .await
+            .unwrap(),
+        60_000
+    );
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 30, "{seen:?}");
+    assert!(seen[0] == 0, "nothing is written before the first batch");
+    assert!(
+        seen[29] >= 5,
+        "parts had gone out before the input's last batch: {seen:?}"
+    );
+    assert!(
+        seen.windows(2).all(|w| w[0] <= w[1]) && seen[15] > 0,
+        "the parts go out while the input is read: {seen:?}"
+    );
+    let events = lake.store.events();
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Abort(_))),
+        "{events:?}"
+    );
+
+    // The collected path, under the options a table of this schema writes with.
+    let collected = Lake::new(None).await;
+    let collected_ctx = sql_ctx(&collected, None).await;
+    empty_table(&collected_ctx).await;
+    let lake_schema = collected_ctx
+        .catalog("lake")
+        .unwrap()
+        .schema("main")
+        .unwrap();
+    let any: &dyn std::any::Any = lake_schema.as_ref();
+    let table_options = any
+        .downcast_ref::<datafusion_ducklake::DuckLakeSchema>()
+        .unwrap()
+        .new_table_write_options()
+        .unwrap();
+    let store: Arc<dyn ObjectStore> = collected.store.clone();
+    DuckLakeTableWriter::new(collected.writer.clone(), store)
+        .unwrap()
+        .with_options(&table_options)
+        .append_table("main", "t", &batches(30))
+        .await
+        .unwrap();
+    assert_eq!(lake.files().await.len(), collected.files().await.len());
+    assert_eq!(lake.catalog_stats().await, collected.catalog_stats().await);
+    assert_eq!(lake.duckdb_reads(), expected_reads(30));
+    assert_eq!(collected.duckdb_reads(), expected_reads(30));
+}
+
+/// An input that fails after some of its rows are written leaves nothing: the
+/// insert returns the input's error, every upload it opened is aborted or its
+/// object removed, no data file is in the catalog and no snapshot was made.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sql_insert_whose_input_fails_mid_stream_leaves_nothing() {
+    let lake = Lake::new(None).await;
+    let ctx = sql_ctx(&lake, None).await;
+    empty_table(&ctx).await;
+    let snapshots = lake.snapshot_count().await;
+    let seen = register_source(&ctx, &lake, 30, Some(20));
+    let error = run(&ctx, "INSERT INTO lake.main.t SELECT * FROM src")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("failed mid-stream"), "{error}");
+    assert!(
+        seen.lock().unwrap()[20] > 0,
+        "parts had gone out before the input failed"
+    );
+    let (opened, completed, aborted) = counts(&lake.store.events());
+    assert!(opened >= 2 && aborted >= 1, "{:?}", lake.store.events());
+    assert_eq!(opened, completed + aborted);
+    assert_eq!(lake.parquet_on_disk(), Vec::<std::path::PathBuf>::new());
+    assert!(lake.files().await.is_empty());
+    assert_eq!(lake.snapshot_count().await, snapshots);
+}
+
+/// What the insert's session holds is charged to the session's pool: past it
+/// the insert is refused as the pool's (`ResourcesExhausted`), and leaves
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sql_insert_past_the_pool_is_refused_and_leaves_nothing() {
+    let lake = Lake::new(None).await;
+    let ctx = sql_ctx(&lake, Some(8 * 1024)).await;
+    empty_table(&ctx).await;
+    register_source(&ctx, &lake, 30, None);
+    let error = run(&ctx, "INSERT INTO lake.main.t SELECT * FROM src")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.find_root(),
+            datafusion::error::DataFusionError::ResourcesExhausted(_)
+        ),
+        "{error}"
+    );
+    assert_eq!(lake.parquet_on_disk(), Vec::<std::path::PathBuf>::new());
+    assert!(lake.files().await.is_empty());
+}
+
+/// `lake.main.t` holding `batches(30)` through SQL, in several files.
+async fn seeded(fault: Option<Fault>) -> (Lake, datafusion::prelude::SessionContext) {
+    let lake = Lake::new(fault).await;
+    let ctx = sql_ctx(&lake, None).await;
+    empty_table(&ctx).await;
+    register_source(&ctx, &lake, 30, None);
+    run(&ctx, "INSERT INTO lake.main.t SELECT * FROM src")
+        .await
+        .unwrap();
+    // A fresh context, so the UPDATE plans at the head.
+    let ctx = sql_ctx(&lake, None).await;
+    (lake, ctx)
+}
+
+/// DuckDB's count, sum of ids, sum of rowids and min id.
+fn duckdb_rows(lake: &Lake) -> (i64, i64, i64, i64) {
+    let oracle = duckdb::Connection::open_in_memory().unwrap();
+    oracle
+        .execute_batch(&format!(
+            "LOAD ducklake; LOAD sqlite; \
+             ATTACH 'ducklake:sqlite:{}' AS lake (DATA_PATH '{}/', READ_ONLY);",
+            lake.catalog().display(),
+            lake.data().display()
+        ))
+        .unwrap();
+    oracle
+        .query_row(
+            "SELECT count(*), sum(id)::BIGINT, sum(rowid)::BIGINT, min(id) FROM lake.main.t",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+}
+
+/// An `UPDATE` of every row streams its new versions into its session: its
+/// last source file is read only after parts of the new files have gone out.
+/// Every row keeps its row id and DuckDB reads the new values.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sql_update_streams_its_new_versions_into_parts() {
+    let (lake, ctx) = seeded(None).await;
+    let sources: Vec<String> = lake
+        .files()
+        .await
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert!(sources.len() >= 3, "{sources:?}");
+    let (rows, ids, rowids, _) = duckdb_rows(&lake);
+    let parts_before = parts_of(&lake.store.events());
+    lake.store.reads.lock().unwrap().clear();
+
+    assert_eq!(
+        run(&ctx, "UPDATE lake.main.t SET id = id + 100000")
+            .await
+            .unwrap(),
+        60_000
+    );
+
+    let reads = lake.store.reads.lock().unwrap().clone();
+    let last_source = sources.last().unwrap();
+    let last_read = reads
+        .iter()
+        .filter(|(path, _)| path.ends_with(last_source.as_str()))
+        .map(|(_, sent)| *sent)
+        .max()
+        .unwrap_or_else(|| panic!("{last_source} is read: {reads:?}"));
+    assert!(
+        last_read > parts_before,
+        "new versions went out before the last source file was read: \
+         {parts_before} parts before the update, {reads:?}"
+    );
+    assert_eq!(
+        duckdb_rows(&lake),
+        (rows, ids + 100_000 * rows, rowids, 100_000),
+        "every row updated, its row id kept"
+    );
+}
+
+/// An `UPDATE` that fails mid-stream, after parts of its new file went out (a NULL into
+/// the NOT NULL `id`, met in a late batch), leaves the table as it was: no snapshot, the
+/// upload it opened aborted, only the files it started from. (A refused part aborts its
+/// own upload; this is the failure the session's own abort is for.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sql_update_that_fails_mid_stream_leaves_the_table_as_it_was() {
+    let (lake, ctx) = seeded(None).await;
+    let files = lake.files().await;
+    let on_disk = lake.parquet_on_disk().len();
+    let snapshots = lake.snapshot_count().await;
+    let seed_parts = parts_of(&lake.store.events());
+    let before = duckdb_rows(&lake);
+    let error = run(
+        &ctx,
+        "UPDATE lake.main.t SET id = CASE WHEN id > 50000 THEN NULL ELSE id + 100000 END",
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().to_lowercase().contains("null"), "{error}");
+    let events = lake.store.events();
+    assert!(
+        parts_of(&events) > seed_parts,
+        "the update sent parts before it failed: {events:?}"
+    );
+    let (opened, completed, aborted) = counts(&events);
+    assert!(aborted >= 1, "the update's upload is aborted: {events:?}");
+    assert_eq!(opened, completed + aborted, "{events:?}");
+    assert_eq!(lake.files().await, files);
+    assert_eq!(lake.parquet_on_disk().len(), on_disk);
+    assert_eq!(lake.snapshot_count().await, snapshots);
+    assert_eq!(duckdb_rows(&lake), before);
+}
+
+/// What an `UPDATE` holds is charged to its pool: the new versions' session and
+/// the superseded positions it keeps for the deletes (8 bytes a row). Past the
+/// pool it is refused as the pool's (`ResourcesExhausted`), and leaves the table
+/// as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sql_update_past_the_pool_is_refused_and_leaves_the_table_as_it_was() {
+    let (lake, _) = seeded(None).await;
+    let files = lake.files().await;
+    let snapshots = lake.snapshot_count().await;
+    let before = duckdb_rows(&lake);
+    // 60,000 positions are 480,000 bytes: past this pool, which the session's
+    // own row group and unsent part fit in.
+    let ctx = sql_ctx(&lake, Some(POSITIONS_POOL)).await;
+    let error = run(&ctx, "UPDATE lake.main.t SET id = id + 100000")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.find_root(),
+            datafusion::error::DataFusionError::ResourcesExhausted(_)
+        ),
+        "{error}"
+    );
+    let (opened, completed, aborted) = counts(&lake.store.events());
+    assert_eq!(opened, completed + aborted);
+    assert_eq!(lake.files().await, files);
+    assert_eq!(lake.snapshot_count().await, snapshots);
+    assert_eq!(duckdb_rows(&lake), before);
+}
+
+const POSITIONS_POOL: usize = 400 * 1024;
+
+// ---- #34 review round 1 ----
+
+/// A memory pool that refuses nothing and records, per consumer name, what is
+/// reserved now and at its peak; and, each time a consumer named `watched`
+/// grows, what every consumer held at that moment.
+#[derive(Debug, Default)]
+struct Tracking {
+    state: Mutex<TrackingState>,
+}
+
+#[derive(Debug, Default)]
+struct TrackingState {
+    now: std::collections::HashMap<String, usize>,
+    peak: std::collections::HashMap<String, usize>,
+    watched: Vec<std::collections::HashMap<String, usize>>,
+}
+
+const WATCHED: &str = "DuckLakeUpdateExec deletes";
+
+impl Tracking {
+    fn change(&self, name: &str, grow: usize, shrink: usize) {
+        let mut state = self.state.lock().unwrap();
+        let now = state.now.entry(name.to_string()).or_default();
+        *now = *now + grow - shrink;
+        let value = *now;
+        let peak = state.peak.entry(name.to_string()).or_default();
+        *peak = (*peak).max(value);
+        if grow > 0 && name == WATCHED {
+            let snapshot = state.now.clone();
+            state.watched.push(snapshot);
+        }
+    }
+
+    fn peak(&self, name: &str) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .peak
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+impl std::fmt::Display for Tracking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tracking")
+    }
+}
+
+impl datafusion::execution::memory_pool::MemoryPool for Tracking {
+    fn name(&self) -> &str {
+        "tracking"
+    }
+
+    fn grow(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        additional: usize,
+    ) {
+        self.change(reservation.consumer().name(), additional, 0);
+    }
+
+    fn shrink(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        shrink: usize,
+    ) {
+        self.change(reservation.consumer().name(), 0, shrink);
+    }
+
+    fn try_grow(
+        &self,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        additional: usize,
+    ) -> datafusion::error::Result<()> {
+        self.change(reservation.consumer().name(), additional, 0);
+        Ok(())
+    }
+
+    fn reserved(&self) -> usize {
+        self.state.lock().unwrap().now.values().sum()
+    }
+}
+
+/// An UPDATE's charge covers what it holds, and holds until its commit: the
+/// superseded positions are charged at least their bytes (by capacity, with
+/// a growth's two allocations), and when the commit's delete working set is
+/// charged, at least the largest delete file's positions, path column and
+/// copies, the positions and the new versions' session are still charged.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_charges_what_it_holds_until_its_commit() {
+    let (lake, _) = seeded(None).await;
+    let pool = Arc::new(Tracking::default());
+    let ctx = sql_ctx_on(
+        &lake,
+        datafusion::execution::runtime_env::RuntimeEnvBuilder::new().with_memory_pool(pool.clone()),
+    )
+    .await;
+    assert_eq!(
+        run(
+            &ctx,
+            "UPDATE lake.main.t SET id = id + 100000 WHERE id % 2 = 0"
+        )
+        .await
+        .unwrap(),
+        30_000
+    );
+    let pool_db = SqlitePool::connect(&url(&lake.temp)).await.unwrap();
+    let (largest,): (i64,) = sqlx::query_as(
+        "SELECT max(delete_count) FROM ducklake_delete_file WHERE end_snapshot IS NULL",
+    )
+    .fetch_one(&pool_db)
+    .await
+    .unwrap();
+    let (path,): (i64,) = sqlx::query_as(
+        "SELECT max(length(path)) FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .fetch_one(&pool_db)
+    .await
+    .unwrap();
+    pool_db.close().await;
+    assert!(largest >= 5_000, "a delete file per source file: {largest}");
+    let held = 30_000 * 8;
+    // More than their bytes: a vector's capacity, and while it grows, both of
+    // its allocations (by doubling, the last growth of the last file alone is
+    // half again its positions).
+    assert!(
+        pool.peak("DuckLakeUpdateExec positions") >= held * 5 / 4,
+        "positions charged {} for {held} bytes of them",
+        pool.peak("DuckLakeUpdateExec positions")
+    );
+    // The batch a delete file is written from: the positions copied twice
+    // (the column, the info), their snapshots, a path a row.
+    let deletes = largest as usize * (3 * 8 + path as usize);
+    assert!(
+        pool.peak(WATCHED) >= deletes,
+        "the commit's deletes charged {} for at least {deletes}",
+        pool.peak(WATCHED)
+    );
+    let state = pool.state.lock().unwrap();
+    let at_commit = state
+        .watched
+        .first()
+        .expect("the commit charged its deletes");
+    assert!(
+        at_commit
+            .get("DuckLakeUpdateExec positions")
+            .copied()
+            .unwrap_or(0)
+            >= held,
+        "positions still charged at the commit: {at_commit:?}"
+    );
+    assert!(
+        at_commit.get("DuckLakeUpdateExec").copied().unwrap_or(0) > 0,
+        "the session still charged at the commit: {at_commit:?}"
+    );
+}
+
+/// An UPDATE of every row drops each source file and writes no delete file, so
+/// its commit charges nothing for deletes (#744 round 1). Charging a delete file
+/// it never makes (the path a row) refused a 256 MiB UPDATE of every row in a
+/// tab, holding 103 MiB, for a 490 MB working set.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_of_every_row_charges_no_delete_file() {
+    let (lake, _) = seeded(None).await;
+    let pool = Arc::new(Tracking::default());
+    let ctx = sql_ctx_on(
+        &lake,
+        datafusion::execution::runtime_env::RuntimeEnvBuilder::new().with_memory_pool(pool.clone()),
+    )
+    .await;
+    assert_eq!(
+        run(&ctx, "UPDATE lake.main.t SET id = id + 100000")
+            .await
+            .unwrap(),
+        60_000
+    );
+    let pool_db = SqlitePool::connect(&url(&lake.temp)).await.unwrap();
+    let (delete_files,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM ducklake_delete_file WHERE end_snapshot IS NULL")
+            .fetch_one(&pool_db)
+            .await
+            .unwrap();
+    pool_db.close().await;
+    assert_eq!(
+        delete_files, 0,
+        "every source file is dropped, none gets a delete file"
+    );
+    assert_eq!(
+        pool.peak(WATCHED),
+        0,
+        "the commit charged {} for delete files it does not write",
+        pool.peak(WATCHED)
+    );
+    assert!(
+        pool.peak("DuckLakeUpdateExec positions") >= 60_000 * 8,
+        "the positions are still charged: {}",
+        pool.peak("DuckLakeUpdateExec positions")
+    );
+}
+
+/// A partitioned table's INSERT still collects its input, and charges it to
+/// the pool as a streamed one charges its session: past the pool it is refused
+/// (`ResourcesExhausted`), and the table is left as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partitioned_sql_insert_past_the_pool_is_refused_and_leaves_nothing() {
+    let lake = Lake::new(None).await;
+    let created = lake
+        .table_writer(Staging::Memory)
+        .create_table("main", "pt", &partitioned_batches(1)[..1])
+        .await
+        .unwrap();
+    lake.writer
+        .set_partition_spec(
+            created.table_id,
+            &[("p".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let files = lake.files().await;
+    let snapshots = lake.snapshot_count().await;
+    let ctx = sql_ctx(&lake, Some(64 * 1024)).await;
+    let source = datafusion::datasource::MemTable::try_new(
+        partitioned_schema(),
+        vec![partitioned_batches(20)],
+    )
+    .unwrap();
+    ctx.register_table("src", Arc::new(source)).unwrap();
+    let error = run(&ctx, "INSERT INTO lake.main.pt SELECT * FROM src")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.find_root(),
+            datafusion::error::DataFusionError::ResourcesExhausted(_)
+        ),
+        "{error}"
+    );
+    assert_eq!(lake.files().await, files);
+    assert_eq!(lake.snapshot_count().await, snapshots);
+}
+
+/// An insert plan built through `DuckLakeInsertExec::new` alone, which says
+/// nothing of the table's sort order, does not stream: the writer finds the
+/// table's `SET SORTED BY` and lays the rows out sorted, as `write_rows` does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_insert_built_through_new_into_a_sorted_table_is_sorted() {
+    use datafusion_ducklake::sort::{NullOrder, SortDirection, SortField};
+    let lake = Lake::new(None).await;
+    let created = lake
+        .table_writer(Staging::Memory)
+        .create_table("main", "t", &batches(1)[..1])
+        .await
+        .unwrap();
+    lake.writer
+        .set_sort_spec(
+            created.table_id,
+            &[SortField::column(0, "id", SortDirection::Asc, NullOrder::NullsLast)],
+        )
+        .unwrap();
+    // Three batches in descending id order, each ascending within: ids
+    // 100,000.. down to 104,000.. .
+    let input: Vec<RecordBatch> = batches(3)
+        .into_iter()
+        .rev()
+        .map(|batch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .map(|id| id.unwrap() + 100_000)
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::clone(batch.column(1)),
+                    Arc::clone(batch.column(2)),
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+    let source =
+        datafusion::datasource::memory::MemorySourceConfig::try_new_exec(&[input], schema(), None)
+            .unwrap();
+    let insert = datafusion_ducklake::DuckLakeInsertExec::new(
+        source,
+        lake.writer.clone(),
+        "main".to_string(),
+        "t".to_string(),
+        schema(),
+        WriteMode::Append,
+        Arc::new(datafusion::execution::object_store::ObjectStoreUrl::local_filesystem()),
+        None,
+        options(Staging::Parts {
+            part_bytes: PART_BYTES,
+        }),
+        None,
+    );
+    let ctx = sql_ctx(&lake, None).await;
+    datafusion::physical_plan::collect(Arc::new(insert), ctx.task_ctx())
+        .await
+        .unwrap();
+    let oracle = duckdb::Connection::open_in_memory().unwrap();
+    oracle
+        .execute_batch(&format!(
+            "LOAD ducklake; LOAD sqlite; \
+             ATTACH 'ducklake:sqlite:{}' AS lake (DATA_PATH '{}/', READ_ONLY);",
+            lake.catalog().display(),
+            lake.data().display()
+        ))
+        .unwrap();
+    let mut statement = oracle
+        .prepare("SELECT id FROM lake.main.t WHERE id >= 100000 ORDER BY rowid")
+        .unwrap();
+    let ids: Vec<i64> = statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(ids.len(), 6_000);
+    assert!(
+        ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "laid out in the table's sort order, not as they came: starts {:?}",
+        &ids[..3]
+    );
 }

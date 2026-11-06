@@ -1,8 +1,13 @@
 //! DuckLake INSERT execution plan.
 //!
-//! Limitations:
-//! - Collects all batches into memory before writing (no streaming yet)
-//! - Single partition only (partition 0)
+//! An unpartitioned table whose rows the plan orders (or that has no sort
+//! order) streams its input into a write session, batch by batch: the session
+//! holds the first `data_inlining_row_limit` rows to inline, and past them writes
+//! Parquet that goes out as it is encoded (ADR-0037 in ferrion). A partitioned
+//! table, and one the writer itself must sort, still collect the input first:
+//! the rows are split or sorted as a whole.
+//!
+//! Single partition only (partition 0).
 
 use std::fmt::{self, Debug};
 use std::sync::Arc;
@@ -17,7 +22,7 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-use futures::stream::{self, TryStreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 
 use crate::metadata_writer::{MetadataWriter, WriteMode};
 use crate::table_writer::DuckLakeTableWriter;
@@ -64,6 +69,11 @@ pub struct DuckLakeInsertExec {
     /// lays the rows out under, as official reads it once, in `PlanInsert`.
     /// `None` when the plan read none, and the writer reads it.
     planned_sort_on_insert: Option<bool>,
+    /// Set when the statement was planned against a table with no sort order:
+    /// the one case, beside a plan that sorted the rows, in which the rows may
+    /// stream into the writer. Unset (a plan built through [`Self::new`]
+    /// alone) collects them, so the writer can apply a sort order it finds.
+    planned_no_sort_order: bool,
     cache: Arc<PlanProperties>,
 }
 
@@ -96,6 +106,7 @@ impl DuckLakeInsertExec {
             required_ordering,
             planned_snapshot: None,
             planned_sort_on_insert: None,
+            planned_no_sort_order: false,
             cache,
         }
     }
@@ -109,6 +120,13 @@ impl DuckLakeInsertExec {
     /// planned with, rather than reading it again at execution.
     pub(crate) fn with_planned_sort_on_insert(mut self, sort_on_insert: Option<bool>) -> Self {
         self.planned_sort_on_insert = sort_on_insert;
+        self
+    }
+
+    /// The statement was planned against a table with no sort order, so its rows
+    /// may stream into the writer.
+    pub(crate) fn with_planned_no_sort_order(mut self, no_sort_order: bool) -> Self {
+        self.planned_no_sort_order = no_sort_order;
         self
     }
 
@@ -221,7 +239,8 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 self.required_ordering.clone(),
             )
             .with_planned_snapshot_opt(self.planned_snapshot)
-            .with_planned_sort_on_insert(self.planned_sort_on_insert),
+            .with_planned_sort_on_insert(self.planned_sort_on_insert)
+            .with_planned_no_sort_order(self.planned_no_sort_order),
         ))
     }
 
@@ -253,11 +272,84 @@ impl ExecutionPlan for DuckLakeInsertExec {
             sort_on_insert: self.planned_sort_on_insert,
             sorted: self.required_ordering.is_some(),
         };
+        // The rows stream when nothing needs them whole: no partition spec to
+        // split them by, and no sort the writer must make. Known, not assumed:
+        // the plan sorted them, or the statement was planned against a table
+        // with no sort order. Anything else (a plan built through `new` alone)
+        // collects them, and the writer applies whatever sort order it finds.
+        let unsorted = sort_plan.sorted || self.planned_no_sort_order;
+        let streams = partition.is_none() && unsorted;
+        // What the collected path holds: the input, and for a split or a sort
+        // a second copy of it.
+        let copies = if partition.is_some() || !unsorted {
+            2
+        } else {
+            1
+        };
         let output_schema = make_insert_count_schema();
 
         let stream = stream::once(async move {
-            let input_stream = input.execute(0, Arc::clone(&context))?;
-            let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+            // An encrypted catalog takes no Parquet this crate writes, so its
+            // insert is decided on the whole input (inlined, or refused): a
+            // session would refuse it at its start, rows it could inline too.
+            let streams = streams
+                && !writer
+                    .catalog_encrypted()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let mut input_stream = input.execute(0, Arc::clone(&context))?;
+            let collected =
+                datafusion::execution::memory_pool::MemoryConsumer::new("DuckLakeInsertExec")
+                    .register(context.memory_pool());
+            let batches: Vec<RecordBatch> = if streams {
+                // Up to the first batch with rows: an input of none is answered
+                // below as before.
+                let mut first = None;
+                while let Some(batch) = input_stream.next().await {
+                    let batch = batch?;
+                    if batch.num_rows() > 0 {
+                        first = Some(batch);
+                        break;
+                    }
+                }
+                match first {
+                    Some(first) => {
+                        // Boxed: a write session is kilobytes, and this future is
+                        // built on the stack of whoever executes the plan.
+                        let rows = Box::pin(insert_streamed(
+                            StreamedInsert {
+                                writer,
+                                object_store: context
+                                    .runtime_env()
+                                    .object_store(object_store_url.as_ref())?,
+                                write_options: &write_options,
+                                planned_snapshot,
+                                schema_name: &schema_name,
+                                table_name: &table_name,
+                                arrow_schema: &arrow_schema,
+                                write_mode,
+                            },
+                            first,
+                            input_stream,
+                            context.memory_pool(),
+                        ))
+                        .await?;
+                        let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![rows]));
+                        return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
+                    },
+                    None => Vec::new(),
+                }
+            } else {
+                // Charged to the pool, as the streamed path's session is, so an
+                // input past the pool is refused (`ResourcesExhausted`) rather
+                // than outgrowing it; held until the write is done.
+                let mut batches = Vec::new();
+                while let Some(batch) = input_stream.next().await {
+                    let batch = batch?;
+                    collected.try_grow(batch.get_array_memory_size() * copies)?;
+                    batches.push(batch);
+                }
+                batches
+            };
 
             // An empty input is a genuine no-op only for Append. For
             // Replace/Overwrite we must still run the write session so the prior
@@ -381,6 +473,95 @@ impl ExecutionPlan for DuckLakeInsertExec {
             stream.map_err(|e: DataFusionError| e),
         )))
     }
+}
+
+/// Where a streamed insert writes: the table and how its writer is set up.
+struct StreamedInsert<'a> {
+    writer: Arc<dyn MetadataWriter>,
+    object_store: Arc<dyn object_store::ObjectStore>,
+    write_options: &'a crate::table_writer::DuckLakeWriteOptions,
+    planned_snapshot: Option<i64>,
+    schema_name: &'a str,
+    table_name: &'a str,
+    arrow_schema: &'a SchemaRef,
+    write_mode: WriteMode,
+}
+
+/// Begin the write session of `target` (refusing a partition spec gone live
+/// since planning, as the collected path does) and stream `first` and `rest`
+/// into it ([`stream_into`]): the rows written.
+async fn insert_streamed(
+    target: StreamedInsert<'_>,
+    first: RecordBatch,
+    rest: SendableRecordBatchStream,
+    pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+) -> DataFusionResult<u64> {
+    let mut table_writer = DuckLakeTableWriter::new(target.writer, target.object_store)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .with_options(target.write_options);
+    if let Some(snapshot_id) = target.planned_snapshot {
+        table_writer = table_writer.with_planned_base_snapshot(snapshot_id);
+    }
+    let schema_without_metadata = Schema::new(
+        target
+            .arrow_schema
+            .fields()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let session = table_writer
+        .begin_write_unpartitioned_as_planned(
+            target.schema_name,
+            target.table_name,
+            &schema_without_metadata,
+            target.write_mode,
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    Box::pin(stream_into(session, first, rest, pool)).await
+}
+
+/// Write `first`, then every batch `rest` yields, into `session` as each
+/// arrives, and commit: the rows written. What the session holds in memory
+/// ([`TableWriteSession::memory_size`](crate::TableWriteSession::memory_size))
+/// is charged to `pool` after each batch, the pool the plan's operators use,
+/// so one pool bounds the write: past it the write is refused
+/// (`ResourcesExhausted`) rather than outgrowing it. A failure of the input,
+/// of the write or of the charge aborts the session, which removes what it
+/// uploaded and leaves no catalog row, and is returned as it was met.
+pub(crate) async fn stream_into(
+    mut session: crate::table_writer::TableWriteSession,
+    first: RecordBatch,
+    mut rest: SendableRecordBatchStream,
+    pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+) -> DataFusionResult<u64> {
+    let held = datafusion::execution::memory_pool::MemoryConsumer::new("DuckLakeInsertExec")
+        .register(pool);
+    let mut next = Some(Ok(first));
+    while let Some(batch) = next {
+        let written = match batch {
+            // Each of the session's futures boxed, so none sits in this one's
+            // state or in its caller's stack frame (a debug build's futures are
+            // large, and a plan is executed deep in its caller's stack).
+            Ok(batch) => match Box::pin(session.write_batch_async(&batch)).await {
+                Ok(()) => held.try_resize(session.memory_size()),
+                Err(e) => Err(DataFusionError::External(Box::new(e))),
+            },
+            Err(e) => Err(e),
+        };
+        if let Err(e) = written {
+            if let Err(abort) = Box::pin(session.abort()).await {
+                tracing::warn!(error = %abort, "failed to abort an insert's write session");
+            }
+            return Err(e);
+        }
+        next = rest.next().await;
+    }
+    let rows = session.row_count() as u64;
+    Box::pin(session.finish())
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    Ok(rows)
 }
 
 #[cfg(test)]

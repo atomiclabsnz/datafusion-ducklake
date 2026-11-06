@@ -157,6 +157,21 @@ impl DuckLakeSchema {
 }
 
 impl DuckLakeSchema {
+    /// The write options a table created in this schema writes with, as this
+    /// schema's own `CREATE TABLE … AS` and each table's `INSERT` take them: the
+    /// stored settings (schema, then catalog-wide), with the catalog's
+    /// [`DuckLakeCatalog::with_write_options`](crate::DuckLakeCatalog::with_write_options)
+    /// over them, as each table's own options are laid. For a caller that
+    /// writes a new table through a [`DuckLakeTableWriter`](crate::DuckLakeTableWriter)
+    /// of its own, so its files take the lake's `target_file_size`, row groups
+    /// and compression rather than the writer's defaults.
+    #[cfg(feature = "write")]
+    pub fn new_table_write_options(
+        &self,
+    ) -> DataFusionResult<crate::table_writer::DuckLakeWriteOptions> {
+        self.table_write_options(None)
+    }
+
     /// The write options of table `table_id` of this schema (or of a new
     /// table, for `None`): its stored settings with the catalog's
     /// [`DuckLakeCatalog::with_write_options`](crate::DuckLakeCatalog::with_write_options)
