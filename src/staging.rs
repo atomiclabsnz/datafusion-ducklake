@@ -15,11 +15,14 @@
 //! into a buffer, and once the buffer holds a part, an async caller
 //! ([`StageWriter::put_full_parts`], reached through `write_batch_async`) awaits
 //! [`MultipartUpload::put_part`] for it inline. The footer goes as the last part,
-//! and `complete` makes the object. An open file then costs about one row group's
-//! encoded pages plus one part, however large the file. It is the default on
-//! `wasm32`. A file smaller than one part is never opened as an upload and goes
-//! out in one `put`. The file's statistics come from the `ParquetMetaData` the
-//! writer returns, since its bytes are gone by the time it is finished.
+//! and `complete` makes the object. An open file then holds at most one flushed
+//! row group (until its parts are sent), the row group in progress and under one
+//! part, however large the file. It is the default on `wasm32`. A file of which
+//! no part was sent before its footer (one below a part, one written through the
+//! synchronous `write_batch`, one whose only row group closes at its finish) is
+//! never opened as an upload and goes out in one `put`, at any size. The file's
+//! statistics come from the `ParquetMetaData` the writer returns whenever there is
+//! one, since a sent file's bytes are gone by the time it is finished.
 //!
 //! Neither in-memory staging spawns a task: `object_store`'s own multipart writer
 //! (`WriteMultipart`) spawns one per part, and a browser has no tokio runtime to
@@ -103,7 +106,7 @@ pub(crate) enum StageWriter {
 pub(crate) struct PartsSink {
     buffer: Vec<u8>,
     part_bytes: usize,
-    /// Opened by the first part sent; `None` while the file is below one part.
+    /// Opened by the first part sent; `None` until a part is sent.
     upload: Option<Box<dyn MultipartUpload>>,
     /// Bytes sent in parts so far.
     sent: u64,

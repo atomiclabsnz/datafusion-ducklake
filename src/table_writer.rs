@@ -907,8 +907,9 @@ impl DuckLakeTableWriter {
     /// default where there is a filesystem), in memory ([`Staging::Memory`]), or
     /// send it out in parts as it is encoded ([`Staging::Parts`], the default on
     /// `wasm32`). Memory staging holds up to `target_file_size` bytes per file in
-    /// flight; parts staging about a row group and a part, for a caller that
-    /// writes through `write_batch_async`; see [`crate::staging`].
+    /// flight; parts staging at most a flushed row group, the row group in
+    /// progress and under a part, for a caller that writes through
+    /// `write_batch_async`; see [`crate::staging`].
     #[must_use]
     pub fn with_staging(mut self, staging: Staging) -> Self {
         self.staging = staging;
@@ -5720,8 +5721,9 @@ impl TableWriteSession {
     /// uploads its one file at `finish`.
     ///
     /// Under [`Staging::Parts`] it also sends each open file's encoded bytes, a
-    /// part at a time, to that file's multipart upload, so an open file holds
-    /// about a row group and a part rather than the whole file; a single-file
+    /// part at a time, to that file's multipart upload, so an open file holds at
+    /// most a flushed row group, the row group in progress and under a part rather
+    /// than the whole file; a single-file
     /// session's file goes out the same way. A failed part aborts its upload; the
     /// session must then be dropped or [aborted](Self::abort).
     pub async fn write_batch_async(&mut self, batch: &RecordBatch) -> Result<()> {
