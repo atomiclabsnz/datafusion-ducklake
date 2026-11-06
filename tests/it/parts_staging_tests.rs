@@ -17,12 +17,12 @@ use arrow::record_batch::RecordBatch;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::{MultipartUpload, ObjectStore, PutPayload, UploadPart};
+use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
-    DuckLakeTableWriter, DuckLakeWriteOptions, MetadataWriter, SqliteMetadataWriter, Staging,
-    WriteMode,
+    DuckLakeTableWriter, DuckLakeWriteOptions, SqliteMetadataWriter, Staging, WriteMode,
 };
 
 /// Parts this small make a file of a few hundred KiB go out in many of them.
@@ -335,46 +335,40 @@ impl Lake {
     /// order: what a reader prunes by.
     async fn catalog_stats(&self) -> Vec<Vec<Option<String>>> {
         let pool = SqlitePool::connect(&url(&self.temp)).await.unwrap();
-        let rows: Vec<(
-            i64,
-            i64,
-            Option<i64>,
-            i64,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-        )> = sqlx::query_as(
-            "SELECT f.record_count, f.file_size_bytes, f.footer_size, s.column_id, \
-                        s.column_size_bytes, s.value_count, s.null_count, s.min_value, \
-                        s.max_value, s.contains_nan, s.extra_stats \
-                 FROM ducklake_data_file f \
-                 JOIN ducklake_file_column_stats s USING (data_file_id) \
-                 WHERE f.end_snapshot IS NULL \
-                 ORDER BY f.data_file_id, s.column_id",
-        )
+        let columns = [
+            "f.record_count",
+            "f.file_size_bytes",
+            "f.footer_size",
+            "s.column_id",
+            "s.column_size_bytes",
+            "s.value_count",
+            "s.null_count",
+            "s.min_value",
+            "s.max_value",
+            "s.contains_nan",
+            "s.extra_stats",
+        ];
+        let select: Vec<String> = columns
+            .iter()
+            .map(|c| format!("CAST({c} AS TEXT)"))
+            .collect();
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {} \
+             FROM ducklake_data_file f \
+             JOIN ducklake_file_column_stats s USING (data_file_id) \
+             WHERE f.end_snapshot IS NULL \
+             ORDER BY f.data_file_id, s.column_id",
+            select.join(", ")
+        )))
         .fetch_all(&pool)
         .await
         .unwrap();
         pool.close().await;
-        rows.into_iter()
-            .map(|r| {
-                vec![
-                    Some(r.0.to_string()),
-                    Some(r.1.to_string()),
-                    r.2.map(|v| v.to_string()),
-                    Some(r.3.to_string()),
-                    r.4.map(|v| v.to_string()),
-                    r.5.map(|v| v.to_string()),
-                    r.6.map(|v| v.to_string()),
-                    r.7,
-                    r.8,
-                    r.9.map(|v| v.to_string()),
-                    r.10,
-                ]
+        rows.iter()
+            .map(|row| {
+                (0..columns.len())
+                    .map(|i| row.get::<Option<String>, _>(i))
+                    .collect()
             })
             .collect()
     }
