@@ -230,17 +230,47 @@ fn closed() -> crate::error::DuckLakeError {
 /// Bytes `batch`'s buffers hold for its own rows. A slice of a larger batch counts
 /// only its share, where [`RecordBatch::get_array_memory_size`] would count the
 /// whole parent allocation.
+///
+/// Except a column holding a view type (`Utf8View`, `BinaryView`, at any depth):
+/// arrow's slice size counts its 16-byte views and not the data buffers its
+/// strings longer than 12 bytes live in, so a batch of long strings read as a
+/// few bytes a row. Its whole allocation is counted instead, which for a slice
+/// over-counts rather than missing the data.
 fn sliced_memory_size(batch: &RecordBatch) -> usize {
     batch
         .columns()
         .iter()
         .map(|column| {
+            if holds_views(column.data_type()) {
+                return column.get_array_memory_size();
+            }
             column
                 .to_data()
                 .get_slice_memory_size()
                 .unwrap_or_else(|_| column.get_array_memory_size())
         })
         .sum()
+}
+
+/// Whether `data_type` is, or nests, a view type whose data lives in variadic
+/// buffers.
+fn holds_views(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8View | DataType::BinaryView => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::Map(field, _) => holds_views(field.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|field| holds_views(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| holds_views(field.data_type())),
+        DataType::Dictionary(_, value) => holds_views(value),
+        DataType::RunEndEncoded(_, values) => holds_views(values.data_type()),
+        _ => false,
+    }
 }
 
 /// A parquet writer that buffers its file's first row group before opening, so
@@ -502,6 +532,28 @@ mod tests {
         let parent = batch(0, 20_000);
         let slice = parent.slice(0, 1_000);
         assert!(sliced_memory_size(&slice) * 10 < parent.get_array_memory_size());
+    }
+
+    /// A batch of long strings in a view column counts their bytes, not only its
+    /// 16-byte views (what arrow's slice size counts for a view type).
+    #[test]
+    fn a_view_column_counts_its_strings() {
+        let long: Vec<String> = (0..1000).map(|i| format!("{i:0>200}")).collect();
+        let column = arrow::array::StringViewArray::from_iter_values(long.iter());
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "s",
+                DataType::Utf8View,
+                false,
+            )])),
+            vec![Arc::new(column)],
+        )
+        .unwrap();
+        assert!(
+            sliced_memory_size(&batch) >= 1000 * 200,
+            "{} bytes for 200,000 bytes of strings",
+            sliced_memory_size(&batch)
+        );
     }
 
     #[test]
