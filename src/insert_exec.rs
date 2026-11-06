@@ -287,27 +287,26 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 }
                 match first {
                     Some(first) => {
-                        let object_store = context
-                            .runtime_env()
-                            .object_store(object_store_url.as_ref())?;
-                        let mut table_writer = DuckLakeTableWriter::new(writer, object_store)
-                            .map_err(|e| DataFusionError::External(Box::new(e)))?
-                            .with_options(&write_options);
-                        if let Some(snapshot_id) = planned_snapshot {
-                            table_writer = table_writer.with_planned_base_snapshot(snapshot_id);
-                        }
-                        let schema_without_metadata =
-                            Schema::new(arrow_schema.fields().iter().cloned().collect::<Vec<_>>());
-                        let session = table_writer
-                            .begin_write_unpartitioned_as_planned(
-                                &schema_name,
-                                &table_name,
-                                &schema_without_metadata,
+                        // Boxed: a write session is kilobytes, and this future is
+                        // built on the stack of whoever executes the plan.
+                        let rows = Box::pin(insert_streamed(
+                            StreamedInsert {
+                                writer,
+                                object_store: context
+                                    .runtime_env()
+                                    .object_store(object_store_url.as_ref())?,
+                                write_options: &write_options,
+                                planned_snapshot,
+                                schema_name: &schema_name,
+                                table_name: &table_name,
+                                arrow_schema: &arrow_schema,
                                 write_mode,
-                            )
-                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                        let rows = stream_into(session, first, input_stream, context.memory_pool())
-                            .await?;
+                            },
+                            first,
+                            input_stream,
+                            context.memory_pool(),
+                        ))
+                        .await?;
                         let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![rows]));
                         return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
                     },
@@ -441,6 +440,52 @@ impl ExecutionPlan for DuckLakeInsertExec {
     }
 }
 
+/// Where a streamed insert writes: the table and how its writer is set up.
+struct StreamedInsert<'a> {
+    writer: Arc<dyn MetadataWriter>,
+    object_store: Arc<dyn object_store::ObjectStore>,
+    write_options: &'a crate::table_writer::DuckLakeWriteOptions,
+    planned_snapshot: Option<i64>,
+    schema_name: &'a str,
+    table_name: &'a str,
+    arrow_schema: &'a SchemaRef,
+    write_mode: WriteMode,
+}
+
+/// Begin the write session of `target` (refusing a partition spec gone live
+/// since planning, as the collected path does) and stream `first` and `rest`
+/// into it ([`stream_into`]): the rows written.
+async fn insert_streamed(
+    target: StreamedInsert<'_>,
+    first: RecordBatch,
+    rest: SendableRecordBatchStream,
+    pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+) -> DataFusionResult<u64> {
+    let mut table_writer = DuckLakeTableWriter::new(target.writer, target.object_store)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .with_options(target.write_options);
+    if let Some(snapshot_id) = target.planned_snapshot {
+        table_writer = table_writer.with_planned_base_snapshot(snapshot_id);
+    }
+    let schema_without_metadata = Schema::new(
+        target
+            .arrow_schema
+            .fields()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let session = table_writer
+        .begin_write_unpartitioned_as_planned(
+            target.schema_name,
+            target.table_name,
+            &schema_without_metadata,
+            target.write_mode,
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    Box::pin(stream_into(session, first, rest, pool)).await
+}
+
 /// Write `first`, then every batch `rest` yields, into `session` as each
 /// arrives, and commit: the rows written. What the session holds in memory
 /// ([`TableWriteSession::memory_size`](crate::TableWriteSession::memory_size))
@@ -460,14 +505,17 @@ pub(crate) async fn stream_into(
     let mut next = Some(Ok(first));
     while let Some(batch) = next {
         let written = match batch {
-            Ok(batch) => match session.write_batch_async(&batch).await {
+            // Each of the session's futures boxed, so none sits in this one's
+            // state or in its caller's stack frame (a debug build's futures are
+            // large, and a plan is executed deep in its caller's stack).
+            Ok(batch) => match Box::pin(session.write_batch_async(&batch)).await {
                 Ok(()) => held.try_resize(session.memory_size()),
                 Err(e) => Err(DataFusionError::External(Box::new(e))),
             },
             Err(e) => Err(e),
         };
         if let Err(e) = written {
-            if let Err(abort) = session.abort().await {
+            if let Err(abort) = Box::pin(session.abort()).await {
                 tracing::warn!(error = %abort, "failed to abort an insert's write session");
             }
             return Err(e);
@@ -475,8 +523,7 @@ pub(crate) async fn stream_into(
         next = rest.next().await;
     }
     let rows = session.row_count() as u64;
-    session
-        .finish()
+    Box::pin(session.finish())
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     Ok(rows)

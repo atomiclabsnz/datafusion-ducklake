@@ -435,7 +435,8 @@ struct NewVersionSink<'a> {
     limit: usize,
     held: Vec<RecordBatch>,
     rows: usize,
-    session: Option<TableWriteSession>,
+    /// Boxed: a session is kilobytes, and this sink lives in the UPDATE's future.
+    session: Option<Box<TableWriteSession>>,
     /// What the held versions or the session hold in memory, charged to the
     /// pool the statement's operators use, as an insert's is
     /// ([`crate::insert_exec`]).
@@ -502,20 +503,19 @@ impl<'a> NewVersionSink<'a> {
                         self.physical_schema.as_ref(),
                         WriteMode::Append,
                     )
-                    .map(|session| session.with_base_snapshot_id(self.base_snapshot))
+                    .map(|session| Box::new(session.with_base_snapshot_id(self.base_snapshot)))
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 let session = self.session.insert(session);
                 for held in std::mem::take(&mut self.held) {
-                    session
-                        .write_batch_async(&held)
+                    Box::pin(session.write_batch_async(&held))
                         .await
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 }
                 session
             },
         };
-        session
-            .write_batch_async(&batch)
+        // Boxed, as an insert's are (`insert_exec::stream_into`).
+        Box::pin(session.write_batch_async(&batch))
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
@@ -523,7 +523,7 @@ impl<'a> NewVersionSink<'a> {
     /// Every new version taken: the held ones, or the session they went into.
     fn finish(self) -> NewVersions {
         match self.session {
-            Some(session) => NewVersions::Written(Box::new(session)),
+            Some(session) => NewVersions::Written(session),
             None => NewVersions::Held(self.held),
         }
     }
@@ -532,7 +532,7 @@ impl<'a> NewVersionSink<'a> {
     /// it uploaded and releases what its start inserted.
     async fn abort(self) {
         if let Some(session) = self.session {
-            abort_session(session).await;
+            abort_session(*session).await;
         }
     }
 }
