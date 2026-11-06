@@ -319,6 +319,23 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
             .map_or(0, ArrowWriter::in_progress_size)
     }
 
+    /// The bytes this writer holds in memory, outside its sink: the rows of a
+    /// first row group it is still buffering, and the encoded row group in
+    /// progress ([`ArrowWriter::memory_size`]).
+    pub(crate) fn memory_size(&self) -> usize {
+        self.buffered_bytes + self.writer.as_ref().map_or(0, ArrowWriter::memory_size)
+    }
+
+    /// The sink, to read how much it holds. `None` only if opening the file
+    /// failed part-way.
+    pub(crate) fn sink(&self) -> Option<&W> {
+        match (&self.writer, &self.pending) {
+            (Some(writer), _) => Some(writer.inner()),
+            (None, Some((sink, _, _))) => Some(sink),
+            (None, None) => None,
+        }
+    }
+
     /// The sink, to take finished bytes out of it between writes (never to write
     /// into: the writer's offsets would no longer match its bytes).
     /// `None` only if opening the file failed part-way.

@@ -308,6 +308,21 @@ impl StageWriter {
         matches!(self, StageWriter::Parts(sink) if sink.is_cancelled())
     }
 
+    /// The bytes this staging holds in memory: what a buffer has allocated
+    /// (the whole file so far for [`Staging::Memory`], the bytes not yet sent
+    /// for [`Staging::Parts`]), and a temporary file's write buffer.
+    pub(crate) fn memory_size(&self) -> usize {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            StageWriter::File {
+                file,
+                ..
+            } => file.capacity(),
+            StageWriter::Memory(bytes) => bytes.capacity(),
+            StageWriter::Parts(sink) => sink.buffer.capacity(),
+        }
+    }
+
     /// Mark a [`Staging::Parts`] file as having lost a part to a cancelled send:
     /// a unit test's way to make its finish fail.
     #[cfg(test)]
@@ -446,6 +461,18 @@ impl Staged {
             Staged::Memory(bytes) => bytes.len() as u64,
             Staged::Parts(parts) => parts.sent + parts.tail.len() as u64,
         })
+    }
+
+    /// The bytes this finished file holds in memory until it is uploaded: all
+    /// of it for [`Staging::Memory`], its unsent tail for [`Staging::Parts`],
+    /// none for a temporary file.
+    pub(crate) fn memory_size(&self) -> usize {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Staged::File(_) => 0,
+            Staged::Memory(bytes) => bytes.len(),
+            Staged::Parts(parts) => parts.tail.len(),
+        }
     }
 
     /// How many parts were sent before the file was finished: zero for a

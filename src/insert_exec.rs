@@ -1,8 +1,13 @@
 //! DuckLake INSERT execution plan.
 //!
-//! Limitations:
-//! - Collects all batches into memory before writing (no streaming yet)
-//! - Single partition only (partition 0)
+//! An unpartitioned table whose rows the plan orders (or that has no sort
+//! order) streams its input into a write session, batch by batch: the session
+//! holds the first `data_inlining_row_limit` rows to inline, and past them writes
+//! Parquet that goes out as it is encoded (ADR-0037 in ferrion). A partitioned
+//! table, and one the writer itself must sort, still collect the input first:
+//! the rows are split or sorted as a whole.
+//!
+//! Single partition only (partition 0).
 
 use std::fmt::{self, Debug};
 use std::sync::Arc;
@@ -17,7 +22,7 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-use futures::stream::{self, TryStreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 
 use crate::metadata_writer::{MetadataWriter, WriteMode};
 use crate::table_writer::DuckLakeTableWriter;
@@ -253,11 +258,57 @@ impl ExecutionPlan for DuckLakeInsertExec {
             sort_on_insert: self.planned_sort_on_insert,
             sorted: self.required_ordering.is_some(),
         };
+        // The rows stream when nothing needs them whole: no partition spec to
+        // split them by, and no sort the writer must make (the plan sorted
+        // them, or the table had no sort order when it was planned).
+        let streams =
+            partition.is_none() && (sort_plan.sorted || sort_plan.sort_on_insert.is_none());
         let output_schema = make_insert_count_schema();
 
         let stream = stream::once(async move {
-            let input_stream = input.execute(0, Arc::clone(&context))?;
-            let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+            let mut input_stream = input.execute(0, Arc::clone(&context))?;
+            let batches: Vec<RecordBatch> = if streams {
+                // Up to the first batch with rows: an input of none is answered
+                // below as before.
+                let mut first = None;
+                while let Some(batch) = input_stream.next().await {
+                    let batch = batch?;
+                    if batch.num_rows() > 0 {
+                        first = Some(batch);
+                        break;
+                    }
+                }
+                match first {
+                    Some(first) => {
+                        let object_store = context
+                            .runtime_env()
+                            .object_store(object_store_url.as_ref())?;
+                        let mut table_writer = DuckLakeTableWriter::new(writer, object_store)
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?
+                            .with_options(&write_options);
+                        if let Some(snapshot_id) = planned_snapshot {
+                            table_writer = table_writer.with_planned_base_snapshot(snapshot_id);
+                        }
+                        let schema_without_metadata =
+                            Schema::new(arrow_schema.fields().iter().cloned().collect::<Vec<_>>());
+                        let session = table_writer
+                            .begin_write_unpartitioned_as_planned(
+                                &schema_name,
+                                &table_name,
+                                &schema_without_metadata,
+                                write_mode,
+                            )
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                        let rows = stream_into(session, first, input_stream, context.memory_pool())
+                            .await?;
+                        let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![rows]));
+                        return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
+                    },
+                    None => Vec::new(),
+                }
+            } else {
+                input_stream.try_collect().await?
+            };
 
             // An empty input is a genuine no-op only for Append. For
             // Replace/Overwrite we must still run the write session so the prior
@@ -381,6 +432,47 @@ impl ExecutionPlan for DuckLakeInsertExec {
             stream.map_err(|e: DataFusionError| e),
         )))
     }
+}
+
+/// Write `first`, then every batch `rest` yields, into `session` as each
+/// arrives, and commit: the rows written. What the session holds in memory
+/// ([`TableWriteSession::memory_size`](crate::TableWriteSession::memory_size))
+/// is charged to `pool` after each batch, the pool the plan's operators use,
+/// so one pool bounds the write: past it the write is refused
+/// (`ResourcesExhausted`) rather than outgrowing it. A failure of the input,
+/// of the write or of the charge aborts the session, which removes what it
+/// uploaded and leaves no catalog row, and is returned as it was met.
+pub(crate) async fn stream_into(
+    mut session: crate::table_writer::TableWriteSession,
+    first: RecordBatch,
+    mut rest: SendableRecordBatchStream,
+    pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+) -> DataFusionResult<u64> {
+    let held = datafusion::execution::memory_pool::MemoryConsumer::new("DuckLakeInsertExec")
+        .register(pool);
+    let mut next = Some(Ok(first));
+    while let Some(batch) = next {
+        let written = match batch {
+            Ok(batch) => match session.write_batch_async(&batch).await {
+                Ok(()) => held.try_resize(session.memory_size()),
+                Err(e) => Err(DataFusionError::External(Box::new(e))),
+            },
+            Err(e) => Err(e),
+        };
+        if let Err(e) = written {
+            if let Err(abort) = session.abort().await {
+                tracing::warn!(error = %abort, "failed to abort an insert's write session");
+            }
+            return Err(e);
+        }
+        next = rest.next().await;
+    }
+    let rows = session.row_count() as u64;
+    session
+        .finish()
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    Ok(rows)
 }
 
 #[cfg(test)]

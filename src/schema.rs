@@ -167,6 +167,21 @@ impl DuckLakeSchema {
     /// [`MetadataWriter::data_inlining_row_limit`] applies, else `10`), and a
     /// stored `sort_on_insert` outranks the options' one, as official has no
     /// session override of it.
+    /// The write options a table created in this schema writes with, as this
+    /// schema's own `CREATE TABLE … AS` and each table's `INSERT` take them: the
+    /// stored settings (schema, then catalog-wide), with the catalog's
+    /// [`DuckLakeCatalog::with_write_options`](crate::DuckLakeCatalog::with_write_options)
+    /// over them as [`Self::table_write_options`] lays them. For a caller that
+    /// writes a new table through a [`DuckLakeTableWriter`](crate::DuckLakeTableWriter)
+    /// of its own, so its files take the lake's `target_file_size`, row groups
+    /// and compression rather than the writer's defaults.
+    #[cfg(feature = "write")]
+    pub fn new_table_write_options(
+        &self,
+    ) -> DataFusionResult<crate::table_writer::DuckLakeWriteOptions> {
+        self.table_write_options(None)
+    }
+
     #[cfg(feature = "write")]
     fn table_write_options(
         &self,
