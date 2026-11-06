@@ -371,7 +371,10 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             deletes_held.try_grow(delete_working_set(
                 superseded_positions
                     .iter()
-                    .map(|(scan, positions)| (scan.source_path.as_str(), positions.len()))
+                    .filter_map(|(scan, positions)| {
+                        delete_file_rows(scan, positions.len(), inline_limit)
+                            .map(|rows| (scan.source_path.as_str(), rows))
+                    })
                     .chain(
                         pending_deletes
                             .iter()
@@ -480,6 +483,30 @@ impl HeldPositions {
         self.reservation.resize(self.retained);
         Ok(cumulative)
     }
+}
+
+/// How many rows the delete file a staged commit writes for `scan` holds, when it writes
+/// one: as [`crate::delete_exec::FileDeletions::record`] decides. Deletions within the
+/// inlining limit are inlined into the catalog, and a file all of whose rows are deleted
+/// is dropped: neither writes a file, so neither is charged (#744 round 1: charging them
+/// refused a 256 MiB `UPDATE` of every row for a 490 MB delete file it never makes). A
+/// file with a delete file already has it rewritten with the existing positions too.
+fn delete_file_rows(
+    scan: &UpdateSourceScan,
+    positions: usize,
+    inline_limit: usize,
+) -> Option<usize> {
+    if positions == 0 || (inline_limit > 0 && positions <= inline_limit) {
+        return None;
+    }
+    let rows = match scan.delete_file_id {
+        Some(_) => scan.existing_parquet_deletes.len() + positions,
+        None => positions,
+    };
+    let every_row = scan
+        .record_count
+        .is_some_and(|count| usize::try_from(count).is_ok_and(|count| count == rows));
+    (!every_row).then_some(rows)
 }
 
 /// What the commit allocates to write the largest of `files`' delete files

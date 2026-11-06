@@ -1516,6 +1516,49 @@ async fn an_update_charges_what_it_holds_until_its_commit() {
     );
 }
 
+/// An UPDATE of every row drops each source file and writes no delete file, so
+/// its commit charges nothing for deletes (#744 round 1). Charging a delete file
+/// it never makes (the path a row) refused a 256 MiB UPDATE of every row in a
+/// tab, holding 103 MiB, for a 490 MB working set.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_of_every_row_charges_no_delete_file() {
+    let (lake, _) = seeded(None).await;
+    let pool = Arc::new(Tracking::default());
+    let ctx = sql_ctx_on(
+        &lake,
+        datafusion::execution::runtime_env::RuntimeEnvBuilder::new().with_memory_pool(pool.clone()),
+    )
+    .await;
+    assert_eq!(
+        run(&ctx, "UPDATE lake.main.t SET id = id + 100000")
+            .await
+            .unwrap(),
+        60_000
+    );
+    let pool_db = SqlitePool::connect(&url(&lake.temp)).await.unwrap();
+    let (delete_files,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM ducklake_delete_file WHERE end_snapshot IS NULL")
+            .fetch_one(&pool_db)
+            .await
+            .unwrap();
+    pool_db.close().await;
+    assert_eq!(
+        delete_files, 0,
+        "every source file is dropped, none gets a delete file"
+    );
+    assert_eq!(
+        pool.peak(WATCHED),
+        0,
+        "the commit charged {} for delete files it does not write",
+        pool.peak(WATCHED)
+    );
+    assert!(
+        pool.peak("DuckLakeUpdateExec positions") >= 60_000 * 8,
+        "the positions are still charged: {}",
+        pool.peak("DuckLakeUpdateExec positions")
+    );
+}
+
 /// A partitioned table's INSERT still collects its input, and charges it to
 /// the pool as a streamed one charges its session: past the pool it is refused
 /// (`ResourcesExhausted`), and the table is left as it was.
