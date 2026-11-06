@@ -5905,6 +5905,7 @@ impl TableProvider for DuckLakeTable {
         // columns whenever it plans a sort, however many rows the statement
         // holds, so a missing sort column fails here, before execution.
         let mut planned_sort_on_insert = None;
+        let mut planned_no_sort_order = false;
         let ordering = match self
             .provider
             .get_sort_spec(self.table_id, head_snapshot)
@@ -5948,7 +5949,10 @@ impl TableProvider for DuckLakeTable {
                     None
                 }
             },
-            None => None,
+            None => {
+                planned_no_sort_order = true;
+                None
+            },
         };
         // Wrap the input in a SortExec now AND declare the same requirement on
         // DuckLakeInsertExec, so DataFusion's EnforceSorting keeps the ordering
@@ -5975,7 +5979,8 @@ impl TableProvider for DuckLakeTable {
                 ordering,
             )
             .with_planned_snapshot(self.snapshot_id)
-            .with_planned_sort_on_insert(planned_sort_on_insert),
+            .with_planned_sort_on_insert(planned_sort_on_insert)
+            .with_planned_no_sort_order(planned_no_sort_order),
         ))
     }
 

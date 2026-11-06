@@ -69,6 +69,11 @@ pub struct DuckLakeInsertExec {
     /// lays the rows out under, as official reads it once, in `PlanInsert`.
     /// `None` when the plan read none, and the writer reads it.
     planned_sort_on_insert: Option<bool>,
+    /// Set when the statement was planned against a table with no sort order:
+    /// the one case, beside a plan that sorted the rows, in which the rows may
+    /// stream into the writer. Unset (a plan built through [`Self::new`]
+    /// alone) collects them, so the writer can apply a sort order it finds.
+    planned_no_sort_order: bool,
     cache: Arc<PlanProperties>,
 }
 
@@ -101,6 +106,7 @@ impl DuckLakeInsertExec {
             required_ordering,
             planned_snapshot: None,
             planned_sort_on_insert: None,
+            planned_no_sort_order: false,
             cache,
         }
     }
@@ -114,6 +120,13 @@ impl DuckLakeInsertExec {
     /// planned with, rather than reading it again at execution.
     pub(crate) fn with_planned_sort_on_insert(mut self, sort_on_insert: Option<bool>) -> Self {
         self.planned_sort_on_insert = sort_on_insert;
+        self
+    }
+
+    /// The statement was planned against a table with no sort order, so its rows
+    /// may stream into the writer.
+    pub(crate) fn with_planned_no_sort_order(mut self, no_sort_order: bool) -> Self {
+        self.planned_no_sort_order = no_sort_order;
         self
     }
 
@@ -226,7 +239,8 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 self.required_ordering.clone(),
             )
             .with_planned_snapshot_opt(self.planned_snapshot)
-            .with_planned_sort_on_insert(self.planned_sort_on_insert),
+            .with_planned_sort_on_insert(self.planned_sort_on_insert)
+            .with_planned_no_sort_order(self.planned_no_sort_order),
         ))
     }
 
@@ -259,10 +273,19 @@ impl ExecutionPlan for DuckLakeInsertExec {
             sorted: self.required_ordering.is_some(),
         };
         // The rows stream when nothing needs them whole: no partition spec to
-        // split them by, and no sort the writer must make (the plan sorted
-        // them, or the table had no sort order when it was planned).
-        let streams =
-            partition.is_none() && (sort_plan.sorted || sort_plan.sort_on_insert.is_none());
+        // split them by, and no sort the writer must make. Known, not assumed:
+        // the plan sorted them, or the statement was planned against a table
+        // with no sort order. Anything else (a plan built through `new` alone)
+        // collects them, and the writer applies whatever sort order it finds.
+        let unsorted = sort_plan.sorted || self.planned_no_sort_order;
+        let streams = partition.is_none() && unsorted;
+        // What the collected path holds: the input, and for a split or a sort
+        // a second copy of it.
+        let copies = if partition.is_some() || !unsorted {
+            2
+        } else {
+            1
+        };
         let output_schema = make_insert_count_schema();
 
         let stream = stream::once(async move {
@@ -274,6 +297,9 @@ impl ExecutionPlan for DuckLakeInsertExec {
                     .catalog_encrypted()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
             let mut input_stream = input.execute(0, Arc::clone(&context))?;
+            let collected =
+                datafusion::execution::memory_pool::MemoryConsumer::new("DuckLakeInsertExec")
+                    .register(context.memory_pool());
             let batches: Vec<RecordBatch> = if streams {
                 // Up to the first batch with rows: an input of none is answered
                 // below as before.
@@ -313,7 +339,16 @@ impl ExecutionPlan for DuckLakeInsertExec {
                     None => Vec::new(),
                 }
             } else {
-                input_stream.try_collect().await?
+                // Charged to the pool, as the streamed path's session is, so an
+                // input past the pool is refused (`ResourcesExhausted`) rather
+                // than outgrowing it; held until the write is done.
+                let mut batches = Vec::new();
+                while let Some(batch) = input_stream.next().await {
+                    let batch = batch?;
+                    collected.try_grow(batch.get_array_memory_size() * copies)?;
+                    batches.push(batch);
+                }
+                batches
             };
 
             // An empty input is a genuine no-op only for Append. For

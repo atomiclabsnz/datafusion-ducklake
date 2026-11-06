@@ -974,6 +974,18 @@ async fn a_dropped_session_aborts_its_open_upload_in_the_background() {
 /// under `options(Parts)` (rolling small files, nothing inlined), its store the
 /// logging one; `pool` bounds the operators' memory when given.
 async fn sql_ctx(lake: &Lake, pool: Option<usize>) -> datafusion::prelude::SessionContext {
+    let mut runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new();
+    if let Some(bytes) = pool {
+        runtime = runtime.with_memory_limit(bytes, 1.0);
+    }
+    sql_ctx_on(lake, runtime).await
+}
+
+/// [`sql_ctx`] over the pool `runtime` gives.
+async fn sql_ctx_on(
+    lake: &Lake,
+    runtime: datafusion::execution::runtime_env::RuntimeEnvBuilder,
+) -> datafusion::prelude::SessionContext {
     let url = url(&lake.temp);
     let provider = datafusion_ducklake::SqliteMetadataProvider::new(&url)
         .await
@@ -984,10 +996,6 @@ async fn sql_ctx(lake: &Lake, pool: Option<usize>) -> datafusion::prelude::Sessi
             .with_write_options(options(Staging::Parts {
                 part_bytes: PART_BYTES,
             }));
-    let mut runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new();
-    if let Some(bytes) = pool {
-        runtime = runtime.with_memory_limit(bytes, 1.0);
-    }
     // One partition, as a tab runs: above it a `RepartitionExec` would drain the
     // source on a task of its own, ahead of the write.
     let ctx = datafusion::prelude::SessionContext::new_with_config_rt(
@@ -1348,3 +1356,134 @@ async fn a_sql_update_past_the_pool_is_refused_and_leaves_the_table_as_it_was() 
 }
 
 const POSITIONS_POOL: usize = 400 * 1024;
+
+// ---- #34 review round 1 ----
+
+/// A partitioned table's INSERT still collects its input, and charges it to
+/// the pool as a streamed one charges its session: past the pool it is refused
+/// (`ResourcesExhausted`), and the table is left as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partitioned_sql_insert_past_the_pool_is_refused_and_leaves_nothing() {
+    let lake = Lake::new(None).await;
+    let created = lake
+        .table_writer(Staging::Memory)
+        .create_table("main", "pt", &partitioned_batches(1)[..1])
+        .await
+        .unwrap();
+    lake.writer
+        .set_partition_spec(
+            created.table_id,
+            &[("p".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let files = lake.files().await;
+    let snapshots = lake.snapshot_count().await;
+    let ctx = sql_ctx(&lake, Some(64 * 1024)).await;
+    let source = datafusion::datasource::MemTable::try_new(
+        partitioned_schema(),
+        vec![partitioned_batches(20)],
+    )
+    .unwrap();
+    ctx.register_table("src", Arc::new(source)).unwrap();
+    let error = run(&ctx, "INSERT INTO lake.main.pt SELECT * FROM src")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.find_root(),
+            datafusion::error::DataFusionError::ResourcesExhausted(_)
+        ),
+        "{error}"
+    );
+    assert_eq!(lake.files().await, files);
+    assert_eq!(lake.snapshot_count().await, snapshots);
+}
+
+/// An insert plan built through `DuckLakeInsertExec::new` alone, which says
+/// nothing of the table's sort order, does not stream: the writer finds the
+/// table's `SET SORTED BY` and lays the rows out sorted, as `write_rows` does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_insert_built_through_new_into_a_sorted_table_is_sorted() {
+    use datafusion_ducklake::sort::{NullOrder, SortDirection, SortField};
+    let lake = Lake::new(None).await;
+    let created = lake
+        .table_writer(Staging::Memory)
+        .create_table("main", "t", &batches(1)[..1])
+        .await
+        .unwrap();
+    lake.writer
+        .set_sort_spec(
+            created.table_id,
+            &[SortField::column(0, "id", SortDirection::Asc, NullOrder::NullsLast)],
+        )
+        .unwrap();
+    // Three batches in descending id order, each ascending within: ids
+    // 100,000.. down to 104,000.. .
+    let input: Vec<RecordBatch> = batches(3)
+        .into_iter()
+        .rev()
+        .map(|batch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .map(|id| id.unwrap() + 100_000)
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::clone(batch.column(1)),
+                    Arc::clone(batch.column(2)),
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+    let source =
+        datafusion::datasource::memory::MemorySourceConfig::try_new_exec(&[input], schema(), None)
+            .unwrap();
+    let insert = datafusion_ducklake::DuckLakeInsertExec::new(
+        source,
+        lake.writer.clone(),
+        "main".to_string(),
+        "t".to_string(),
+        schema(),
+        WriteMode::Append,
+        Arc::new(datafusion::execution::object_store::ObjectStoreUrl::local_filesystem()),
+        None,
+        options(Staging::Parts {
+            part_bytes: PART_BYTES,
+        }),
+        None,
+    );
+    let ctx = sql_ctx(&lake, None).await;
+    datafusion::physical_plan::collect(Arc::new(insert), ctx.task_ctx())
+        .await
+        .unwrap();
+    let oracle = duckdb::Connection::open_in_memory().unwrap();
+    oracle
+        .execute_batch(&format!(
+            "LOAD ducklake; LOAD sqlite; \
+             ATTACH 'ducklake:sqlite:{}' AS lake (DATA_PATH '{}/', READ_ONLY);",
+            lake.catalog().display(),
+            lake.data().display()
+        ))
+        .unwrap();
+    let mut statement = oracle
+        .prepare("SELECT id FROM lake.main.t WHERE id >= 100000 ORDER BY rowid")
+        .unwrap();
+    let ids: Vec<i64> = statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(ids.len(), 6_000);
+    assert!(
+        ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "laid out in the table's sort order, not as they came: starts {:?}",
+        &ids[..3]
+    );
+}
