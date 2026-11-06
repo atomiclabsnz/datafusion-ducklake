@@ -68,6 +68,9 @@ impl Staging {
     pub const DEFAULT_PART_BYTES: usize = 8 * 1024 * 1024;
 }
 
+// Not derived: natively the default is the unit `File`, but on `wasm32` it is
+// `Parts`, which carries its part size, and `#[default]` takes only a unit variant.
+#[allow(clippy::derivable_impls)]
 impl Default for Staging {
     fn default() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
