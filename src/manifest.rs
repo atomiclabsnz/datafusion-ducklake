@@ -46,9 +46,43 @@ pub struct TableManifest {
     pub partition_spec: Option<PartitionSpec>,
     /// Every data file live at the snapshot, by ascending `data_file_id`.
     pub files: Vec<ManifestDataFile>,
+    /// Columns the table no longer has whose ids some file may still carry: a
+    /// column dropped after the file was written. A file column with one of
+    /// these ids is not a column of the table, and an import reserves the ids,
+    /// so no column added later takes one and reads the dropped column's
+    /// values. Empty from [`DuckLakeTable::export_manifest`].
+    pub retired_fields: Vec<DuckLakeTableField>,
 }
 
 impl TableManifest {
+    /// A manifest of `files` for a table with `fields`, as another table
+    /// format's snapshot describes it, to import with
+    /// [`DuckLakeTableWriter::import_manifest`](crate::DuckLakeTableWriter::import_manifest).
+    /// `table_id` and `snapshot_id` describe the source and are not read by
+    /// the import.
+    pub fn new(
+        table_id: i64,
+        snapshot_id: i64,
+        fields: Vec<DuckLakeTableField>,
+        partition_spec: Option<PartitionSpec>,
+        files: Vec<ManifestDataFile>,
+    ) -> Self {
+        Self {
+            table_id,
+            snapshot_id,
+            fields,
+            partition_spec,
+            files,
+            retired_fields: Vec::new(),
+        }
+    }
+
+    /// Set [`Self::retired_fields`].
+    pub fn with_retired_fields(mut self, retired_fields: Vec<DuckLakeTableField>) -> Self {
+        self.retired_fields = retired_fields;
+        self
+    }
+
     /// The files whose columns this manifest could not bind to the table's
     /// column ids ([`ColumnBinding::Unresolved`]).
     pub fn unresolved_files(&self) -> impl Iterator<Item = &ManifestDataFile> {
@@ -98,6 +132,66 @@ pub struct ManifestDataFile {
     /// Positions (0-based physical row indexes) of the rows the snapshot does
     /// not show, ascending and distinct.
     pub deleted_positions: Vec<i64>,
+}
+
+impl ManifestDataFile {
+    /// A file at `path` (an absolute URL), with no statistics, no partition,
+    /// and no deleted positions until the `with_` methods give them.
+    /// `data_file_id` identifies the file in its source and is not read by the
+    /// import.
+    pub fn new(
+        data_file_id: i64,
+        path: impl Into<String>,
+        file_size_bytes: i64,
+        record_count: i64,
+        column_binding: ColumnBinding,
+    ) -> Self {
+        Self {
+            data_file_id,
+            path: path.into(),
+            file_size_bytes,
+            record_count,
+            footer_size: None,
+            column_statistics: Vec::new(),
+            partition_id: None,
+            partition_values: Vec::new(),
+            column_binding,
+            deleted_positions: Vec::new(),
+        }
+    }
+
+    /// Set [`Self::footer_size`].
+    pub fn with_footer_size(mut self, footer_size: Option<i64>) -> Self {
+        self.footer_size = footer_size;
+        self
+    }
+
+    /// Set [`Self::column_statistics`]. An import computes a file's statistics
+    /// from its footer when this is empty.
+    pub fn with_column_statistics(
+        mut self,
+        column_statistics: Vec<DuckLakeFileColumnStatistics>,
+    ) -> Self {
+        self.column_statistics = column_statistics;
+        self
+    }
+
+    /// Set [`Self::partition_id`] and [`Self::partition_values`].
+    pub fn with_partition(
+        mut self,
+        partition_id: Option<i64>,
+        partition_values: Vec<(i32, Option<String>)>,
+    ) -> Self {
+        self.partition_id = partition_id;
+        self.partition_values = partition_values;
+        self
+    }
+
+    /// Set [`Self::deleted_positions`]: ascending and distinct.
+    pub fn with_deleted_positions(mut self, deleted_positions: Vec<i64>) -> Self {
+        self.deleted_positions = deleted_positions;
+        self
+    }
 }
 
 /// How a data file's physical columns map onto the table's `column_id`s.
@@ -277,6 +371,7 @@ impl DuckLakeTable {
             fields: self.fields().to_vec(),
             partition_spec: self.partition_spec().cloned(),
             files,
+            retired_fields: Vec::new(),
         })
     }
 
