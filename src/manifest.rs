@@ -50,7 +50,9 @@ pub struct TableManifest {
     /// column dropped after the file was written. A file column with one of
     /// these ids is not a column of the table, and an import reserves the ids,
     /// so no column added later takes one and reads the dropped column's
-    /// values. Empty from [`DuckLakeTable::export_manifest`].
+    /// values. [`DuckLakeTable::export_manifest`] fills it with the dropped
+    /// columns whose ids a live file holds, as the table had them when the file
+    /// was written.
     pub retired_fields: Vec<DuckLakeTableField>,
 }
 
@@ -160,14 +162,15 @@ impl ManifestDataFile {
         }
     }
 
-    /// Set [`Self::footer_size`].
+    /// Set [`Self::footer_size`]. An import stores the length it measures.
     pub fn with_footer_size(mut self, footer_size: Option<i64>) -> Self {
         self.footer_size = footer_size;
         self
     }
 
-    /// Set [`Self::column_statistics`]. An import computes a file's statistics
-    /// from its footer when this is empty.
+    /// Set [`Self::column_statistics`]: what another format adopting the file
+    /// may carry. [`DuckLakeTableWriter::import_manifest`](crate::DuckLakeTableWriter::import_manifest)
+    /// ignores them and takes every statistic from the file's footer.
     pub fn with_column_statistics(
         mut self,
         column_statistics: Vec<DuckLakeFileColumnStatistics>,
@@ -292,6 +295,12 @@ impl DuckLakeTable {
 
         let inlined_deletes = self.inlined_deletes_by_file()?;
         let mut mappings: HashMap<i64, DuckLakeNameMapping> = HashMap::new();
+        let live_ids: HashSet<i64> = self.fields().iter().map(|f| f.column_id).collect();
+        // Columns the table has dropped whose ids a live file still carries, as the
+        // table had them when the file was written.
+        let mut retired: std::collections::BTreeMap<i64, DuckLakeTableField> =
+            std::collections::BTreeMap::new();
+        let mut fields_at: HashMap<i64, Vec<DuckLakeTableField>> = HashMap::new();
         let mut files = Vec::with_capacity(listed.len());
         for metadata in listed {
             let table_file = metadata.file;
@@ -336,6 +345,33 @@ impl DuckLakeTable {
                         .filter(|field| !has_field_id(field))
                         .map(|field| field.name().clone())
                         .collect();
+                    let mut ids = Vec::new();
+                    for field in facts.arrow_schema.fields() {
+                        file_field_ids(field, &mut ids);
+                    }
+                    let dropped: Vec<i64> = ids
+                        .into_iter()
+                        .filter(|id| !live_ids.contains(id) && !retired.contains_key(id))
+                        .filter(|id| {
+                            *id != i64::from(crate::row_id::ROW_ID_PARQUET_FIELD_ID)
+                                && *id != i64::from(crate::row_id::SNAPSHOT_ID_PARQUET_FIELD_ID)
+                        })
+                        .collect();
+                    if !dropped.is_empty()
+                        && let Some(written_at) = table_file.begin_snapshot
+                    {
+                        if !fields_at.contains_key(&written_at) {
+                            let fields = self
+                                .provider()
+                                .get_table_fields(self.table_id(), written_at)?;
+                            fields_at.insert(written_at, fields);
+                        }
+                        for field in &fields_at[&written_at] {
+                            if dropped.contains(&field.column_id) {
+                                retired.insert(field.column_id, field.clone());
+                            }
+                        }
+                    }
                     let binding = if columns.is_empty() {
                         ColumnBinding::FieldIds
                     } else {
@@ -371,7 +407,7 @@ impl DuckLakeTable {
             fields: self.fields().to_vec(),
             partition_spec: self.partition_spec().cloned(),
             files,
-            retired_fields: Vec::new(),
+            retired_fields: retired.into_values().collect(),
         })
     }
 
@@ -390,4 +426,24 @@ impl DuckLakeTable {
 
 fn has_field_id(field: &Field) -> bool {
     field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY)
+}
+
+/// Every field id of `field` and the fields nested in it.
+fn file_field_ids(field: &Field, out: &mut Vec<i64>) {
+    use arrow::datatypes::DataType;
+    if let Some(id) = field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .and_then(|id| id.parse().ok())
+    {
+        out.push(id);
+    }
+    match field.data_type() {
+        DataType::Struct(children) => children.iter().for_each(|c| file_field_ids(c, out)),
+        DataType::List(child)
+        | DataType::LargeList(child)
+        | DataType::FixedSizeList(child, _)
+        | DataType::Map(child, _) => file_field_ids(child, out),
+        _ => {},
+    }
 }

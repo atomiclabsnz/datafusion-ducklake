@@ -6270,10 +6270,12 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .fetch_all(&mut *tx)
             .await?;
-            if let Some(field) = retired.iter().find(|field| {
-                live.iter()
-                    .any(|column| column.column_id == field.column_id)
-            }) {
+            // Only a column that stays live after this commit clashes: one the commit ends
+            // (left out of the manifest's columns) is exactly what a retired field is.
+            if let Some(field) = retired
+                .iter()
+                .find(|field| column_ids.contains(&field.column_id))
+            {
                 return Err(crate::manifest_import::ImportError::RetiredFieldIsLive {
                     column: field.column_name.clone(),
                     field_id: field.column_id,
