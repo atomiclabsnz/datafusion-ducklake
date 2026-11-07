@@ -527,11 +527,16 @@ mod tests {
                     nulls_first,
                 };
                 let expected = in_memory(input.clone(), options);
-                let (fits, slot) =
-                    run(input.clone(), key(options), Arc::new(TaskContext::default())).await;
+                let (fits, slot) = run(
+                    input.clone(),
+                    key(options),
+                    Arc::new(TaskContext::default()),
+                )
+                .await;
                 assert_eq!(fits, expected, "{options:?}, in memory");
                 assert_eq!(spills(&slot), 0, "{options:?}: nothing spilled");
-                let (spilled, slot) = run(input.clone(), key(options), spilling_context(1_000_000)).await;
+                let (spilled, slot) =
+                    run(input.clone(), key(options), spilling_context(1_000_000)).await;
                 assert_eq!(spilled, expected, "{options:?}, spilled");
                 assert!(spills(&slot) > 0, "{options:?}: the sort spilled");
             }
@@ -549,9 +554,17 @@ mod tests {
             .step_by(1000)
             .map(|start| {
                 let k: Int64Array = (start..start + 1000)
-                    .map(|i| Some(if i == zero_at { 0 } else { i + 1 }))
+                    .map(|i| {
+                        Some(if i == zero_at {
+                            0
+                        } else {
+                            i + 1
+                        })
+                    })
                     .collect();
-                let s: StringArray = (start..start + 1000).map(|i| Some(format!("{i:08}"))).collect();
+                let s: StringArray = (start..start + 1000)
+                    .map(|i| Some(format!("{i:08}")))
+                    .collect();
                 RecordBatch::try_new(schema(), vec![Arc::new(k), Arc::new(s)]).unwrap()
             })
             .collect();

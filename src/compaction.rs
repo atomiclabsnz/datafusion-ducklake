@@ -1208,7 +1208,9 @@ impl DuckLakeTable {
                 let mut range_maxes: Vec<i64> = Vec::with_capacity(bin.len());
                 for tf in bin {
                     let begin = tf.begin_snapshot.ok_or_else(|| {
-                        DuckLakeError::Internal("merge candidate missing begin_snapshot".to_string())
+                        DuckLakeError::Internal(
+                            "merge candidate missing begin_snapshot".to_string(),
+                        )
                     })?;
                     range_mins.push(begin);
                     range_maxes.push(tf.partial_max.unwrap_or(begin));

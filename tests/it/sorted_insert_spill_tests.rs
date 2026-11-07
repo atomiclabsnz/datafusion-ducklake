@@ -26,10 +26,7 @@ use datafusion::execution::{DiskManager, SpillFile, TempFileFactory};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_ducklake::sort::{NullOrder, SortDirection, SortField};
-use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeWriteOptions, MergeOptions, MetadataProvider, MetadataWriter,
-    WriteMode,
-};
+use datafusion_ducklake::{DuckLakeWriteOptions, MergeOptions, WriteMode};
 use object_store::local::LocalFileSystem;
 
 use crate::inlining_abstraction_tests::{Lake, create_with, sqlite};
@@ -93,11 +90,7 @@ fn sorted_table(lake: &Lake, name: &str, keys: &[Key<'_>], sort_on_insert: bool)
     create_with(
         lake,
         name,
-        &[
-            ("id", DataType::Int64),
-            ("k", DataType::Int64),
-            ("v", DataType::Utf8),
-        ],
+        &[("id", DataType::Int64), ("k", DataType::Int64), ("v", DataType::Utf8)],
     )
     .unwrap();
     let table_id = lake.table_id(name);
@@ -117,7 +110,11 @@ fn sorted_table(lake: &Lake, name: &str, keys: &[Key<'_>], sort_on_insert: bool)
         .set_table_setting(
             table_id,
             "sort_on_insert",
-            if sort_on_insert { "true" } else { "false" },
+            if sort_on_insert {
+                "true"
+            } else {
+                "false"
+            },
         )
         .unwrap();
     table_id
@@ -185,10 +182,7 @@ impl CountingFactory {
 }
 
 impl TempFileFactory for CountingFactory {
-    fn create_temp_file(
-        &self,
-        description: &str,
-    ) -> datafusion::error::Result<Arc<dyn SpillFile>> {
+    fn create_temp_file(&self, description: &str) -> datafusion::error::Result<Arc<dyn SpillFile>> {
         self.created.fetch_add(1, Ordering::SeqCst);
         self.inner.create_tmp_file(description)
     }
@@ -216,7 +210,10 @@ fn spills(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize) {
             .and_then(|metrics| metrics.spill_count())
             .unwrap_or(0)
     };
-    fn others(plan: &Arc<dyn ExecutionPlan>, own: &dyn Fn(&Arc<dyn ExecutionPlan>) -> usize) -> usize {
+    fn others(
+        plan: &Arc<dyn ExecutionPlan>,
+        own: &dyn Fn(&Arc<dyn ExecutionPlan>) -> usize,
+    ) -> usize {
         plan.children()
             .into_iter()
             .map(|child| own(child) + others(child, own))
@@ -301,7 +298,12 @@ fn on_disk(lake: &Lake, table: &str) -> Vec<PathBuf> {
 
 /// `main.<table>` written by the in-memory sort, as a SQL `INSERT` wrote it
 /// before: [`DuckLakeTableWriter::write_rows`] over `batches`.
-async fn in_memory(lake: &Lake, table: &str, options: &DuckLakeWriteOptions, batches: &[RecordBatch]) {
+async fn in_memory(
+    lake: &Lake,
+    table: &str,
+    options: &DuckLakeWriteOptions,
+    batches: &[RecordBatch],
+) {
     lake.table_writer()
         .with_options(options)
         .write_rows("main", table, &schema(), WriteMode::Append, batches)
@@ -323,7 +325,11 @@ async fn a_writer_sorted_insert_spills_and_lays_out_as_the_in_memory_sort() {
     let batches = input(120_000, 997);
     let cases: [(&[Key<'_>], bool, usize); 4] = [
         (&[("(k % 7)", Asc, NullsLast)], true, 0),
-        (&[("(k % 7)", Desc, NullsFirst), ("abs((k - 500))", Asc, NullsLast)], true, 0),
+        (
+            &[("(k % 7)", Desc, NullsFirst), ("abs((k - 500))", Asc, NullsLast)],
+            true,
+            0,
+        ),
         (&[("(k + 1)", Desc, NullsLast)], true, 10),
         (&[("k", Desc, NullsFirst)], false, 10),
     ];
@@ -338,12 +344,20 @@ async fn a_writer_sorted_insert_spills_and_lays_out_as_the_in_memory_sort() {
         assert!(expected.len() > 5, "{keys:?}: rolls into many files");
 
         let factory = CountingFactory::new(None);
-        let ctx = session(&lake, &options, runtime(SMALL_POOL, Some(Arc::clone(&factory))), &batches);
+        let ctx = session(
+            &lake,
+            &options,
+            runtime(SMALL_POOL, Some(Arc::clone(&factory))),
+            &batches,
+        );
         let plan = run(&ctx, "INSERT INTO lake.main.b SELECT id, k, v FROM src")
             .await
             .unwrap_or_else(|e| panic!("{keys:?}: {e}"));
         let (own, others) = spills(&plan);
-        assert!(own > 0, "{keys:?}: the insert's sort spilled ({own}, the plan's {others})");
+        assert!(
+            own > 0,
+            "{keys:?}: the insert's sort spilled ({own}, the plan's {others})"
+        );
         assert_eq!(others, 0, "{keys:?}: the plan sorted nothing");
         assert!(factory.created() > 0, "{keys:?}: spill files were made");
         assert_eq!(layout(&lake, "b"), expected, "{keys:?}: spilled");
@@ -382,7 +396,11 @@ async fn a_failing_key_writes_the_rows_in_arrival_order() {
         )
         .unwrap(),
     );
-    let keys: &[Key<'_>] = &[("CAST(v AS BIGINT)", SortDirection::Asc, NullOrder::NullsLast)];
+    let keys: &[Key<'_>] = &[(
+        "CAST(v AS BIGINT)",
+        SortDirection::Asc,
+        NullOrder::NullsLast,
+    )];
     let lake = sqlite()(None).await;
     let options = options(0);
     for table in ["a", "b"] {
@@ -390,10 +408,22 @@ async fn a_failing_key_writes_the_rows_in_arrival_order() {
     }
     in_memory(&lake, "a", &options, &batches).await;
     let expected = layout(&lake, "a");
-    let ids: Vec<i64> = expected.iter().flat_map(|f| f.2.iter().map(|r| r.0)).collect();
-    assert_eq!(ids, (0..60_000).collect::<Vec<_>>(), "the reference keeps arrival order");
+    let ids: Vec<i64> = expected
+        .iter()
+        .flat_map(|f| f.2.iter().map(|r| r.0))
+        .collect();
+    assert_eq!(
+        ids,
+        (0..60_000).collect::<Vec<_>>(),
+        "the reference keeps arrival order"
+    );
     let factory = CountingFactory::new(None);
-    let ctx = session(&lake, &options, runtime(SMALL_POOL, Some(factory)), &batches);
+    let ctx = session(
+        &lake,
+        &options,
+        runtime(SMALL_POOL, Some(factory)),
+        &batches,
+    );
     run(&ctx, "INSERT INTO lake.main.b SELECT id, k, v FROM src")
         .await
         .unwrap();
@@ -402,7 +432,11 @@ async fn a_failing_key_writes_the_rows_in_arrival_order() {
 
 /// The catalog's snapshots, data files and inlined rows of `main.<table>`.
 fn committed(lake: &Lake, table: &str) -> (i64, usize, usize) {
-    (lake.head(), lake.data_files(table), lake.inlined_rows(table))
+    (
+        lake.head(),
+        lake.data_files(table),
+        lake.inlined_rows(table),
+    )
 }
 
 /// A writer-sorted INSERT that fails mid-sort leaves nothing: no catalog row
@@ -416,10 +450,18 @@ async fn a_sorted_insert_refused_mid_sort_leaves_nothing() {
     let failing = "INSERT INTO lake.main.b SELECT id, \
                    CASE WHEN id = 119990 THEN CAST(v AS BIGINT) ELSE k END, v FROM src";
     let cases: [(&str, RuntimeEnvBuilder, &str, &str); 3] = [
-        ("the pool, no disk manager", runtime(SMALL_POOL, None), insert, "Resources exhausted"),
+        (
+            "the pool, no disk manager",
+            runtime(SMALL_POOL, None),
+            insert,
+            "Resources exhausted",
+        ),
         (
             "the spill budget",
-            runtime(SMALL_POOL, Some(CountingFactory::new(Some(64 * KIB as u64)))),
+            runtime(
+                SMALL_POOL,
+                Some(CountingFactory::new(Some(64 * KIB as u64))),
+            ),
             insert,
             "exceeded",
         ),
@@ -438,7 +480,11 @@ async fn a_sorted_insert_refused_mid_sort_leaves_nothing() {
         let error = run(&ctx, sql).await.expect_err(what);
         assert!(error.contains(says), "{what}: {error}");
         assert_eq!(committed(&lake, "b"), before, "{what}: nothing committed");
-        assert_eq!(on_disk(&lake, "b"), Vec::<PathBuf>::new(), "{what}: no file left");
+        assert_eq!(
+            on_disk(&lake, "b"),
+            Vec::<PathBuf>::new(),
+            "{what}: no file left"
+        );
     }
 }
 
@@ -543,7 +589,12 @@ async fn a_sorted_insert_whose_write_fails_after_the_sort_leaves_nothing() {
     sorted_table(&lake, "b", keys, true);
     let before = committed(&lake, "b");
     let factory = CountingFactory::new(None);
-    let ctx = session(&lake, &options(0), runtime(SMALL_POOL, Some(Arc::clone(&factory))), &batches);
+    let ctx = session(
+        &lake,
+        &options(0),
+        runtime(SMALL_POOL, Some(Arc::clone(&factory))),
+        &batches,
+    );
     ctx.runtime_env().register_object_store(
         datafusion::execution::object_store::ObjectStoreUrl::local_filesystem().as_ref(),
         Arc::new(FailingStore {
@@ -568,8 +619,18 @@ async fn a_sorted_insert_whose_write_fails_after_the_sort_leaves_nothing() {
 async fn a_plan_sorted_insert_spills() {
     let batches = input(120_000, 997);
     let lake = sqlite()(None).await;
-    sorted_table(&lake, "b", &[("k", SortDirection::Asc, NullOrder::NullsLast)], true);
-    let ctx = session(&lake, &options(0), runtime(SMALL_POOL, Some(CountingFactory::new(None))), &batches);
+    sorted_table(
+        &lake,
+        "b",
+        &[("k", SortDirection::Asc, NullOrder::NullsLast)],
+        true,
+    );
+    let ctx = session(
+        &lake,
+        &options(0),
+        runtime(SMALL_POOL, Some(CountingFactory::new(None))),
+        &batches,
+    );
     let plan = run(&ctx, "INSERT INTO lake.main.b SELECT id, k, v FROM src")
         .await
         .unwrap();
@@ -582,7 +643,10 @@ async fn a_plan_sorted_insert_spills() {
         .collect();
     assert_eq!(keys.len(), 120_000);
     let rank = |k: &Option<i64>| k.map_or(i64::MAX, |k| k);
-    assert!(keys.windows(2).all(|w| rank(&w[0]) <= rank(&w[1])), "in `k` order, NULLs last");
+    assert!(
+        keys.windows(2).all(|w| rank(&w[0]) <= rank(&w[1])),
+        "in `k` order, NULLs last"
+    );
 }
 
 /// `main.t` sorted by `(k % 7)` (compaction sorts by it), written unsorted as
@@ -592,7 +656,12 @@ async fn a_plan_sorted_insert_spills() {
 /// of them apart.
 async fn compaction_lake() -> Lake {
     let lake = sqlite()(None).await;
-    sorted_table(&lake, "t", &[("(k % 7)", SortDirection::Asc, NullOrder::NullsLast)], false);
+    sorted_table(
+        &lake,
+        "t",
+        &[("(k % 7)", SortDirection::Asc, NullOrder::NullsLast)],
+        false,
+    );
     let mut options = options(0);
     options.target_file_size = None;
     let small = input(14_000, 997);
@@ -645,7 +714,6 @@ async fn merge(lake: &Lake, runtime: RuntimeEnvBuilder, target: u64) -> Result<u
                 target_file_size: target,
                 max_merged_files: 100,
                 min_file_size: 0,
-                ..MergeOptions::default()
             },
         )
         .await
@@ -671,12 +739,27 @@ async fn a_sorted_compaction_spills_or_is_refused_whole() {
         .await
         .expect_err("the second bin's sort does not fit the pool");
     assert!(refused.contains("Resources exhausted"), "{refused}");
-    assert_eq!((committed(&lake, "t"), on_disk(&lake, "t")), before, "nothing left");
+    assert_eq!(
+        (committed(&lake, "t"), on_disk(&lake, "t")),
+        before,
+        "nothing left"
+    );
 
     let reference = compaction_lake().await;
-    assert_eq!(merge(&reference, RuntimeEnvBuilder::new(), target).await, Ok(2));
+    assert_eq!(
+        merge(&reference, RuntimeEnvBuilder::new(), target).await,
+        Ok(2)
+    );
     let factory = CountingFactory::new(None);
-    assert_eq!(merge(&lake, runtime(SMALL_POOL, Some(Arc::clone(&factory))), target).await, Ok(2));
+    assert_eq!(
+        merge(
+            &lake,
+            runtime(SMALL_POOL, Some(Arc::clone(&factory))),
+            target
+        )
+        .await,
+        Ok(2)
+    );
     assert!(factory.created() > 0, "the compaction's sort spilled");
     let rows = |lake: &Lake| -> Vec<Vec<(Option<i64>, String)>> {
         layout(lake, "t")
@@ -685,10 +768,17 @@ async fn a_sorted_compaction_spills_or_is_refused_whole() {
             .collect()
     };
     let spilled = rows(&lake);
-    assert_eq!(spilled, rows(&reference), "the same files, rows in the same order");
+    assert_eq!(
+        spilled,
+        rows(&reference),
+        "the same files, rows in the same order"
+    );
     for file in &spilled {
         let key = |row: &(Option<i64>, String)| row.0.map_or(i64::MAX, |k| k % 7);
-        assert!(file.windows(2).all(|w| key(&w[0]) <= key(&w[1])), "in `(k % 7)` order");
+        assert!(
+            file.windows(2).all(|w| key(&w[0]) <= key(&w[1])),
+            "in `(k % 7)` order"
+        );
     }
 }
 
@@ -703,7 +793,12 @@ async fn a_sorted_compaction_spills_or_is_refused_whole() {
 async fn a_sorted_insert_that_fits_the_pool_is_not_refused_by_its_charge() {
     for key in ["k", "(k + 1)"] {
         let lake = sqlite()(None).await;
-        sorted_table(&lake, "t", &[(key, SortDirection::Asc, NullOrder::NullsLast)], true);
+        sorted_table(
+            &lake,
+            "t",
+            &[(key, SortDirection::Asc, NullOrder::NullsLast)],
+            true,
+        );
         let mut options = DuckLakeWriteOptions::default();
         options.data_inlining_row_limit = Some(10);
         let ctx = session(&lake, &options, runtime(256 * MIB, None), &input(1, 1));
@@ -721,6 +816,9 @@ async fn a_sorted_insert_that_fits_the_pool_is_not_refused_by_its_charge() {
             .flat_map(|file| file.2.into_iter().map(|row| row.1))
             .collect();
         assert_eq!(keys.len(), 986_895, "`{key}`");
-        assert!(keys.windows(2).all(|w| w[0] <= w[1]), "`{key}`: in key order");
+        assert!(
+            keys.windows(2).all(|w| w[0] <= w[1]),
+            "`{key}`: in key order"
+        );
     }
 }

@@ -620,16 +620,17 @@ async fn insert_sorted(
             .cloned()
             .collect::<Vec<_>>(),
     );
-    let limit = DuckLakeTableWriter::new(Arc::clone(&target.writer), Arc::clone(&target.object_store))
-        .map_err(external)?
-        .with_options(target.write_options)
-        .inline_row_limit(
-            target.schema_name,
-            target.table_name,
-            target.write_mode,
-            &schema_without_metadata,
-        )
-        .map_err(external)?;
+    let limit =
+        DuckLakeTableWriter::new(Arc::clone(&target.writer), Arc::clone(&target.object_store))
+            .map_err(external)?
+            .with_options(target.write_options)
+            .inline_row_limit(
+                target.schema_name,
+                target.table_name,
+                target.write_mode,
+                &schema_without_metadata,
+            )
+            .map_err(external)?;
     let mut batches = Vec::new();
     let mut rows = 0usize;
     while rows <= limit {
@@ -648,11 +649,14 @@ async fn insert_sorted(
     // would have spilled). Not taken when the pool cannot spare it.
     let estimate = session_headroom(&batches, rows, target.write_options);
     held.free();
-    let mut headroom =
+    let headroom =
         datafusion::execution::memory_pool::MemoryConsumer::new("DuckLakeInsertExec headroom")
             .register(context.memory_pool());
     if headroom.try_grow(estimate).is_err() {
-        tracing::debug!(estimate, "no headroom for an insert's session beside its sort");
+        tracing::debug!(
+            estimate,
+            "no headroom for an insert's session beside its sort"
+        );
     }
     let schema = input.schema();
     let rest: SendableRecordBatchStream = Box::pin(
@@ -678,7 +682,13 @@ async fn insert_sorted(
     };
     // The session is charged what it holds from here (`stream_into`).
     drop(headroom);
-    let rows = Box::pin(insert_streamed(target, first, sorted, context.memory_pool())).await?;
+    let rows = Box::pin(insert_streamed(
+        target,
+        first,
+        sorted,
+        context.memory_pool(),
+    ))
+    .await?;
     Ok(Sorted::Written(rows))
 }
 
@@ -698,7 +708,9 @@ fn session_headroom(
         group = group.min(cap);
     }
     let part = match options.staging {
-        Some(crate::Staging::Parts { part_bytes }) => part_bytes,
+        Some(crate::Staging::Parts {
+            part_bytes,
+        }) => part_bytes,
         // The default on `wasm32`.
         None if cfg!(target_arch = "wasm32") => crate::Staging::DEFAULT_PART_BYTES,
         _ => 0,

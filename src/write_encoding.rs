@@ -266,11 +266,12 @@ fn sliced_memory_size(batch: &RecordBatch) -> usize {
 /// 57 MiB a batch). The copy is of the buffered rows' strings only, once per
 /// file. A view nested in another type is still counted whole.
 fn compact_views(batch: &RecordBatch) -> Result<RecordBatch> {
-    if !batch
-        .columns()
-        .iter()
-        .any(|column| matches!(column.data_type(), DataType::Utf8View | DataType::BinaryView))
-    {
+    if !batch.columns().iter().any(|column| {
+        matches!(
+            column.data_type(),
+            DataType::Utf8View | DataType::BinaryView
+        )
+    }) {
         return Ok(batch.clone());
     }
     let columns = batch

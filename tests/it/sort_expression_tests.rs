@@ -414,10 +414,34 @@ async fn writer_sorted_inserts_order_as_the_duckdb_cli() {
         )
     };
     let cases = [
-        (COLUMNS, "ti", format!("VALUES {ROWS}"), format!("VALUES {ROWS}"), None),
-        (COLUMNS, "ti DESC NULLS FIRST, id", format!("VALUES {ROWS}"), format!("VALUES {ROWS}"), None),
-        (COLUMNS, "d DESC", format!("VALUES {ROWS}"), format!("VALUES {ROWS}"), None),
-        (COLUMNS, "s, id DESC", format!("VALUES {ROWS}"), format!("VALUES {ROWS}"), None),
+        (
+            COLUMNS,
+            "ti",
+            format!("VALUES {ROWS}"),
+            format!("VALUES {ROWS}"),
+            None,
+        ),
+        (
+            COLUMNS,
+            "ti DESC NULLS FIRST, id",
+            format!("VALUES {ROWS}"),
+            format!("VALUES {ROWS}"),
+            None,
+        ),
+        (
+            COLUMNS,
+            "d DESC",
+            format!("VALUES {ROWS}"),
+            format!("VALUES {ROWS}"),
+            None,
+        ),
+        (
+            COLUMNS,
+            "s, id DESC",
+            format!("VALUES {ROWS}"),
+            format!("VALUES {ROWS}"),
+            None,
+        ),
         (
             MANY,
             "k DESC NULLS FIRST, id",
@@ -509,6 +533,9 @@ async fn writer_sorted_inserts_order_as_the_duckdb_cli() {
             })
             .collect();
         assert_eq!(ours.len(), official.len(), "`{keys}`");
-        assert!(ours == official, "`{keys}`: our order differs from official's");
+        assert!(
+            ours == official,
+            "`{keys}`: our order differs from official's"
+        );
     }
 }
