@@ -277,15 +277,86 @@ pub(crate) fn sort_stream(
     )))
 }
 
-/// `array` typed as `planned`: itself when it is, else cast to it. A batch
-/// may name a list's or a struct's fields otherwise than its stream's schema
-/// (`DataType::equals_datatype` holds), while the sort builds its batches
-/// against the schema, which must match exactly.
+/// `array` typed as `planned`, where the two are the same type up to nested
+/// field names and metadata (`DataType::equals_datatype`): itself when it is
+/// `planned` exactly, else rebuilt under `planned` with the same children, BY
+/// POSITION, as `equals_datatype` matched them and DataFusion reads them (not
+/// `arrow::compute::cast`, which matches a struct's fields by name). A batch
+/// may name a list's or a struct's fields otherwise than its stream's schema,
+/// while the sort builds its batches against the schema, which must match
+/// exactly. A nested type not rebuilt here is an error.
 fn as_planned(array: ArrayRef, planned: &DataType) -> Result<ArrayRef> {
+    use arrow::array::{
+        Array, AsArray, FixedSizeListArray, LargeListArray, ListArray, MapArray, StructArray,
+    };
     if array.data_type() == planned {
         return Ok(array);
     }
-    Ok(arrow::compute::cast(&array, planned)?)
+    let mismatch = || {
+        DataFusionError::Internal(format!(
+            "an insert's sort: {} is not {planned} by position",
+            array.data_type()
+        ))
+    };
+    if !array.data_type().equals_datatype(planned) {
+        return Err(mismatch());
+    }
+    let rebuilt: ArrayRef = match planned {
+        DataType::Struct(fields) => {
+            let from = array.as_struct();
+            let children = from
+                .columns()
+                .iter()
+                .zip(fields.iter())
+                .map(|(child, field)| as_planned(Arc::clone(child), field.data_type()))
+                .collect::<Result<Vec<_>>>()?;
+            Arc::new(StructArray::try_new(
+                fields.clone(),
+                children,
+                from.nulls().cloned(),
+            )?)
+        },
+        DataType::List(field) => {
+            let from = array.as_list::<i32>();
+            Arc::new(ListArray::try_new(
+                Arc::clone(field),
+                from.offsets().clone(),
+                as_planned(Arc::clone(from.values()), field.data_type())?,
+                from.nulls().cloned(),
+            )?)
+        },
+        DataType::LargeList(field) => {
+            let from = array.as_list::<i64>();
+            Arc::new(LargeListArray::try_new(
+                Arc::clone(field),
+                from.offsets().clone(),
+                as_planned(Arc::clone(from.values()), field.data_type())?,
+                from.nulls().cloned(),
+            )?)
+        },
+        DataType::FixedSizeList(field, size) => {
+            let from = array.as_fixed_size_list();
+            Arc::new(FixedSizeListArray::try_new(
+                Arc::clone(field),
+                *size,
+                as_planned(Arc::clone(from.values()), field.data_type())?,
+                from.nulls().cloned(),
+            )?)
+        },
+        DataType::Map(field, ordered) => {
+            let from = array.as_map();
+            let entries = as_planned(Arc::new(from.entries().clone()), field.data_type())?;
+            Arc::new(MapArray::try_new(
+                Arc::clone(field),
+                from.offsets().clone(),
+                entries.as_struct().clone(),
+                from.nulls().cloned(),
+                *ordered,
+            )?)
+        },
+        _ => return Err(mismatch()),
+    };
+    Ok(rebuilt)
 }
 
 /// `input` sorted by `ordering` in a `SortExec` over `context`, kept in `slot`.
@@ -738,5 +809,75 @@ mod tests {
             })
             .collect();
         assert_eq!(firsts, (0..20).collect::<Vec<_>>(), "sorted by the key");
+    }
+
+    /// A struct key whose batches name its fields in another order than the
+    /// stream's schema (`{a BIGINT, b VARCHAR}` against `{b BIGINT, a VARCHAR}`)
+    /// is the same key BY POSITION, as `equals_datatype` and DataFusion read it:
+    /// sorted by its first field, the BIGINTs. (`arrow::compute::cast` would
+    /// match the fields by name and cast the strings to BIGINT.)
+    #[tokio::test]
+    async fn a_struct_key_named_in_another_order_is_its_fields_by_position() {
+        use arrow::array::{AsArray, StructArray};
+        let fields = |first: &str, second: &str| {
+            arrow::datatypes::Fields::from(vec![
+                Field::new(first, DataType::Int64, true),
+                Field::new(second, DataType::Utf8, true),
+            ])
+        };
+        let planned = Arc::new(Schema::new(vec![Field::new(
+            "k",
+            DataType::Struct(fields("b", "a")),
+            true,
+        )]));
+        let own = Arc::new(Schema::new(vec![Field::new(
+            "k",
+            DataType::Struct(fields("a", "b")),
+            true,
+        )]));
+        let batches: Vec<RecordBatch> = (0..4i64)
+            .map(|b| {
+                let ints: Int64Array = (0..5i64).map(|i| Some((b * 5 + i) * 7 % 20)).collect();
+                let text: StringArray =
+                    (0..5i64).map(|i| Some(format!("x{}", b * 5 + i))).collect();
+                let column = StructArray::try_new(
+                    fields("a", "b"),
+                    vec![Arc::new(ints), Arc::new(text)],
+                    None,
+                )
+                .unwrap();
+                RecordBatch::try_new(Arc::clone(&own), vec![Arc::new(column)]).unwrap()
+            })
+            .collect();
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&planned),
+            stream::iter(batches.into_iter().map(Ok)),
+        ));
+        let keys =
+            vec![PhysicalSortExpr::new(Arc::new(Column::new("k", 0)), SortOptions::default())];
+        let slot = SortSlot::default();
+        let sorted: Vec<RecordBatch> = sort_stream(input, keys, spilling_context(1 << 30), &slot)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let firsts: Vec<i64> = sorted
+            .iter()
+            .flat_map(|batch| {
+                let column = batch.column(0).as_struct();
+                assert_eq!(column.fields(), &fields("b", "a"), "typed as planned");
+                let ints = column
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                ints.values().to_vec()
+            })
+            .collect();
+        assert_eq!(
+            firsts,
+            (0..20).collect::<Vec<_>>(),
+            "sorted by the first field"
+        );
     }
 }

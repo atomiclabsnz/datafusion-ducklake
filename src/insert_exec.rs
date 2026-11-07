@@ -389,15 +389,18 @@ impl ExecutionPlan for DuckLakeInsertExec {
                         let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![rows]));
                         return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
                     },
-                    // At most what could be inlined: decided whole, as before.
+                    // The input the collected path takes: written by it, as before.
                     Sorted::Held(batches) => batches,
                 }
             } else if streams {
                 // Rows the plan sorted come once its sort has read them all,
                 // from a merge that takes what the pool has free: room for the
                 // session is held until they do, as for the writer's own sort
-                // (`insert_sorted`), its rows' strings not known.
-                let headroom = sort_plan.sorted.then(|| {
+                // (`insert_sorted`), its rows' strings not known. Only for a
+                // plan whose one sort runs in one partition: with a sort per
+                // partition each takes its own merge reservation, and the
+                // room is not taken (as before slice 4).
+                let headroom = (sort_plan.sorted && one_sort_in_one_partition(&input)).then(|| {
                     reserve_headroom(
                         &context,
                         session_headroom(
@@ -599,21 +602,28 @@ struct StreamedInsert<'a> {
 enum Sorted {
     /// Sorted and written: the rows written.
     Written(u64),
-    /// Not written: the input, every batch, holding at most the rows that
-    /// could be inlined, for the collected path to decide whole.
+    /// Not written: the whole input, held and charged as the collected path
+    /// holds it, for that path to write as it always has.
     Held(Vec<RecordBatch>),
 }
 
-/// An insert whose rows the writer sorts by `spec`, streamed: `input`'s
-/// batches are held (charged to `held`, `copies` times their size, as the
-/// collected path charges them) while they number at most the rows a write
-/// could inline ([`DuckLakeTableWriter::inline_row_limit`]); a write of no
-/// more is returned [`Sorted::Held`], so its layout is decided whole, as
-/// before. Past them no row can be inlined, so the rows are sorted as the
-/// writer sorts rows written to Parquet ([`crate::sort::sort_exprs`], in
-/// DataFusion's spilling sort over `context`, [`crate::insert_sort`]) and
-/// streamed into a session ([`insert_streamed`]). The held batches' charge is
-/// released first: the sort charges what it holds.
+/// An insert whose rows the writer sorts by `spec`. Its input is held and
+/// charged to `held` (`copies` times its size) exactly as the collected path
+/// holds it, and a write whose input that pool takes is returned
+/// [`Sorted::Held`], for the collected path to write: in memory, inlined or
+/// not, as before the sort streamed. So no write the collected path completes
+/// takes another route, whatever the pool (a fair pool's share of it for a
+/// spillable sort is not what the collected path's charge is given).
+///
+/// Only where the collected path is refused (the charge fails) and the
+/// runtime can spill (a disk manager that makes files) do the rows go further:
+/// the held ones and the rest are sorted as the writer sorts rows written to
+/// Parquet ([`crate::sort::sort_exprs`], in DataFusion's spilling sort over
+/// `context`, [`crate::insert_sort`]) and streamed into a session
+/// ([`insert_streamed`]), the held charge released first (the sort charges
+/// what it holds), room for the session held beside the sort until its first
+/// row ([`reserve_headroom`]). With nothing to spill to the refusal stands, as
+/// before.
 ///
 /// A failure of the sort (the pool, the spill budget, the input) before its
 /// first row leaves no session; after it, the session is aborted
@@ -636,33 +646,27 @@ async fn insert_sorted(
             .cloned()
             .collect::<Vec<_>>(),
     );
-    let limit =
-        DuckLakeTableWriter::new(Arc::clone(&target.writer), Arc::clone(&target.object_store))
-            .map_err(external)?
-            .with_options(target.write_options)
-            .inline_row_limit(
-                target.schema_name,
-                target.table_name,
-                target.write_mode,
-                &schema_without_metadata,
-            )
-            .map_err(external)?;
     let mut batches = Vec::new();
     let mut rows = 0usize;
-    while rows <= limit {
+    loop {
         let Some(batch) = input.next().await else {
             return Ok(Sorted::Held(batches));
         };
         let batch = batch?;
-        held.try_grow(batch.get_array_memory_size() * copies)?;
+        let refused = held.try_grow(batch.get_array_memory_size() * copies);
         rows += batch.num_rows();
         batches.push(batch);
+        if let Err(refusal) = refused {
+            if !context.runtime_env().disk_manager.tmp_files_enabled() {
+                return Err(refusal);
+            }
+            break;
+        }
     }
-    // Room for the session beside the sort ([`session_headroom`]), held
-    // until the sort's first row. Without it a sort that just fits the pool
-    // keeps it all, or its merge takes what is left, and the session then
-    // finds none (refused at the pool, where with a disk manager the sort
-    // would have spilled).
+    // Past what the collected path holds, with a disk manager: the spilling
+    // sort. Room for the session beside it ([`session_headroom`]), held until
+    // its first row: without it the sort's spill merge takes what the pool
+    // has free, and the session then finds none.
     let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
     held.free();
     let schema = input.schema();
@@ -779,6 +783,25 @@ fn reserve_headroom(
         tracing::debug!(bytes, "no headroom for an insert's session beside its sort");
     }
     headroom
+}
+
+/// Whether `plan` sorts in exactly one `SortExec` that runs in one partition
+/// (one sorter, one merge reservation): the only shape [`reserve_headroom`]'s
+/// cap accounts for.
+fn one_sort_in_one_partition(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    fn sorts(plan: &Arc<dyn ExecutionPlan>, found: &mut Vec<usize>) {
+        if let Some(sort) = (plan.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<datafusion::physical_plan::sorts::sort::SortExec>()
+        {
+            found.push(sort.properties().output_partitioning().partition_count());
+        }
+        for child in plan.children() {
+            sorts(child, found);
+        }
+    }
+    let mut found = Vec::new();
+    sorts(plan, &mut found);
+    found == [1]
 }
 
 /// What a write session of rows of `schema`, `per_row` bytes each, holds at

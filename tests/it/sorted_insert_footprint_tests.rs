@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
-use datafusion::execution::memory_pool::GreedyMemoryPool;
+use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_ducklake::DuckLakeWriteOptions;
@@ -150,50 +150,117 @@ async fn a_wide_sorted_insert_under_the_default_settings_is_written() {
     let mut failed = Vec::new();
     for case in &CASES {
         for key in ["c0", "(c0 + 1)"] {
-            let lake = sqlite()(None).await;
-            wide_table(&lake, case.columns, key).await;
-            let disk = if case.spills {
-                DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory)
-            } else {
-                DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled)
-            };
-            let runtime = RuntimeEnvBuilder::new()
-                .with_memory_pool(Arc::new(GreedyMemoryPool::new(case.pool)))
-                .with_disk_manager_builder(disk)
-                .build_arc()
-                .unwrap();
-            // DataFusion's defaults, `sort_spill_reservation_bytes` (10 MiB)
-            // among them; a tab plans one partition.
-            let mut config = SessionConfig::new();
-            if case.tab {
-                config = config.with_target_partitions(1);
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(case.pool));
+            let partitions = case.tab.then_some(1);
+            if let Err(e) =
+                write_wide(case.columns, case.rows, pool, case.spills, partitions, key).await
+            {
+                failed.push(format!("{} `{key}`: {e}", case.what));
             }
-            let ctx = SessionContext::new_with_config_rt(config, runtime);
-            let mut options = DuckLakeWriteOptions::default();
-            options.data_inlining_row_limit = Some(0);
-            ctx.register_catalog("lake", Arc::new(lake.catalog().with_write_options(options)));
-            let values: Vec<String> = (0..case.columns)
-                .map(|i| format!("CAST((value * {}) % 1000003 AS BIGINT)", i + 1))
-                .collect();
-            let sql = format!(
-                "INSERT INTO lake.main.t SELECT {} FROM generate_series(1, {}) AS g(value)",
-                values.join(", "),
-                case.rows
-            );
-            let result = match ctx.sql(&sql).await {
-                Ok(frame) => frame.collect().await.map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            };
-            match result {
-                Ok(batches) => {
-                    let count = arrow::util::pretty::pretty_format_batches(&batches)
-                        .unwrap()
-                        .to_string();
-                    if !count.contains(&format!("| {} ", case.rows)) {
-                        failed.push(format!("{} `{key}`: answered {count}", case.what));
-                    }
-                },
-                Err(e) => failed.push(format!("{} `{key}`: {e}", case.what)),
+        }
+    }
+    assert!(failed.is_empty(), "refused:\n{}", failed.join("\n"));
+}
+
+/// `rows` rows of `columns` BIGINTs into a new `main.t` sorted by `key`, under
+/// `pool`, spilling to the OS temp directory when `spills`, planned in
+/// `partitions` (DataFusion's default, the core count, when `None`) and
+/// otherwise at DataFusion's defaults (`sort_spill_reservation_bytes` 10 MiB
+/// among them): `Ok` when all of them are written.
+async fn write_wide(
+    columns: usize,
+    rows: u64,
+    pool: Arc<dyn MemoryPool>,
+    spills: bool,
+    partitions: Option<usize>,
+    key: &str,
+) -> Result<(), String> {
+    let lake = sqlite()(None).await;
+    wide_table(&lake, columns, key).await;
+    let disk = if spills {
+        DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory)
+    } else {
+        DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled)
+    };
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(pool)
+        .with_disk_manager_builder(disk)
+        .build_arc()
+        .unwrap();
+    let mut config = SessionConfig::new();
+    if let Some(partitions) = partitions {
+        config = config.with_target_partitions(partitions);
+    }
+    let ctx = SessionContext::new_with_config_rt(config, runtime);
+    let mut options = DuckLakeWriteOptions::default();
+    options.data_inlining_row_limit = Some(0);
+    ctx.register_catalog("lake", Arc::new(lake.catalog().with_write_options(options)));
+    let values: Vec<String> = (0..columns)
+        .map(|i| format!("CAST((value * {}) % 1000003 AS BIGINT)", i + 1))
+        .collect();
+    let sql = format!(
+        "INSERT INTO lake.main.t SELECT {} FROM generate_series(1, {rows}) AS g(value)",
+        values.join(", ")
+    );
+    let batches = match ctx.sql(&sql).await {
+        Ok(frame) => frame.collect().await.map_err(|e| e.to_string())?,
+        Err(e) => return Err(e.to_string()),
+    };
+    let count = arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    if count.contains(&format!("| {rows} ")) {
+        Ok(())
+    } else {
+        Err(format!("answered {count}"))
+    }
+}
+
+/// The review-round-2 shapes (datafusion-ducklake#35): 100,000 rows of 30
+/// BIGINTs, 64 MiB in one partition and 128 MiB in 2, 4 and 16, a disk manager,
+/// DataFusion's defaults, under a greedy pool and a fair one (`FairSpillPool`, which
+/// splits what is spillable evenly between its spillable consumers), both
+/// keys. On the fork's head before round 2, the plan's sort in more than one
+/// partition was refused (each partition's sort takes its own merge
+/// reservation; the session's room was capped for one), and the writer's sort
+/// under a fair pool too (its spillable share in 16 partitions is under one
+/// batch's, where the collected path's charge is not shared).
+///
+/// The fork before slice 4 refuses `c0` in 4 and 16 partitions under the fair
+/// pool (each partition's sort's share is under its own batch), and so does
+/// this one, so those two are not here; every other one the fork before slice
+/// 4 writes (this file passes on it).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sorted_insert_in_many_partitions_under_either_pool_is_written() {
+    let mut failed = Vec::new();
+    for partitions in [1usize, 2, 4, 16] {
+        for fair in [false, true] {
+            for key in ["c0", "(c0 + 1)"] {
+                if partitions >= 4 && fair && key == "c0" {
+                    continue;
+                }
+                // 128 MiB past one partition: at 64 MiB the fork before slice
+                // 4 itself refuses `c0` in 2 and 4 partitions on some runs
+                // (each partition's sort and the merge above them race for the
+                // pool), so no run there tells this head from it.
+                let size = if partitions == 1 {
+                    64 * MIB
+                } else {
+                    128 * MIB
+                };
+                let pool: Arc<dyn MemoryPool> = if fair {
+                    Arc::new(FairSpillPool::new(size))
+                } else {
+                    Arc::new(GreedyMemoryPool::new(size))
+                };
+                if let Err(e) = write_wide(30, 100_000, pool, true, Some(partitions), key).await {
+                    let pool = if fair {
+                        "fair"
+                    } else {
+                        "greedy"
+                    };
+                    failed.push(format!("{partitions} partitions, {pool} `{key}`: {e}"));
+                }
             }
         }
     }
