@@ -5906,6 +5906,7 @@ impl TableProvider for DuckLakeTable {
         // holds, so a missing sort column fails here, before execution.
         let mut planned_sort_on_insert = None;
         let mut planned_no_sort_order = false;
+        let mut planned_writer_sort = None;
         let ordering = match self
             .provider
             .get_sort_spec(self.table_id, head_snapshot)
@@ -5946,6 +5947,15 @@ impl TableProvider for DuckLakeTable {
                 if sort_on_insert && bare_columns {
                     sort_ordering_for(&input.schema(), Some(&spec))?
                 } else {
+                    // Left to the writer: it sorts the rows it writes to
+                    // Parquet with the option on, or off while inlining is
+                    // enabled, and none otherwise. Executed as a spilling sort
+                    // (`DuckLakeInsertExec`, `crate::insert_sort`).
+                    planned_writer_sort = Some(if sort_on_insert || inlining_enabled {
+                        crate::insert_exec::WriterSort::Sorted(spec)
+                    } else {
+                        crate::insert_exec::WriterSort::Unsorted
+                    });
                     None
                 }
             },
@@ -5980,7 +5990,8 @@ impl TableProvider for DuckLakeTable {
             )
             .with_planned_snapshot(self.snapshot_id)
             .with_planned_sort_on_insert(planned_sort_on_insert)
-            .with_planned_no_sort_order(planned_no_sort_order),
+            .with_planned_no_sort_order(planned_no_sort_order)
+            .with_planned_writer_sort(planned_writer_sort),
         ))
     }
 

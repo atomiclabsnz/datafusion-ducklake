@@ -533,17 +533,60 @@ async fn first_nonempty(
 /// arrival order. `unsorted` re-executes the sources from a fresh plan state
 /// (`reset_plan_states`); an error that is not the key's (a source that
 /// cannot be read) fails that run too.
+///
+/// The sort's own refusals are not the key's and fail the compaction: the
+/// pool (`ResourcesExhausted`, a sort past it with no disk manager to spill
+/// to) and its spill files' I/O (a spill budget spent, ferrion's
+/// `spill_limit_exceeded`). Writing the rows unsorted instead would answer a
+/// memory limit with a different layout, silently (ADR-0037 slice 4 in
+/// ferrion: a sort past the pool spills where the session can, and is refused
+/// where it cannot).
 async fn first_nonempty_sorted(
     sorted: Result<SendableRecordBatchStream>,
     unsorted: impl FnOnce() -> Result<SendableRecordBatchStream>,
 ) -> Result<Option<SendableRecordBatchStream>> {
-    match sorted.map(first_nonempty) {
-        Ok(first) => match first.await {
-            Ok(first) => Ok(first),
-            Err(_) => first_nonempty(unsorted()?).await,
+    let error = match sorted {
+        Ok(sorted) => match first_nonempty(sorted).await {
+            Ok(first) => return Ok(first),
+            Err(error) => error,
         },
-        Err(_) => first_nonempty(unsorted()?).await,
+        Err(error) => error,
+    };
+    if is_the_sorts_refusal(&error) {
+        return Err(error);
     }
+    first_nonempty(unsorted()?).await
+}
+
+/// Whether `error` is a sort refused by its resources rather than by its key:
+/// a `ResourcesExhausted` or an I/O error anywhere in its chain
+/// ([`first_nonempty_sorted`]).
+fn is_the_sorts_refusal(error: &DuckLakeError) -> bool {
+    fn refusal(error: &(dyn std::error::Error + 'static)) -> bool {
+        if let Some(error) = error.downcast_ref::<datafusion::error::DataFusionError>() {
+            return matches!(
+                error,
+                datafusion::error::DataFusionError::ResourcesExhausted(_)
+                    | datafusion::error::DataFusionError::IoError(_)
+            ) || matches!(
+                error,
+                datafusion::error::DataFusionError::ArrowError(error, _)
+                    if matches!(error.as_ref(), arrow::error::ArrowError::IoError(..))
+            );
+        }
+        if let Some(error) = error.downcast_ref::<arrow::error::ArrowError>() {
+            return matches!(error, arrow::error::ArrowError::IoError(..));
+        }
+        error.downcast_ref::<std::io::Error>().is_some()
+    }
+    let mut at: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = at {
+        if refusal(error) {
+            return true;
+        }
+        at = error.source();
+    }
+    false
 }
 
 /// A file's partition identity, normalized for grouping and comparison: the spec
@@ -1136,190 +1179,209 @@ impl DuckLakeTable {
         let mut files_processed = 0usize;
         let mut rows_written = 0i64;
 
-        for bin in &bins {
-            // Every source's snapshot bounds are catalog metadata, so the shape
-            // of the output is settled before a single row is read.
-            //
-            // A source spans the snapshot RANGE `[begin_snapshot, partial_max]` —
-            // a point for an ordinary file, a genuine interval for a partial one
-            // — so the output spans the union of those ranges: it begins at the
-            // MINIMUM origin (so historical reads back to that point see it,
-            // row-filtered by origin) and its `partial_max` is the maximum origin
-            // any of its rows carries. `GetCompactionChanges`
-            // (`ducklake_transaction_state.cpp`) derives the same two values the
-            // same way. The sources are then redundant for every snapshot, so the
-            // commit removes + schedules them.
-            //
-            // The output is partial whenever its rows do not all share one
-            // origin, and ALSO whenever any source physically carries the
-            // embedded column. That second disjunct is what keeps a re-merge
-            // lossless when the catalog understates a source: writing a
-            // non-partial output would drop the snapshot column AND record
-            // `partial_max` NULL, so no reader would look for those origins
-            // again — and this same commit removes the sources.
-            let mut range_mins: Vec<i64> = Vec::with_capacity(bin.len());
-            let mut range_maxes: Vec<i64> = Vec::with_capacity(bin.len());
-            for tf in bin {
-                let begin = tf.begin_snapshot.ok_or_else(|| {
-                    DuckLakeError::Internal("merge candidate missing begin_snapshot".to_string())
-                })?;
-                range_mins.push(begin);
-                range_maxes.push(tf.partial_max.unwrap_or(begin));
-            }
-            let min_origin = range_mins.iter().copied().min();
-            let max_origin = range_maxes.iter().copied().max();
-            let embeds_origins = |tf: &DuckLakeTableFile| {
-                source_facts
-                    .get(&tf.data_file_id)
-                    .is_some_and(|facts| facts.has_embedded_snapshot)
-            };
-            let partial = min_origin != max_origin || bin.iter().any(|tf| embeds_origins(tf));
+        // Whole or nothing: a bin that fails (its sort refused at the pool
+        // or past its spill budget, a source unreadable) leaves none of the
+        // files the ones before it wrote, as a refused commit leaves none.
+        let written: Result<()> = async {
+            for bin in &bins {
+                // Every source's snapshot bounds are catalog metadata, so the shape
+                // of the output is settled before a single row is read.
+                //
+                // A source spans the snapshot RANGE `[begin_snapshot, partial_max]` —
+                // a point for an ordinary file, a genuine interval for a partial one
+                // — so the output spans the union of those ranges: it begins at the
+                // MINIMUM origin (so historical reads back to that point see it,
+                // row-filtered by origin) and its `partial_max` is the maximum origin
+                // any of its rows carries. `GetCompactionChanges`
+                // (`ducklake_transaction_state.cpp`) derives the same two values the
+                // same way. The sources are then redundant for every snapshot, so the
+                // commit removes + schedules them.
+                //
+                // The output is partial whenever its rows do not all share one
+                // origin, and ALSO whenever any source physically carries the
+                // embedded column. That second disjunct is what keeps a re-merge
+                // lossless when the catalog understates a source: writing a
+                // non-partial output would drop the snapshot column AND record
+                // `partial_max` NULL, so no reader would look for those origins
+                // again — and this same commit removes the sources.
+                let mut range_mins: Vec<i64> = Vec::with_capacity(bin.len());
+                let mut range_maxes: Vec<i64> = Vec::with_capacity(bin.len());
+                for tf in bin {
+                    let begin = tf.begin_snapshot.ok_or_else(|| {
+                        DuckLakeError::Internal(
+                            "merge candidate missing begin_snapshot".to_string(),
+                        )
+                    })?;
+                    range_mins.push(begin);
+                    range_maxes.push(tf.partial_max.unwrap_or(begin));
+                }
+                let min_origin = range_mins.iter().copied().min();
+                let max_origin = range_maxes.iter().copied().max();
+                let embeds_origins = |tf: &DuckLakeTableFile| {
+                    source_facts
+                        .get(&tf.data_file_id)
+                        .is_some_and(|facts| facts.has_embedded_snapshot)
+                };
+                let partial = min_origin != max_origin || bin.iter().any(|tf| embeds_origins(tf));
 
-            // Rowid-adjacent sources: the output embeds no rowid column and
-            // keeps the first source's `row_id_start`, so each row's rowid is
-            // that start plus its position in the output, as in official
-            // DuckLake's merge (`adjacent_row_id_start`). The rule reads only
-            // the catalog ranges, so a source that physically embeds rowids
-            // (an inlined-data flush records both the column and a range)
-            // qualifies too, and its rows are taken in file order like any
-            // other source's. Under a sort order the rows are written in
-            // sorted order, so a row the sort moves takes the rowid of its new
-            // position, as in official.
-            let carried_row_id_start = adjacent_row_id_start(bin);
-            // Seeded from the catalog so a bin that embeds nothing still reports
-            // its range; every leaf raises it to what it actually emitted.
-            let observed_max_origin = Arc::new(AtomicI64::new(max_origin.unwrap_or(i64::MIN)));
+                // Rowid-adjacent sources: the output embeds no rowid column and
+                // keeps the first source's `row_id_start`, so each row's rowid is
+                // that start plus its position in the output, as in official
+                // DuckLake's merge (`adjacent_row_id_start`). The rule reads only
+                // the catalog ranges, so a source that physically embeds rowids
+                // (an inlined-data flush records both the column and a range)
+                // qualifies too, and its rows are taken in file order like any
+                // other source's. Under a sort order the rows are written in
+                // sorted order, so a row the sort moves takes the rowid of its new
+                // position, as in official.
+                let carried_row_id_start = adjacent_row_id_start(bin);
+                // Seeded from the catalog so a bin that embeds nothing still reports
+                // its range; every leaf raises it to what it actually emitted.
+                let observed_max_origin = Arc::new(AtomicI64::new(max_origin.unwrap_or(i64::MIN)));
 
-            // ONE execution over the whole bin, so DataFusion reads every source
-            // concurrently instead of one object-store round trip at a time.
-            // Each source contributes a leaf that carries its own rowid lineage
-            // (and, for a partial merge, its origin snapshot) as columns, which
-            // is what makes the single scan possible — the same shape official
-            // DuckLake compaction uses.
-            let mut leaves: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(bin.len());
-            for (tf, begin) in bin.iter().zip(&range_mins) {
-                // One fact — does this file physically carry the embedded column
-                // — decides both the scan's projection and where the exec reads
-                // origins from, so the two can never disagree and stamp a
-                // per-row-origin source with a single `begin_snapshot`. A source
-                // that carries it forces `partial`, so the column always has
-                // somewhere to go.
-                let source_embeds_origins = embeds_origins(tf);
-                let origin = partial.then_some(if source_embeds_origins {
-                    OriginSource::Embedded
-                } else {
-                    OriginSource::Constant(*begin)
-                });
-                let scan = self
-                    .build_update_scan_with_snapshot(
-                        state,
-                        tf,
-                        source_embeds_origins,
-                        inlined_deletes.get(&tf.data_file_id),
-                        None,
+                // ONE execution over the whole bin, so DataFusion reads every source
+                // concurrently instead of one object-store round trip at a time.
+                // Each source contributes a leaf that carries its own rowid lineage
+                // (and, for a partial merge, its origin snapshot) as columns, which
+                // is what makes the single scan possible — the same shape official
+                // DuckLake compaction uses.
+                let mut leaves: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(bin.len());
+                for (tf, begin) in bin.iter().zip(&range_mins) {
+                    // One fact — does this file physically carry the embedded column
+                    // — decides both the scan's projection and where the exec reads
+                    // origins from, so the two can never disagree and stamp a
+                    // per-row-origin source with a single `begin_snapshot`. A source
+                    // that carries it forces `partial`, so the column always has
+                    // somewhere to go.
+                    let source_embeds_origins = embeds_origins(tf);
+                    let origin = partial.then_some(if source_embeds_origins {
+                        OriginSource::Embedded
+                    } else {
+                        OriginSource::Constant(*begin)
+                    });
+                    let scan = self
+                        .build_update_scan_with_snapshot(
+                            state,
+                            tf,
+                            source_embeds_origins,
+                            inlined_deletes.get(&tf.data_file_id),
+                            None,
+                        )
+                        .await?;
+                    leaves.push(Arc::new(CompactionSourceExec::new(
+                        Arc::new(scan),
+                        Arc::clone(&physical_schema),
+                        origin,
+                        Arc::clone(&observed_max_origin),
+                        carried_row_id_start.is_some(),
+                    )));
+                    sources.push(CompactionSourceFile {
+                        data_file_id: tf.data_file_id,
+                        delete_file_id: None,
+                    });
+                    files_processed += 1;
+                }
+
+                let rowid_index = physical_schema.fields().len();
+                // Fresh plan state each time: a scan executed once hands its
+                // files out from a shared queue, which a second execution of the
+                // same plan finds drained.
+                let unsorted = || -> Result<SendableRecordBatchStream> {
+                    let input = reset_plan_states(UnionExec::try_new(leaves.clone())?)?;
+                    match carried_row_id_start {
+                        Some(start) => {
+                            rowid_ordered_output(state.task_ctx(), input, rowid_index, start)
+                        },
+                        None => sorted_rewrite_output(state.task_ctx(), input, None),
+                    }
+                };
+                // A bin whose sources hold no rows at all writes no file; its
+                // sources are still retired by the commit below.
+                let merged = match ordering.as_ref() {
+                    None => first_nonempty(unsorted()?).await?,
+                    Some(ordering) => {
+                        let sorted = UnionExec::try_new(leaves.clone())
+                            .map_err(DuckLakeError::from)
+                            .and_then(|input| {
+                                sorted_rewrite_output(state.task_ctx(), input, Some(ordering))
+                            })
+                            .and_then(|sorted| match carried_row_id_start {
+                                Some(_) => without_column(sorted, rowid_index),
+                                None => Ok(sorted),
+                            });
+                        first_nonempty_sorted(sorted, unsorted).await?
+                    },
+                };
+                let Some(merged) = merged else {
+                    continue;
+                };
+                // Every file in the bin shares one partition identity (that is the
+                // grouping key), so the merged output inherits it: same Hive directory,
+                // same `partition_id` + values in the catalog.
+                let (partition_id, partition_values) = partition_key(bin[0]);
+                let subpath = partition_id
+                    .filter(|_| self.write_options().hive_file_pattern.unwrap_or(true))
+                    .map(|pid| {
+                        self.partition_subpath(
+                            live_partition_spec.as_ref(),
+                            pid,
+                            &partition_values,
+                            &top_level_column_ids,
+                            bin[0],
+                        )
+                    });
+                let mut file = table_writer
+                    .write_compacted_file_stream_with_lineage(
+                        schema_name,
+                        self.table_name(),
+                        physical_schema.as_ref(),
+                        &column_ids,
+                        &top_level_column_ids,
+                        merged,
+                        carried_row_id_start.is_none(),
+                        partial,
+                        subpath.as_deref(),
                     )
                     .await?;
-                leaves.push(Arc::new(CompactionSourceExec::new(
-                    Arc::new(scan),
-                    Arc::clone(&physical_schema),
-                    origin,
-                    Arc::clone(&observed_max_origin),
-                    carried_row_id_start.is_some(),
-                )));
-                sources.push(CompactionSourceFile {
-                    data_file_id: tf.data_file_id,
-                    delete_file_id: None,
-                });
-                files_processed += 1;
-            }
-
-            let rowid_index = physical_schema.fields().len();
-            // Fresh plan state each time: a scan executed once hands its
-            // files out from a shared queue, which a second execution of the
-            // same plan finds drained.
-            let unsorted = || -> Result<SendableRecordBatchStream> {
-                let input = reset_plan_states(UnionExec::try_new(leaves.clone())?)?;
-                match carried_row_id_start {
-                    Some(start) => {
-                        rowid_ordered_output(state.task_ctx(), input, rowid_index, start)
-                    },
-                    None => sorted_rewrite_output(state.task_ctx(), input, None),
+                if let Some(start) = carried_row_id_start {
+                    // The count closes the range: the file holds exactly as many
+                    // rows as the sources' ranges cover. (Unsorted, the stream also
+                    // checked the rows arrived in source order.)
+                    let expected: i64 = bin.iter().filter_map(|tf| tf.max_row_count).sum();
+                    if file.record_count != expected {
+                        return Err(DuckLakeError::Internal(format!(
+                            "rowid-adjacent merge wrote {} rows, its sources hold {expected}",
+                            file.record_count
+                        )));
+                    }
+                    file.row_id_start = RowIdStart::Preserved(start);
                 }
-            };
-            // A bin whose sources hold no rows at all writes no file; its
-            // sources are still retired by the commit below.
-            let merged = match ordering.as_ref() {
-                None => first_nonempty(unsorted()?).await?,
-                Some(ordering) => {
-                    let sorted = UnionExec::try_new(leaves.clone())
-                        .map_err(DuckLakeError::from)
-                        .and_then(|input| {
-                            sorted_rewrite_output(state.task_ctx(), input, Some(ordering))
-                        })
-                        .and_then(|sorted| match carried_row_id_start {
-                            Some(_) => without_column(sorted, rowid_index),
-                            None => Ok(sorted),
-                        });
-                    first_nonempty_sorted(sorted, unsorted).await?
-                },
-            };
-            let Some(merged) = merged else {
-                continue;
-            };
-            // Every file in the bin shares one partition identity (that is the
-            // grouping key), so the merged output inherits it: same Hive directory,
-            // same `partition_id` + values in the catalog.
-            let (partition_id, partition_values) = partition_key(bin[0]);
-            let subpath = partition_id
-                .filter(|_| self.write_options().hive_file_pattern.unwrap_or(true))
-                .map(|pid| {
-                    self.partition_subpath(
-                        live_partition_spec.as_ref(),
-                        pid,
-                        &partition_values,
-                        &top_level_column_ids,
-                        bin[0],
-                    )
+                rows_written += file.record_count;
+                let file = match partition_id {
+                    Some(pid) => file.with_partition(pid, partition_value_pairs(&partition_values)),
+                    None => file,
+                };
+                // Read after the write has drained the stream: the bound the
+                // catalog claimed, raised to whatever the merge actually emitted.
+                let partial_max = partial.then(|| observed_max_origin.load(Ordering::Relaxed));
+                outputs.push(CompactionOutputFile {
+                    file,
+                    partial_max,
+                    begin_snapshot: min_origin,
                 });
-            let mut file = table_writer
-                .write_compacted_file_stream_with_lineage(
-                    schema_name,
-                    self.table_name(),
-                    physical_schema.as_ref(),
-                    &column_ids,
-                    &top_level_column_ids,
-                    merged,
-                    carried_row_id_start.is_none(),
-                    partial,
-                    subpath.as_deref(),
-                )
-                .await?;
-            if let Some(start) = carried_row_id_start {
-                // The count closes the range: the file holds exactly as many
-                // rows as the sources' ranges cover. (Unsorted, the stream also
-                // checked the rows arrived in source order.)
-                let expected: i64 = bin.iter().filter_map(|tf| tf.max_row_count).sum();
-                if file.record_count != expected {
-                    return Err(DuckLakeError::Internal(format!(
-                        "rowid-adjacent merge wrote {} rows, its sources hold {expected}",
-                        file.record_count
-                    )));
-                }
-                file.row_id_start = RowIdStart::Preserved(start);
             }
-            rows_written += file.record_count;
-            let file = match partition_id {
-                Some(pid) => file.with_partition(pid, partition_value_pairs(&partition_values)),
-                None => file,
-            };
-            // Read after the write has drained the stream: the bound the
-            // catalog claimed, raised to whatever the merge actually emitted.
-            let partial_max = partial.then(|| observed_max_origin.load(Ordering::Relaxed));
-            outputs.push(CompactionOutputFile {
-                file,
-                partial_max,
-                begin_snapshot: min_origin,
-            });
+            Ok(())
+        }
+        .await;
+        if let Err(error) = written {
+            let files = outputs
+                .iter()
+                .map(|output| (output.file.path.clone(), output.file.path_is_relative))
+                .collect();
+            table_writer
+                .remove_unstaged(schema_name, self.table_name(), files)
+                .await;
+            return Err(error);
         }
 
         if sources.is_empty() {
@@ -1618,98 +1680,115 @@ impl DuckLakeTable {
         let mut files_processed = 0usize;
         let mut rows_written = 0i64;
 
-        for tf in candidates {
-            // A rewrite replaces ONE source file, so its scan is already the
-            // whole set; `build_update_scan` splits it across partitions itself,
-            // since this plan is executed directly and never reaches the
-            // optimizer's repartition rule. Rowid lineage rides out of the scan
-            // as a column, so the sort and the parquet write consume the plan
-            // directly instead of a fully collected `Vec<RecordBatch>`.
-            let scan = self
-                .build_update_scan(state, tf, inlined_deletes.get(&tf.data_file_id))
-                .await?;
-            let source: Arc<dyn ExecutionPlan> = Arc::new(CompactionSourceExec::new(
-                Arc::new(scan),
-                Arc::clone(&physical_schema),
-                // A delete-rewrite emits no origin column, so nothing raises
-                // this and nothing reads it.
-                None,
-                Arc::new(AtomicI64::new(i64::MIN)),
-                // A rewrite always embeds its rowids: deleted rows leave gaps.
-                false,
-            ));
-            // Fresh plan state, as for a merge: the sorted run drained the
-            // scan's shared file queue.
-            let unsorted = || {
-                sorted_rewrite_output(
-                    state.task_ctx(),
-                    reset_plan_states(Arc::clone(&source))?,
+        // Whole or nothing: a rewrite that fails (its sort refused at the pool
+        // or past its spill budget, a source unreadable) leaves none of the
+        // files the ones before it wrote, as a refused commit leaves none.
+        let written: Result<()> = async {
+            for tf in candidates {
+                // A rewrite replaces ONE source file, so its scan is already the
+                // whole set; `build_update_scan` splits it across partitions itself,
+                // since this plan is executed directly and never reaches the
+                // optimizer's repartition rule. Rowid lineage rides out of the scan
+                // as a column, so the sort and the parquet write consume the plan
+                // directly instead of a fully collected `Vec<RecordBatch>`.
+                let scan = self
+                    .build_update_scan(state, tf, inlined_deletes.get(&tf.data_file_id))
+                    .await?;
+                let source: Arc<dyn ExecutionPlan> = Arc::new(CompactionSourceExec::new(
+                    Arc::new(scan),
+                    Arc::clone(&physical_schema),
+                    // A delete-rewrite emits no origin column, so nothing raises
+                    // this and nothing reads it.
                     None,
-                )
-            };
-            let sorted = match ordering.as_ref() {
-                None => first_nonempty(unsorted()?).await?,
-                Some(ordering) => {
-                    let sorted = sorted_rewrite_output(
-                        state.task_ctx(),
-                        Arc::clone(&source),
-                        Some(ordering),
-                    );
-                    first_nonempty_sorted(sorted, unsorted).await?
-                },
-            };
-
-            files_processed += 1;
-            sources.push(CompactionSourceFile {
-                data_file_id: tf.data_file_id,
-                delete_file_id: tf.delete_file_id,
-            });
-
-            // Every row deleted: the source is retired with no replacement.
-            let Some(sorted) = sorted else {
-                continue;
-            };
-
-            // The rewrite drops deleted rows from ONE source file, so the output
-            // holds a subset of that file's rows and therefore its exact
-            // partition: inherit the identity and the Hive directory.
-            let (partition_id, partition_values) = partition_key(tf);
-            let subpath = partition_id
-                .filter(|_| self.write_options().hive_file_pattern.unwrap_or(true))
-                .map(|pid| {
-                    self.partition_subpath(
-                        live_partition_spec.as_ref(),
-                        pid,
-                        &partition_values,
-                        &top_level_column_ids,
-                        tf,
-                    )
-                });
-            let file = table_writer
-                .write_compacted_file_stream(
-                    schema_name,
-                    self.table_name(),
-                    physical_schema.as_ref(),
-                    &column_ids,
-                    &top_level_column_ids,
-                    sorted,
+                    Arc::new(AtomicI64::new(i64::MIN)),
+                    // A rewrite always embeds its rowids: deleted rows leave gaps.
                     false,
-                    subpath.as_deref(),
-                )
-                .await?;
-            rows_written += file.record_count;
-            let file = match partition_id {
-                Some(pid) => file.with_partition(pid, partition_value_pairs(&partition_values)),
-                None => file,
-            };
-            // A rewrite output holds only currently-live rows and begins at
-            // the compaction snapshot (begin_snapshot = None); its
-            // pre-compaction history is served by the retained sources.
-            outputs.push(CompactionOutputFile {
-                file,
-                partial_max: None,
-                begin_snapshot: None,
-            });
+                ));
+                // Fresh plan state, as for a merge: the sorted run drained the
+                // scan's shared file queue.
+                let unsorted = || {
+                    sorted_rewrite_output(
+                        state.task_ctx(),
+                        reset_plan_states(Arc::clone(&source))?,
+                        None,
+                    )
+                };
+                let sorted = match ordering.as_ref() {
+                    None => first_nonempty(unsorted()?).await?,
+                    Some(ordering) => {
+                        let sorted = sorted_rewrite_output(
+                            state.task_ctx(),
+                            Arc::clone(&source),
+                            Some(ordering),
+                        );
+                        first_nonempty_sorted(sorted, unsorted).await?
+                    },
+                };
+
+                files_processed += 1;
+                sources.push(CompactionSourceFile {
+                    data_file_id: tf.data_file_id,
+                    delete_file_id: tf.delete_file_id,
+                });
+
+                // Every row deleted: the source is retired with no replacement.
+                let Some(sorted) = sorted else {
+                    continue;
+                };
+
+                // The rewrite drops deleted rows from ONE source file, so the output
+                // holds a subset of that file's rows and therefore its exact
+                // partition: inherit the identity and the Hive directory.
+                let (partition_id, partition_values) = partition_key(tf);
+                let subpath = partition_id
+                    .filter(|_| self.write_options().hive_file_pattern.unwrap_or(true))
+                    .map(|pid| {
+                        self.partition_subpath(
+                            live_partition_spec.as_ref(),
+                            pid,
+                            &partition_values,
+                            &top_level_column_ids,
+                            tf,
+                        )
+                    });
+                let file = table_writer
+                    .write_compacted_file_stream(
+                        schema_name,
+                        self.table_name(),
+                        physical_schema.as_ref(),
+                        &column_ids,
+                        &top_level_column_ids,
+                        sorted,
+                        false,
+                        subpath.as_deref(),
+                    )
+                    .await?;
+                rows_written += file.record_count;
+                let file = match partition_id {
+                    Some(pid) => file.with_partition(pid, partition_value_pairs(&partition_values)),
+                    None => file,
+                };
+                // A rewrite output holds only currently-live rows and begins at
+                // the compaction snapshot (begin_snapshot = None); its
+                // pre-compaction history is served by the retained sources.
+                outputs.push(CompactionOutputFile {
+                    file,
+                    partial_max: None,
+                    begin_snapshot: None,
+                });
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = written {
+            let files = outputs
+                .iter()
+                .map(|output| (output.file.path.clone(), output.file.path_is_relative))
+                .collect();
+            table_writer
+                .remove_unstaged(schema_name, self.table_name(), files)
+                .await;
+            return Err(error);
         }
 
         if sources.is_empty() {
