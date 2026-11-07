@@ -79,7 +79,7 @@ struct Case {
     tab: bool,
 }
 
-const CASES: [Case; 5] = [
+const CASES: [Case; 7] = [
     Case {
         what: "native defaults, 30 columns, 100 rows, 64 MiB, a disk manager",
         columns: 30,
@@ -110,6 +110,25 @@ const CASES: [Case; 5] = [
         rows: 100,
         pool: 256 * MIB,
         spills: true,
+        tab: true,
+    },
+    // Measured, 100,000 to 1.6M rows of 3, 8 and 30 columns under 64 MiB with nothing to
+    // spill to: the fork before slice 4 and this one refuse the same writes; with the
+    // headroom also taken there, these two (and 800,000 rows of 3) were refused too.
+    Case {
+        what: "a tab's main thread, 30 columns, 100,000 rows, 64 MiB, nothing to spill to",
+        columns: 30,
+        rows: 100_000,
+        pool: 64 * MIB,
+        spills: false,
+        tab: true,
+    },
+    Case {
+        what: "a tab's main thread, 8 columns, 400,000 rows, 64 MiB, nothing to spill to",
+        columns: 8,
+        rows: 400_000,
+        pool: 64 * MIB,
+        spills: false,
         tab: true,
     },
     Case {
