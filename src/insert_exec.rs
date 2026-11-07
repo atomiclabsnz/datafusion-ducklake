@@ -3,9 +3,17 @@
 //! An unpartitioned table whose rows the plan orders (or that has no sort
 //! order) streams its input into a write session, batch by batch: the session
 //! holds the first `data_inlining_row_limit` rows to inline, and past them writes
-//! Parquet that goes out as it is encoded (ADR-0037 in ferrion). A partitioned
-//! table, and one the writer itself must sort, still collect the input first:
-//! the rows are split or sorted as a whole.
+//! Parquet that goes out as it is encoded (ADR-0037 in ferrion).
+//!
+//! A table the writer itself must sort (an expression key with `sort_on_insert`
+//! on, or `sort_on_insert` off while inlining is enabled) streams too, once its
+//! input holds more rows than could be inlined: the rows go through DataFusion's
+//! spilling sort ([`crate::insert_sort`]) under the task's memory pool and disk
+//! manager, then into the session, laid out as the in-memory sort laid them out.
+//! A write of at most that many rows is still decided whole, as before.
+//!
+//! A partitioned table still collects the input first: the rows are split as a
+//! whole.
 //!
 //! Single partition only (partition 0).
 
@@ -74,7 +82,29 @@ pub struct DuckLakeInsertExec {
     /// stream into the writer. Unset (a plan built through [`Self::new`]
     /// alone) collects them, so the writer can apply a sort order it finds.
     planned_no_sort_order: bool,
+    /// What the plan left the writer to do with the rows' order, when the
+    /// table has a sort order the plan did not sort by: `None` when it sorted
+    /// them, the table has none, or the plan was built through [`Self::new`]
+    /// alone (then the rows are collected and the writer reads the order).
+    planned_writer_sort: Option<WriterSort>,
+    /// The sorts the execution ran ([`crate::insert_sort`]), for
+    /// [`ExecutionPlan::metrics`].
+    sorts: crate::insert_sort::SortSlot,
     cache: Arc<PlanProperties>,
+}
+
+/// What a planned `INSERT` leaves the writer to do with its rows' order
+/// ([`DuckLakeInsertExec::with_planned_writer_sort`]).
+#[derive(Debug, Clone)]
+pub(crate) enum WriterSort {
+    /// Nothing: `sort_on_insert` is off and inlining disabled, so official
+    /// sorts no row.
+    Unsorted,
+    /// The rows written to Parquet are sorted by the table's order, as
+    /// official sorts them (`sort_on_insert` on with a key the plan left to
+    /// the writer, or off while inlining is enabled). An inlined write's rows
+    /// are the writer's to order, as before.
+    Sorted(crate::sort::SortSpec),
 }
 
 impl DuckLakeInsertExec {
@@ -107,6 +137,8 @@ impl DuckLakeInsertExec {
             planned_snapshot: None,
             planned_sort_on_insert: None,
             planned_no_sort_order: false,
+            planned_writer_sort: None,
+            sorts: crate::insert_sort::SortSlot::default(),
             cache,
         }
     }
@@ -127,6 +159,13 @@ impl DuckLakeInsertExec {
     /// may stream into the writer.
     pub(crate) fn with_planned_no_sort_order(mut self, no_sort_order: bool) -> Self {
         self.planned_no_sort_order = no_sort_order;
+        self
+    }
+
+    /// What the plan left the writer to do with the rows' order
+    /// ([`WriterSort`]).
+    pub(crate) fn with_planned_writer_sort(mut self, writer_sort: Option<WriterSort>) -> Self {
+        self.planned_writer_sort = writer_sort;
         self
     }
 
@@ -240,8 +279,15 @@ impl ExecutionPlan for DuckLakeInsertExec {
             )
             .with_planned_snapshot_opt(self.planned_snapshot)
             .with_planned_sort_on_insert(self.planned_sort_on_insert)
-            .with_planned_no_sort_order(self.planned_no_sort_order),
+            .with_planned_no_sort_order(self.planned_no_sort_order)
+            .with_planned_writer_sort(self.planned_writer_sort.clone()),
         ))
+    }
+
+    /// The metrics of the sorts the writer-sorted path ran (their spills
+    /// among them); `None` when it ran none.
+    fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
+        self.sorts.metrics()
     }
 
     fn execute(
@@ -274,11 +320,23 @@ impl ExecutionPlan for DuckLakeInsertExec {
         };
         // The rows stream when nothing needs them whole: no partition spec to
         // split them by, and no sort the writer must make. Known, not assumed:
-        // the plan sorted them, or the statement was planned against a table
-        // with no sort order. Anything else (a plan built through `new` alone)
-        // collects them, and the writer applies whatever sort order it finds.
-        let unsorted = sort_plan.sorted || self.planned_no_sort_order;
+        // the plan sorted them, the statement was planned against a table
+        // with no sort order, or the plan found that official sorts none of
+        // them. Anything else (a plan built through `new` alone) collects them,
+        // and the writer applies whatever sort order it finds.
+        let unsorted = sort_plan.sorted
+            || self.planned_no_sort_order
+            || matches!(self.planned_writer_sort, Some(WriterSort::Unsorted));
         let streams = partition.is_none() && unsorted;
+        // ...and a sort the plan left to the writer streams through a spilling
+        // sort once the input is past what could be inlined.
+        let streamed_sort = match &self.planned_writer_sort {
+            Some(WriterSort::Sorted(spec)) if partition.is_none() && !unsorted => {
+                Some(spec.clone())
+            },
+            _ => None,
+        };
+        let sorts = self.sorts.clone();
         // What the collected path holds: the input, and for a split or a sort
         // a second copy of it.
         let copies = if partition.is_some() || !unsorted {
@@ -292,15 +350,49 @@ impl ExecutionPlan for DuckLakeInsertExec {
             // An encrypted catalog takes no Parquet this crate writes, so its
             // insert is decided on the whole input (inlined, or refused): a
             // session would refuse it at its start, rows it could inline too.
-            let streams = streams
-                && !writer
+            let encrypted = (streams || streamed_sort.is_some())
+                && writer
                     .catalog_encrypted()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let streams = streams && !encrypted;
+            let streamed_sort = streamed_sort.filter(|_| !encrypted);
             let mut input_stream = input.execute(0, Arc::clone(&context))?;
-            let collected =
+            let mut collected =
                 datafusion::execution::memory_pool::MemoryConsumer::new("DuckLakeInsertExec")
                     .register(context.memory_pool());
-            let batches: Vec<RecordBatch> = if streams {
+            let batches: Vec<RecordBatch> = if let Some(spec) = streamed_sort {
+                let target = StreamedInsert {
+                    writer: Arc::clone(&writer),
+                    object_store: context
+                        .runtime_env()
+                        .object_store(object_store_url.as_ref())?,
+                    write_options: &write_options,
+                    planned_snapshot,
+                    schema_name: &schema_name,
+                    table_name: &table_name,
+                    arrow_schema: &arrow_schema,
+                    write_mode,
+                };
+                // Boxed, as the streamed path's future is.
+                match Box::pin(insert_sorted(
+                    target,
+                    &spec,
+                    input_stream,
+                    &mut collected,
+                    copies,
+                    &context,
+                    &sorts,
+                ))
+                .await?
+                {
+                    Sorted::Written(rows) => {
+                        let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![rows]));
+                        return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
+                    },
+                    // At most what could be inlined: decided whole, as before.
+                    Sorted::Held(batches) => batches,
+                }
+            } else if streams {
                 // Up to the first batch with rows: an input of none is answered
                 // below as before.
                 let mut first = None;
@@ -485,6 +577,133 @@ struct StreamedInsert<'a> {
     table_name: &'a str,
     arrow_schema: &'a SchemaRef,
     write_mode: WriteMode,
+}
+
+/// What [`insert_sorted`] did with an insert's rows.
+enum Sorted {
+    /// Sorted and written: the rows written.
+    Written(u64),
+    /// Not written: the input, every batch, holding at most the rows that
+    /// could be inlined, for the collected path to decide whole.
+    Held(Vec<RecordBatch>),
+}
+
+/// An insert whose rows the writer sorts by `spec`, streamed: `input`'s
+/// batches are held (charged to `held`, `copies` times their size, as the
+/// collected path charges them) while they number at most the rows a write
+/// could inline ([`DuckLakeTableWriter::inline_row_limit`]); a write of no
+/// more is returned [`Sorted::Held`], so its layout is decided whole, as
+/// before. Past them no row can be inlined, so the rows are sorted as the
+/// writer sorts rows written to Parquet ([`crate::sort::sort_exprs`], in
+/// DataFusion's spilling sort over `context`, [`crate::insert_sort`]) and
+/// streamed into a session ([`insert_streamed`]). The held batches' charge is
+/// released first: the sort charges what it holds.
+///
+/// A failure of the sort (the pool, the spill budget, the input) before its
+/// first row leaves no session; after it, the session is aborted
+/// ([`stream_into`]): no catalog row either way, and its uploads removed.
+async fn insert_sorted(
+    target: StreamedInsert<'_>,
+    spec: &crate::sort::SortSpec,
+    mut input: SendableRecordBatchStream,
+    held: &mut datafusion::execution::memory_pool::MemoryReservation,
+    copies: usize,
+    context: &Arc<TaskContext>,
+    sorts: &crate::insert_sort::SortSlot,
+) -> DataFusionResult<Sorted> {
+    let external = |e: crate::DuckLakeError| DataFusionError::External(Box::new(e));
+    let schema_without_metadata = Schema::new(
+        target
+            .arrow_schema
+            .fields()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let limit = DuckLakeTableWriter::new(Arc::clone(&target.writer), Arc::clone(&target.object_store))
+        .map_err(external)?
+        .with_options(target.write_options)
+        .inline_row_limit(
+            target.schema_name,
+            target.table_name,
+            target.write_mode,
+            &schema_without_metadata,
+        )
+        .map_err(external)?;
+    let mut batches = Vec::new();
+    let mut rows = 0usize;
+    while rows <= limit {
+        let Some(batch) = input.next().await else {
+            return Ok(Sorted::Held(batches));
+        };
+        let batch = batch?;
+        held.try_grow(batch.get_array_memory_size() * copies)?;
+        rows += batch.num_rows();
+        batches.push(batch);
+    }
+    // Room for the session beside the sort: what one row group of these rows
+    // takes ([`session_headroom`]), held until the sort's first row. Without
+    // it a sort that just fits the pool keeps it all, and the session then
+    // finds none (refused at the pool, where with a disk manager the sort
+    // would have spilled). Not taken when the pool cannot spare it.
+    let estimate = session_headroom(&batches, rows, target.write_options);
+    held.free();
+    let mut headroom =
+        datafusion::execution::memory_pool::MemoryConsumer::new("DuckLakeInsertExec headroom")
+            .register(context.memory_pool());
+    if headroom.try_grow(estimate).is_err() {
+        tracing::debug!(estimate, "no headroom for an insert's session beside its sort");
+    }
+    let schema = input.schema();
+    let rest: SendableRecordBatchStream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream::iter(batches.into_iter().map(Ok)).chain(input),
+        ),
+    );
+    let keys = crate::sort::sort_exprs(spec, &schema_without_metadata).map_err(external)?;
+    let mut sorted = crate::insert_sort::sort_stream(rest, keys, Arc::clone(context), sorts)?;
+    let mut first = None;
+    while let Some(batch) = sorted.next().await {
+        let batch = batch?;
+        if batch.num_rows() > 0 {
+            first = Some(batch);
+            break;
+        }
+    }
+    let Some(first) = first else {
+        return Err(DataFusionError::Internal(
+            "an insert's sort returned none of its rows".to_string(),
+        ));
+    };
+    // The session is charged what it holds from here (`stream_into`).
+    drop(headroom);
+    let rows = Box::pin(insert_streamed(target, first, sorted, context.memory_pool())).await?;
+    Ok(Sorted::Written(rows))
+}
+
+/// What a write session of rows like `batches` (`rows` of them) holds at
+/// most beside a sort: one row group of them buffered (`max_row_group_rows`,
+/// DuckDB's 122,880 by default, at most `max_row_group_bytes`) and, for
+/// [`Staging::Parts`](crate::Staging::Parts) (`wasm32`'s default), a part.
+fn session_headroom(
+    batches: &[RecordBatch],
+    rows: usize,
+    options: &crate::table_writer::DuckLakeWriteOptions,
+) -> usize {
+    let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+    let per_row = bytes / rows.max(1);
+    let mut group = per_row.saturating_mul(options.max_row_group_rows.unwrap_or(122_880));
+    if let Some(cap) = options.max_row_group_bytes {
+        group = group.min(cap);
+    }
+    let part = match options.staging {
+        Some(crate::Staging::Parts { part_bytes }) => part_bytes,
+        // The default on `wasm32`.
+        None if cfg!(target_arch = "wasm32") => crate::Staging::DEFAULT_PART_BYTES,
+        _ => 0,
+    };
+    group.saturating_add(part)
 }
 
 /// Begin the write session of `target` (refusing a partition spec gone live

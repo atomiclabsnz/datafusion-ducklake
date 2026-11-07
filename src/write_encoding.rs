@@ -252,6 +252,45 @@ fn sliced_memory_size(batch: &RecordBatch) -> usize {
         .sum()
 }
 
+/// `batch` with each top-level view column (`Utf8View`, `BinaryView`) holding
+/// only its own strings' bytes ([`arrow::array::GenericByteViewArray::gc`]), so
+/// the first row group a writer buffers is charged what it holds
+/// ([`sliced_memory_size`]) and keeps no more alive.
+///
+/// A view column's strings live in buffers it may share with every batch cut
+/// from the same source. A sort's output is that case: each of its batches
+/// draws rows from all of its input, so each one's views reach every buffer of
+/// it, and counting each batch's whole allocation charged the sorted input
+/// once per buffered batch (ADR-0037 slice 4 in ferrion: a 61 MiB sorted
+/// INSERT was refused at a 256 MiB pool, the buffered row group charged
+/// 57 MiB a batch). The copy is of the buffered rows' strings only, once per
+/// file. A view nested in another type is still counted whole.
+fn compact_views(batch: &RecordBatch) -> Result<RecordBatch> {
+    if !batch
+        .columns()
+        .iter()
+        .any(|column| matches!(column.data_type(), DataType::Utf8View | DataType::BinaryView))
+    {
+        return Ok(batch.clone());
+    }
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| -> ArrayRef {
+            match column.data_type() {
+                DataType::Utf8View => std::sync::Arc::new(column.as_string_view().gc()),
+                DataType::BinaryView => std::sync::Arc::new(column.as_binary_view().gc()),
+                _ => std::sync::Arc::clone(column),
+            }
+        })
+        .collect();
+    Ok(RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )?)
+}
+
 /// Whether `data_type` is, or nests, a view type whose data lives in variadic
 /// buffers.
 fn holds_views(data_type: &DataType) -> bool {
@@ -316,9 +355,10 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
         };
         let full_rows = row_group_rows(base);
         let full_bytes = base.max_row_group_bytes();
+        let batch = compact_views(batch)?;
         self.buffered_rows += batch.num_rows();
-        self.buffered_bytes += sliced_memory_size(batch);
-        self.buffered.push(batch.clone());
+        self.buffered_bytes += sliced_memory_size(&batch);
+        self.buffered.push(batch);
         if self.buffered_rows >= full_rows || full_bytes.is_some_and(|b| self.buffered_bytes >= b) {
             self.open()?;
         }

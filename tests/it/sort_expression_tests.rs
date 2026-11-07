@@ -388,3 +388,127 @@ async fn bare_column_keys_order_inserts_as_the_duckdb_cli() {
         assert_eq!(ours, official, "`{keys}`");
     }
 }
+
+/// A sort the writer makes (`sort_on_insert` off while inlining is enabled:
+/// official sorts only the rows it writes to Parquet) orders an insert as
+/// official's does, through the spilling sort (ADR-0037 slice 4 in ferrion):
+/// the [`ROWS`] under each of the keys above, and 200,000 rows under a 2 MiB
+/// pool, which spill, every key's ties broken by `id` so the order is total.
+#[tokio::test(flavor = "multi_thread")]
+async fn writer_sorted_inserts_order_as_the_duckdb_cli() {
+    let Ok(version) = Command::new("duckdb").arg("--version").output() else {
+        eprintln!("skipping: no `duckdb` on PATH (CI installs the pinned CLI)");
+        return;
+    };
+    let version = String::from_utf8_lossy(&version.stdout).to_string();
+    assert!(
+        version.contains("v1.5.6"),
+        "the oracle is the pinned DuckDB CLI (CI installs v1.5.6), found: {version}"
+    );
+    const MANY: &str = "id BIGINT, k BIGINT, s VARCHAR";
+    let many = |range: &str, value: &str| {
+        format!(
+            "SELECT {value} AS id, CASE WHEN {value} % 17 = 0 THEN NULL \
+             ELSE ({value} * 7919) % 1009 END AS k, \
+             repeat(CAST(({value} * 2654435761) % 1000000007 AS VARCHAR), 3) AS s FROM {range}"
+        )
+    };
+    let cases = [
+        (COLUMNS, "ti", format!("VALUES {ROWS}"), format!("VALUES {ROWS}"), None),
+        (COLUMNS, "ti DESC NULLS FIRST, id", format!("VALUES {ROWS}"), format!("VALUES {ROWS}"), None),
+        (COLUMNS, "d DESC", format!("VALUES {ROWS}"), format!("VALUES {ROWS}"), None),
+        (COLUMNS, "s, id DESC", format!("VALUES {ROWS}"), format!("VALUES {ROWS}"), None),
+        (
+            MANY,
+            "k DESC NULLS FIRST, id",
+            many("range(200000) AS t(range)", "range"),
+            many("generate_series(0, 199999) AS t(value)", "value"),
+            Some(2 * 1024 * 1024),
+        ),
+        (
+            MANY,
+            "k NULLS LAST, s DESC, id",
+            many("range(200000) AS t(range)", "range"),
+            many("generate_series(0, 199999) AS t(value)", "value"),
+            Some(2 * 1024 * 1024),
+        ),
+    ];
+    for (columns, keys, official_rows, our_rows, pool) in cases {
+        let temp = tempfile::TempDir::new().unwrap();
+        let catalog = temp.path().join("c.db");
+        let data = temp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        cli(&format!(
+            "{} CALL lake.set_option('data_inlining_row_limit', 2); \
+             CALL lake.set_option('sort_on_insert', false); \
+             CREATE TABLE lake.o({columns}); ALTER TABLE lake.o SET SORTED BY ({keys}); \
+             CREATE TABLE lake.c({columns}); ALTER TABLE lake.c SET SORTED BY ({keys}); \
+             INSERT INTO lake.o {official_rows};",
+            attach(&catalog, &data)
+        ))
+        .unwrap_or_else(|e| panic!("`{keys}` official: {e}"));
+        let official = cli(&format!(
+            "{} SELECT id FROM lake.main.o ORDER BY rowid;",
+            attach(&catalog, &data)
+        ))
+        .unwrap();
+
+        let url = format!("sqlite:{}?mode=rwc", catalog.display());
+        let writer: Arc<dyn MetadataWriter> =
+            Arc::new(SqliteMetadataWriter::new_with_init(&url).await.unwrap());
+        let provider: Arc<dyn MetadataProvider> =
+            Arc::new(SqliteMetadataProvider::new(&url).await.unwrap());
+        let catalog_of =
+            || DuckLakeCatalog::with_writer(Arc::clone(&provider), Arc::clone(&writer)).unwrap();
+        let mut runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new();
+        if let Some(pool) = pool {
+            runtime = runtime.with_memory_limit(pool, 1.0);
+        }
+        let ctx = SessionContext::new_with_config_rt(
+            datafusion::prelude::SessionConfig::new()
+                .with_target_partitions(1)
+                .with_sort_spill_reservation_bytes(256 * 1024),
+            runtime.build_arc().unwrap(),
+        );
+        DuckLakeCatalog::register(&ctx, "lake", catalog_of());
+        let plan = ctx
+            .sql(&format!("INSERT INTO lake.main.c {our_rows}"))
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .unwrap_or_else(|e| panic!("`{keys}` ours: {e}"));
+        if pool.is_some() {
+            let spilled = plan
+                .metrics()
+                .and_then(|metrics| metrics.spill_count())
+                .unwrap_or(0);
+            assert!(spilled > 0, "`{keys}`: the insert's sort spilled");
+        }
+        let ctx = SessionContext::new();
+        DuckLakeCatalog::register(&ctx, "lake", catalog_of().with_row_lineage(true));
+        let batches = ctx
+            .sql("SELECT CAST(id AS BIGINT) FROM lake.main.c ORDER BY rowid")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let ours: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .iter()
+                    .map(|id| id.unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(ours.len(), official.len(), "`{keys}`");
+        assert!(ours == official, "`{keys}`: our order differs from official's");
+    }
+}

@@ -3305,6 +3305,25 @@ impl DuckLakeTableWriter {
         self.inlining_enabled_under(schema_name, table_name, arrow_schema, None)
     }
 
+    /// The most rows a write of `mode` into `schema_name.table_name` may hold
+    /// and still be inlined ([`Self::inline_decision`]): its
+    /// `data_inlining_row_limit`, or 0 when the backend inlines nothing of
+    /// `arrow_schema`. A write of more rows than this is never inlined, so its
+    /// layout does not depend on being decided whole (`DuckLakeInsertExec`'s
+    /// streamed sort).
+    pub(crate) fn inline_row_limit(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        mode: WriteMode,
+        arrow_schema: &Schema,
+    ) -> Result<usize> {
+        if self.flushing_inlined || !self.metadata.supports_data_inlining(arrow_schema) {
+            return Ok(0);
+        }
+        self.write_inlining_limit(schema_name, table_name, mode)
+    }
+
     /// [`Self::inlining_enabled`], under the scoped `limit` when the write
     /// already read it ([`InlineDecision::limit`]).
     fn inlining_enabled_under(
