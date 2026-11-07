@@ -5323,6 +5323,11 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// off that id, and, unless [`ImportedFile::owned`], a record that this
     /// catalog does not own the object. A path already live in the table is
     /// refused ([`crate::manifest_import::ImportError::DuplicateFile`]).
+    /// Each of `retired` (columns dropped before the import, whose ids the
+    /// files may carry) the table has not used is recorded as a column that
+    /// begins and ends at the snapshot, so its id is never given out again; one
+    /// that is a live column of the table is refused
+    /// ([`crate::manifest_import::ImportError::RetiredFieldIsLive`]).
     ///
     /// Default: unsupported. The SQLite writer implements it.
     #[allow(clippy::too_many_arguments)]
@@ -5335,6 +5340,7 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         _base_snapshot: i64,
         _columns: &[ColumnDef],
         _column_ids: &[i64],
+        _retired: &[crate::metadata_provider::DuckLakeTableField],
     ) -> Result<CommitIds> {
         Err(DuckLakeError::Unsupported(
             "importing existing files is not supported by this metadata writer".to_string(),

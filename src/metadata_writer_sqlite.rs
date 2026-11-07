@@ -6240,6 +6240,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         base_snapshot: i64,
         columns: &[ColumnDef],
         column_ids: &[i64],
+        retired: &[crate::metadata_provider::DuckLakeTableField],
     ) -> Result<CommitIds> {
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
@@ -6269,6 +6270,16 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .fetch_all(&mut *tx)
             .await?;
+            if let Some(field) = retired.iter().find(|field| {
+                live.iter()
+                    .any(|column| column.column_id == field.column_id)
+            }) {
+                return Err(crate::manifest_import::ImportError::RetiredFieldIsLive {
+                    column: field.column_name.clone(),
+                    field_id: field.column_id,
+                }
+                .into());
+            }
             let proposed = catalog_column_defs(columns)?;
             let matched = assign_column_ids(&proposed, &live, column_ids)?;
             if let Some((column, (id, live_id))) = proposed
@@ -6303,9 +6314,39 @@ impl MetadataWriter for SqliteMetadataWriter {
                 base_snapshot,
             )
             .await?;
+            // A dropped column's id, which older files still carry: a column that is never
+            // visible, so DuckDB (which allocates past every column row of the table) and this
+            // crate never give the id to a new column.
+            for field in retired {
+                if used.contains(&field.column_id) {
+                    continue;
+                }
+                sqlx::query(
+                    "INSERT INTO ducklake_column
+                         (column_id, table_id, column_name, column_type, column_order,
+                          nulls_allowed, parent_column, begin_snapshot, end_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(field.column_id)
+                .bind(table_id)
+                .bind(&field.column_name)
+                .bind(&field.column_type)
+                .bind(field.column_id)
+                .bind(field.is_nullable)
+                .bind(field.parent_column)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+            }
             // The files' field ids name these columns; ids a later write reserves
             // must come after them.
-            if let Some(highest) = column_ids.iter().copied().max() {
+            if let Some(highest) = column_ids
+                .iter()
+                .copied()
+                .chain(retired.iter().map(|field| field.column_id))
+                .max()
+            {
                 sqlx::query(
                     "UPDATE ducklake_metadata
                      SET value = CAST(MAX(CAST(value AS INTEGER), ?) AS TEXT)

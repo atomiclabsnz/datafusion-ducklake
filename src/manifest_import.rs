@@ -9,9 +9,14 @@
 //! counterpart of official DuckLake's `ducklake_add_data_files`, with deletes:
 //!
 //! - **Field ids must match.** A file's Parquet `field_id`s must be column ids of
-//!   the table; a file without them is accepted only with a name mapping. Anything
-//!   else is refused per file with an [`ImportError`] naming the file and column,
-//!   never matched by position.
+//!   the table, or of a column it has dropped
+//!   ([`TableManifest::retired_fields`]); a file without them is accepted only
+//!   with a name mapping. Anything else is refused per file with an
+//!   [`ImportError`] naming the file and column, never matched by position.
+//! - **A dropped column's id stays taken.** Each retired field is recorded as a
+//!   column that is never visible (it begins and ends at the import's snapshot),
+//!   so neither DuckDB nor this crate gives its id to a column added later, which
+//!   would then read the dropped column's values out of the older files.
 //! - The deleted positions become positional delete files committed in the
 //!   **same** snapshot as the data files, so no snapshot shows the deleted rows.
 //! - One snapshot for the whole import, through the writer's append conflict
@@ -152,6 +157,12 @@ pub enum ImportError {
         path: String,
         expected: String,
     },
+    /// A retired field has the id of one of the table's columns.
+    #[error("retired field '{column}' has id {field_id}, which a column of the table has")]
+    RetiredFieldIsLive {
+        column: String,
+        field_id: i64,
+    },
     /// The existing table's columns differ from the manifest's.
     #[error(
         "table {table} has columns {existing}, the manifest {manifest}; set allow_schema_evolution \
@@ -197,6 +208,22 @@ impl DuckLakeTableWriter {
             .iter()
             .map(|field| field.column_id)
             .collect();
+        if let Some(live) = manifest
+            .retired_fields
+            .iter()
+            .find(|field| table_ids.contains(&field.column_id))
+        {
+            return Err(ImportError::RetiredFieldIsLive {
+                column: live.column_name.clone(),
+                field_id: live.column_id,
+            }
+            .into());
+        }
+        let retired_ids: HashSet<i64> = manifest
+            .retired_fields
+            .iter()
+            .map(|field| field.column_id)
+            .collect();
 
         let head = provider.get_current_snapshot()?;
         if let Some(schema) = provider.get_schema_by_name(schema_name, head)?
@@ -233,7 +260,7 @@ impl DuckLakeTableWriter {
                 }
                 .into());
             }
-            checked.push(self.check_file(file, key, &table_ids).await?);
+            checked.push(self.check_file(file, key, &table_ids, &retired_ids).await?);
         }
 
         let setup = self.metadata_writer().begin_write_transaction(
@@ -302,6 +329,7 @@ impl DuckLakeTableWriter {
                 base_snapshot,
                 &columns,
                 &column_ids,
+                &manifest.retired_fields,
             )
         }
         .await;
@@ -328,6 +356,7 @@ impl DuckLakeTableWriter {
         file: &ManifestDataFile,
         key: String,
         table_ids: &HashSet<i64>,
+        retired_ids: &HashSet<i64>,
     ) -> Result<CheckedFile> {
         let (metadata, footer_size) =
             read_footer(self.object_store(), &key, file.file_size_bytes).await?;
@@ -358,8 +387,10 @@ impl DuckLakeTableWriter {
                         }
                         .into());
                     };
+                    // A dropped column's values, which the table no longer shows.
                     if id == i64::from(ROW_ID_PARQUET_FIELD_ID)
                         || id == i64::from(SNAPSHOT_ID_PARQUET_FIELD_ID)
+                        || retired_ids.contains(&id)
                     {
                         ids.push(None);
                         continue;
@@ -378,7 +409,9 @@ impl DuckLakeTableWriter {
             },
             ColumnBinding::NameMapping(mapping) => {
                 for entry in &mapping.entries {
-                    if !table_ids.contains(&entry.target_field_id) {
+                    if !table_ids.contains(&entry.target_field_id)
+                        && !retired_ids.contains(&entry.target_field_id)
+                    {
                         return Err(ImportError::FieldIdMismatch {
                             path: file.path.clone(),
                             column: entry.source_name.clone(),
@@ -390,7 +423,9 @@ impl DuckLakeTableWriter {
                 let by_name: HashMap<&str, i64> = mapping
                     .entries
                     .iter()
-                    .filter(|entry| entry.parent_column.is_none())
+                    .filter(|entry| {
+                        entry.parent_column.is_none() && table_ids.contains(&entry.target_field_id)
+                    })
                     .map(|entry| (entry.source_name.as_str(), entry.target_field_id))
                     .collect();
                 let ids = arrow_schema
@@ -584,4 +619,224 @@ fn describe_fields(fields: &[DuckLakeTableField]) -> String {
         })
         .collect();
     format!("[{}]", columns.join(", "))
+}
+
+/// A manifest built outside the crate (`TableManifest::new`, `ManifestDataFile::new`), as
+/// another table format's snapshot describes its files: one of them still carries a column
+/// the table has dropped. The import adopts the file with the column ignored, and reserves
+/// the dropped column's id so no column added later takes it.
+#[cfg(all(test, feature = "write-sqlite"))]
+mod tests {
+
+    use std::sync::Arc;
+
+    use crate::metadata_provider::DuckLakeTableField;
+    use crate::metadata_provider_sqlite::SqliteMetadataProvider;
+    use crate::metadata_writer::MetadataWriter;
+    use crate::metadata_writer_sqlite::SqliteMetadataWriter;
+    use crate::{
+        ColumnBinding, DuckLakeCatalog, DuckLakeError, DuckLakeTableWriter, ImportError,
+        ImportOptions, ManifestDataFile, TableManifest,
+    };
+    use arrow::array::{Int32Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::util::display::array_value_to_string;
+    use datafusion::prelude::SessionContext;
+    use object_store::local::LocalFileSystem;
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+
+    fn field(id: i64, name: &str, ty: &str) -> DuckLakeTableField {
+        DuckLakeTableField {
+            column_id: id,
+            column_name: name.to_string(),
+            column_type: ty.to_string(),
+            is_nullable: true,
+            parent_column: None,
+        }
+    }
+
+    fn with_id(name: &str, ty: DataType, id: i64) -> Field {
+        Field::new(name, ty, true).with_metadata(
+            [(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// A Parquet file with columns `id` (field id 1), `name` (2) and `gone` (3).
+    fn write_file(path: &std::path::Path) -> (i64, i64) {
+        let schema = Arc::new(Schema::new(vec![
+            with_id("id", DataType::Int32, 1),
+            with_id("name", DataType::Utf8, 2),
+            with_id("gone", DataType::Utf8, 3),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(StringArray::from(vec!["x", "y", "z"])),
+            ],
+        )
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        (std::fs::metadata(path).unwrap().len() as i64, 3)
+    }
+
+    async fn target(dir: &std::path::Path) -> String {
+        let url = format!("sqlite:{}?mode=rwc", dir.join("target.sqlite").display());
+        let data = dir.join("target");
+        std::fs::create_dir_all(&data).unwrap();
+        let writer = SqliteMetadataWriter::new_with_init(&url).await.unwrap();
+        writer.set_data_path(data.to_str().unwrap()).unwrap();
+        url
+    }
+
+    async fn import(url: &str, manifest: &TableManifest) -> crate::Result<()> {
+        let writer = Arc::new(
+            SqliteMetadataWriter::new(url)
+                .await
+                .unwrap()
+                .with_data_inlining_row_limit(0),
+        );
+        let provider = Arc::new(SqliteMetadataProvider::new(url).await.unwrap());
+        DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new()))
+            .unwrap()
+            .import_manifest(provider, "main", "t", manifest, &ImportOptions::default())
+            .await
+            .map(|_| ())
+    }
+
+    async fn rows(url: &str) -> Vec<Vec<Option<String>>> {
+        let ctx = SessionContext::new();
+        let catalog =
+            DuckLakeCatalog::new(SqliteMetadataProvider::new(url).await.unwrap()).unwrap();
+        ctx.register_catalog("lake", Arc::new(catalog));
+        let batches = ctx
+            .sql("SELECT * FROM lake.main.t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        for batch in batches {
+            for row in 0..batch.num_rows() {
+                out.push(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|c| {
+                            c.is_valid(row)
+                                .then(|| array_value_to_string(c, row).unwrap())
+                        })
+                        .collect(),
+                );
+            }
+        }
+        out
+    }
+
+    fn manifest(path: &std::path::Path, size: i64, count: i64) -> TableManifest {
+        let file = ManifestDataFile::new(
+            1,
+            format!("file://{}", path.display()),
+            size,
+            count,
+            ColumnBinding::FieldIds,
+        )
+        .with_deleted_positions(vec![1]);
+        TableManifest::new(
+            7,
+            9,
+            vec![field(1, "id", "int32"), field(2, "name", "varchar")],
+            None,
+            vec![file],
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_holding_a_dropped_column_imports_and_its_id_stays_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.parquet");
+        let (size, count) = write_file(&source);
+        let url = target(dir.path()).await;
+
+        // Without the retired field the dropped column's id names no column: refused.
+        let refused = import(&url, &manifest(&source, size, count))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                DuckLakeError::Import(ImportError::FieldIdMismatch {
+                    field_id: 3,
+                    ..
+                })
+            ),
+            "{refused}"
+        );
+
+        let retired =
+            manifest(&source, size, count).with_retired_fields(vec![field(3, "gone", "varchar")]);
+        import(&url, &retired).await.unwrap();
+        assert_eq!(
+            rows(&url).await,
+            vec![
+                vec![Some("1".into()), Some("a".into())],
+                vec![Some("3".into()), Some("c".into())],
+            ],
+            "the dropped column is not read; the deleted position is"
+        );
+
+        // The dropped column is recorded as a column that was never visible, so its id stays
+        // taken, and the id counter is past it.
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        let recorded: Vec<(i64, String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT column_id, column_name, begin_snapshot, end_snapshot FROM ducklake_column
+             WHERE column_id = 3",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].1, "gone");
+        assert_eq!(
+            Some(recorded[0].2),
+            recorded[0].3,
+            "begins and ends at once"
+        );
+        let next: String = sqlx::query_scalar(
+            "SELECT value FROM ducklake_metadata WHERE key = 'next_column_id' AND scope IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(next.parse::<i64>().unwrap() >= 3, "next_column_id {next}");
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retired_field_with_a_live_columns_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.parquet");
+        let (size, count) = write_file(&source);
+        let url = target(dir.path()).await;
+        let clash =
+            manifest(&source, size, count).with_retired_fields(vec![field(2, "old", "varchar")]);
+        let refused = import(&url, &clash).await.unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                DuckLakeError::Import(ImportError::RetiredFieldIsLive {
+                    field_id: 2,
+                    ..
+                })
+            ),
+            "{refused}"
+        );
+    }
 }
