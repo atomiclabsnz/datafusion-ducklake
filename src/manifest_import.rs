@@ -1515,6 +1515,62 @@ mod tests {
         );
     }
 
+    /// A bound the footer does not record exactly (parquet-rs truncates a long
+    /// string's statistics, marking them inexact) is not written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_inexact_footer_bound_is_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.parquet");
+        let long = "z".repeat(300);
+        let schema = Arc::new(Schema::new(vec![
+            with_id("id", DataType::Int32, 1),
+            with_id("name", DataType::Utf8, 2),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", long.as_str()])),
+            ],
+        )
+        .unwrap();
+        let size = write_batch(&path, &batch);
+        let reader = parquet::file::serialized_reader::SerializedFileReader::new(
+            std::fs::File::open(&path).unwrap(),
+        )
+        .unwrap();
+        let exact = parquet::file::reader::FileReader::metadata(&reader)
+            .row_group(0)
+            .column(1)
+            .statistics()
+            .unwrap()
+            .max_is_exact();
+        assert!(!exact, "parquet-rs truncated the long string's max");
+        let url = target(dir.path()).await;
+        let manifest = TableManifest::new(
+            1,
+            1,
+            vec![field(1, "id", "int32"), field(2, "name", "varchar")],
+            None,
+            vec![file_at(&path, size, 2)],
+        );
+        import(&url, &manifest).await.unwrap();
+        let stats = catalog_rows(
+            &url,
+            "SELECT column_id, min_value, max_value, null_count FROM ducklake_file_column_stats \
+             ORDER BY column_id",
+        )
+        .await;
+        assert_eq!(
+            stats,
+            vec![(1, Some("1".into()), Some("2".into()), Some(0)), (2, None, None, Some(0))]
+        );
+        assert_eq!(
+            sql(&url, "SELECT id FROM lake.main.t WHERE name > 'zzz'").await,
+            vec![vec![Some("2".into())]]
+        );
+    }
+
     /// Finding 3 and 8: after the source drops a column, re-importing with it retired
     /// succeeds; and an export of the result carries it as retired, so a round trip
     /// imports.
