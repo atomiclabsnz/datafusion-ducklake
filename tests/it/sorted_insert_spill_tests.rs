@@ -30,12 +30,16 @@ use datafusion_ducklake::{DuckLakeWriteOptions, MergeOptions, WriteMode};
 use object_store::local::LocalFileSystem;
 
 use crate::inlining_abstraction_tests::{Lake, create_with, sqlite};
+use crate::sort_expression_tests::raw;
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
 
-/// The pool a spilling run is held to: a fraction of what it sorts.
-const SMALL_POOL: usize = 2 * MIB;
+/// The pool a spilling run is held to: a fraction of what it sorts, with room
+/// for the writer beside the sort (an open file's dictionary column under
+/// `PARQUET_2_0` holds about 1 MiB of encoder, so the session is charged about
+/// 2 MiB from its first row group).
+const SMALL_POOL: usize = 8 * MIB;
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -72,12 +76,12 @@ fn input(rows: i64, per_batch: i64) -> Vec<RecordBatch> {
         .collect()
 }
 
-/// Row groups of 1,000 rows and a 512 KiB target, so a write rolls into many
+/// Row groups of 1,000 rows and a 64 KiB target, so a write rolls into many
 /// files; `limit` rows inline.
 fn options(limit: usize) -> DuckLakeWriteOptions {
     let mut options = DuckLakeWriteOptions::default();
     options.max_row_group_rows = Some(1000);
-    options.target_file_size = Some(512 * KIB);
+    options.target_file_size = Some(64 * KIB);
     options.data_inlining_row_limit = Some(limit);
     options
 }
@@ -86,7 +90,7 @@ type Key<'a> = (&'a str, SortDirection, NullOrder);
 
 /// `main.<name>(id, k, v)` sorted by `keys` (expressions as DuckDB stores
 /// them), with `sort_on_insert` stored as given: its table id.
-fn sorted_table(lake: &Lake, name: &str, keys: &[Key<'_>], sort_on_insert: bool) -> i64 {
+async fn sorted_table(lake: &Lake, name: &str, keys: &[Key<'_>], sort_on_insert: bool) -> i64 {
     create_with(
         lake,
         name,
@@ -97,15 +101,28 @@ fn sorted_table(lake: &Lake, name: &str, keys: &[Key<'_>], sort_on_insert: bool)
     let fields: Vec<SortField> = keys
         .iter()
         .enumerate()
-        .map(|(index, (expression, direction, null_order))| SortField {
+        .map(|(index, (_, direction, null_order))| SortField {
             sort_key_index: index as i32,
-            expression: expression.to_string(),
+            // A bare column, which `set_sort_spec` takes; the key's own
+            // expression is written over it below, as DuckDB stores it.
+            expression: "id".to_string(),
             dialect: "duckdb".to_string(),
             direction: *direction,
             null_order: *null_order,
         })
         .collect();
     lake.writer.set_sort_spec(table_id, &fields).unwrap();
+    for (index, (expression, _, _)) in keys.iter().enumerate() {
+        raw(
+            lake,
+            &format!(
+                "UPDATE ducklake_sort_expression SET expression = '{}' \
+                 WHERE table_id = {table_id} AND sort_key_index = {index}",
+                expression.replace('\'', "''")
+            ),
+        )
+        .await;
+    }
     lake.writer
         .set_table_setting(
             table_id,
@@ -337,11 +354,28 @@ async fn a_writer_sorted_insert_spills_and_lays_out_as_the_in_memory_sort() {
         let lake = sqlite()(None).await;
         let options = options(limit);
         for table in ["a", "b", "c"] {
-            sorted_table(&lake, table, keys, sort_on_insert);
+            sorted_table(&lake, table, keys, sort_on_insert).await;
         }
+        // The order: the collected write's sort (`sort_insert_rows`), as an
+        // INSERT wrote before.
         in_memory(&lake, "a", &options, &batches).await;
-        let expected = layout(&lake, "a");
+        let order: Vec<_> = layout(&lake, "a").into_iter().flat_map(|f| f.2).collect();
+
+        // The layout: the same INSERT under an unbounded pool, sorted in
+        // memory. (Its files are the streamed session's, whose encoding is
+        // not the collected write's, so they are compared with each other.)
+        let ctx = session(&lake, &options, RuntimeEnvBuilder::new(), &batches);
+        let plan = run(&ctx, "INSERT INTO lake.main.c SELECT id, k, v FROM src")
+            .await
+            .unwrap_or_else(|e| panic!("{keys:?}: {e}"));
+        assert_eq!(spills(&plan), (0, 0), "{keys:?}: in memory");
+        let expected = layout(&lake, "c");
         assert!(expected.len() > 5, "{keys:?}: rolls into many files");
+        let rows: Vec<_> = expected.iter().flat_map(|f| f.2.clone()).collect();
+        assert!(
+            rows == order,
+            "{keys:?}: in memory, in the collected sort's order"
+        );
 
         let factory = CountingFactory::new(None);
         let ctx = session(
@@ -360,23 +394,21 @@ async fn a_writer_sorted_insert_spills_and_lays_out_as_the_in_memory_sort() {
         );
         assert_eq!(others, 0, "{keys:?}: the plan sorted nothing");
         assert!(factory.created() > 0, "{keys:?}: spill files were made");
-        assert_eq!(layout(&lake, "b"), expected, "{keys:?}: spilled");
-
-        let ctx = session(&lake, &options, RuntimeEnvBuilder::new(), &batches);
-        let plan = run(&ctx, "INSERT INTO lake.main.c SELECT id, k, v FROM src")
-            .await
-            .unwrap_or_else(|e| panic!("{keys:?}: {e}"));
-        assert_eq!(spills(&plan), (0, 0), "{keys:?}: in memory");
-        assert_eq!(layout(&lake, "c"), expected, "{keys:?}: in memory");
+        assert!(
+            layout(&lake, "b") == expected,
+            "{keys:?}: spilled, laid out as in memory"
+        );
     }
 }
 
 /// A key that fails over the rows (`CAST` of a string that is no number, on
 /// the last rows only) leaves every row in arrival order, as the in-memory
-/// sort leaves it, spilled or not.
+/// sort leaves it, spilled or not. Two sorts hold memory at once here (the
+/// key's, merging, and the position's, filling), so the pool is twice the
+/// others' and the rows twice as many.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failing_key_writes_the_rows_in_arrival_order() {
-    let mut batches = input(60_000, 997);
+    let mut batches = input(240_000, 997);
     // The last row's `v` is no number: `CAST(v AS BIGINT)` fails there.
     let last = batches.pop().unwrap();
     let n = last.num_rows();
@@ -403,31 +435,43 @@ async fn a_failing_key_writes_the_rows_in_arrival_order() {
     )];
     let lake = sqlite()(None).await;
     let options = options(0);
-    for table in ["a", "b"] {
-        sorted_table(&lake, table, keys, true);
+    for table in ["a", "b", "c"] {
+        sorted_table(&lake, table, keys, true).await;
     }
+    let ids = |files: &[File]| -> Vec<i64> {
+        files.iter().flat_map(|f| f.2.iter().map(|r| r.0)).collect()
+    };
     in_memory(&lake, "a", &options, &batches).await;
-    let expected = layout(&lake, "a");
-    let ids: Vec<i64> = expected
-        .iter()
-        .flat_map(|f| f.2.iter().map(|r| r.0))
-        .collect();
     assert_eq!(
-        ids,
-        (0..60_000).collect::<Vec<_>>(),
-        "the reference keeps arrival order"
+        ids(&layout(&lake, "a")),
+        (0..240_000).collect::<Vec<_>>(),
+        "the collected sort keeps arrival order"
+    );
+    let ctx = session(&lake, &options, RuntimeEnvBuilder::new(), &batches);
+    run(&ctx, "INSERT INTO lake.main.c SELECT id, k, v FROM src")
+        .await
+        .unwrap();
+    let expected = layout(&lake, "c");
+    assert_eq!(
+        ids(&expected),
+        (0..240_000).collect::<Vec<_>>(),
+        "in memory: arrival order"
     );
     let factory = CountingFactory::new(None);
     let ctx = session(
         &lake,
         &options,
-        runtime(SMALL_POOL, Some(factory)),
+        runtime(2 * SMALL_POOL, Some(Arc::clone(&factory))),
         &batches,
     );
-    run(&ctx, "INSERT INTO lake.main.b SELECT id, k, v FROM src")
+    let plan = run(&ctx, "INSERT INTO lake.main.b SELECT id, k, v FROM src")
         .await
         .unwrap();
-    assert_eq!(layout(&lake, "b"), expected);
+    assert!(spills(&plan).0 > 0, "the insert's sorts spilled");
+    assert!(
+        layout(&lake, "b") == expected,
+        "spilled, laid out as in memory"
+    );
 }
 
 /// The catalog's snapshots, data files and inlined rows of `main.<table>`.
@@ -448,7 +492,7 @@ async fn a_sorted_insert_refused_mid_sort_leaves_nothing() {
     let keys: &[Key<'_>] = &[("(k % 7)", SortDirection::Asc, NullOrder::NullsLast)];
     let insert = "INSERT INTO lake.main.b SELECT id, k, v FROM src";
     let failing = "INSERT INTO lake.main.b SELECT id, \
-                   CASE WHEN id = 119990 THEN CAST(v AS BIGINT) ELSE k END, v FROM src";
+                   CASE WHEN id = 119990 THEN CAST(concat('x', v) AS BIGINT) ELSE k END, v FROM src";
     let cases: [(&str, RuntimeEnvBuilder, &str, &str); 3] = [
         (
             "the pool, no disk manager",
@@ -474,7 +518,7 @@ async fn a_sorted_insert_refused_mid_sort_leaves_nothing() {
     ];
     for (what, runtime, sql, says) in cases {
         let lake = sqlite()(None).await;
-        sorted_table(&lake, "b", keys, true);
+        sorted_table(&lake, "b", keys, true).await;
         let before = committed(&lake, "b");
         let ctx = session(&lake, &options(0), runtime, &batches);
         let error = run(&ctx, sql).await.expect_err(what);
@@ -586,7 +630,7 @@ async fn a_sorted_insert_whose_write_fails_after_the_sort_leaves_nothing() {
     let batches = input(120_000, 997);
     let keys: &[Key<'_>] = &[("(k % 7)", SortDirection::Asc, NullOrder::NullsLast)];
     let lake = sqlite()(None).await;
-    sorted_table(&lake, "b", keys, true);
+    sorted_table(&lake, "b", keys, true).await;
     let before = committed(&lake, "b");
     let factory = CountingFactory::new(None);
     let ctx = session(
@@ -624,7 +668,8 @@ async fn a_plan_sorted_insert_spills() {
         "b",
         &[("k", SortDirection::Asc, NullOrder::NullsLast)],
         true,
-    );
+    )
+    .await;
     let ctx = session(
         &lake,
         &options(0),
@@ -650,10 +695,10 @@ async fn a_plan_sorted_insert_spills() {
 }
 
 /// `main.t` sorted by `(k % 7)` (compaction sorts by it), written unsorted as
-/// four files: two of distinct strings, then two whose rows repeat 50 values,
-/// so a small file holds megabytes of rows. A row of the last two is all its
-/// key's: rows that tie on it are equal, so no tie rule can tell two layouts
-/// of them apart.
+/// four files: two of distinct strings, then two whose rows repeat 7 values in
+/// runs of 100, so a small file holds megabytes of rows. A row of the last two
+/// is all its key's (`k` is its own `k % 7`): rows that tie on it are equal, so
+/// no tie rule can tell two layouts of them apart.
 async fn compaction_lake() -> Lake {
     let lake = sqlite()(None).await;
     sorted_table(
@@ -661,12 +706,16 @@ async fn compaction_lake() -> Lake {
         "t",
         &[("(k % 7)", SortDirection::Asc, NullOrder::NullsLast)],
         false,
-    );
+    )
+    .await;
     let mut options = options(0);
     options.target_file_size = None;
+    // A row group a file, so the two big files are small on disk (their
+    // dictionary pages are written once, not once per 1,000 rows).
+    options.max_row_group_rows = None;
     let small = input(14_000, 997);
     let repeated = |b: i64| -> RecordBatch {
-        let ks = (0..5000i64).map(|i| (i * 7 + b) % 50);
+        let ks = (0..5000i64).map(|i| (i / 100 + b) % 7);
         RecordBatch::try_new(
             schema(),
             vec![
@@ -798,7 +847,8 @@ async fn a_sorted_insert_that_fits_the_pool_is_not_refused_by_its_charge() {
             "t",
             &[(key, SortDirection::Asc, NullOrder::NullsLast)],
             true,
-        );
+        )
+        .await;
         let mut options = DuckLakeWriteOptions::default();
         options.data_inlining_row_limit = Some(10);
         let ctx = session(&lake, &options, runtime(256 * MIB, None), &input(1, 1));

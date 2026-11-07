@@ -265,7 +265,7 @@ fn sliced_memory_size(batch: &RecordBatch) -> usize {
 /// INSERT was refused at a 256 MiB pool, the buffered row group charged
 /// 57 MiB a batch). The copy is of the buffered rows' strings only, once per
 /// file. A view nested in another type is still counted whole.
-fn compact_views(batch: &RecordBatch) -> Result<RecordBatch> {
+pub(crate) fn compact_views(batch: &RecordBatch) -> Result<RecordBatch> {
     if !batch.columns().iter().any(|column| {
         matches!(
             column.data_type(),

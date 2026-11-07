@@ -25,7 +25,7 @@ use datafusion_ducklake::{
 use crate::inlining_abstraction_tests::{Lake, create, sqlite};
 
 /// Run `statement` against `lake`'s SQLite catalog directly.
-async fn raw(lake: &Lake, statement: &str) {
+pub(crate) async fn raw(lake: &Lake, statement: &str) {
     let url = format!(
         "sqlite:{}?mode=rwc",
         lake.data.parent().unwrap().join("lake.db").display()
@@ -392,8 +392,10 @@ async fn bare_column_keys_order_inserts_as_the_duckdb_cli() {
 /// A sort the writer makes (`sort_on_insert` off while inlining is enabled:
 /// official sorts only the rows it writes to Parquet) orders an insert as
 /// official's does, through the spilling sort (ADR-0037 slice 4 in ferrion):
-/// the [`ROWS`] under each of the keys above, and 200,000 rows under a 2 MiB
+/// the [`ROWS`] under each of the keys above, and 200,000 rows under an 8 MiB
 /// pool, which spill, every key's ties broken by `id` so the order is total.
+/// Both lakes write row groups of 2,048 rows, so the writer's first row group
+/// (which it buffers, charged to the pool) fits beside the sort.
 #[tokio::test(flavor = "multi_thread")]
 async fn writer_sorted_inserts_order_as_the_duckdb_cli() {
     let Ok(version) = Command::new("duckdb").arg("--version").output() else {
@@ -447,14 +449,14 @@ async fn writer_sorted_inserts_order_as_the_duckdb_cli() {
             "k DESC NULLS FIRST, id",
             many("range(200000) AS t(range)", "range"),
             many("generate_series(0, 199999) AS t(value)", "value"),
-            Some(2 * 1024 * 1024),
+            Some(8 * 1024 * 1024),
         ),
         (
             MANY,
             "k NULLS LAST, s DESC, id",
             many("range(200000) AS t(range)", "range"),
             many("generate_series(0, 199999) AS t(value)", "value"),
-            Some(2 * 1024 * 1024),
+            Some(8 * 1024 * 1024),
         ),
     ];
     for (columns, keys, official_rows, our_rows, pool) in cases {
@@ -463,8 +465,11 @@ async fn writer_sorted_inserts_order_as_the_duckdb_cli() {
         let data = temp.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
         cli(&format!(
-            "{} CALL lake.set_option('data_inlining_row_limit', 2); \
+            // One thread: across threads official sorts each thread's rows
+            // alone (200,000 rows on 4 threads land as two sorted runs).
+            "SET threads = 1; {} CALL lake.set_option('data_inlining_row_limit', 2); \
              CALL lake.set_option('sort_on_insert', false); \
+             CALL lake.set_option('parquet_row_group_size', 2048); \
              CREATE TABLE lake.o({columns}); ALTER TABLE lake.o SET SORTED BY ({keys}); \
              CREATE TABLE lake.c({columns}); ALTER TABLE lake.c SET SORTED BY ({keys}); \
              INSERT INTO lake.o {official_rows};",

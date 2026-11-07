@@ -212,7 +212,25 @@ pub(crate) fn sort_stream(
                 POSITION_COLUMN,
                 position,
             )))];
-            sort_by(head, by_position, context, &slot)
+            // Each batch the first sort yields draws its strings from all of
+            // its input's buffers; copied out, the second sort is charged
+            // each batch's own rows, not the whole first sort's buffers a
+            // batch (`write_encoding::compact_views`).
+            let compacted = head.map(|batch| {
+                batch.and_then(|batch| {
+                    crate::write_encoding::compact_views(&batch)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))
+                })
+            });
+            sort_by(
+                Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&augmented),
+                    compacted,
+                )),
+                by_position,
+                context,
+                &slot,
+            )
         })
         .try_flatten()
     };

@@ -393,6 +393,20 @@ impl ExecutionPlan for DuckLakeInsertExec {
                     Sorted::Held(batches) => batches,
                 }
             } else if streams {
+                // Rows the plan sorted come once its sort has read them all,
+                // from a merge that takes what the pool has free: room for the
+                // session is held until they do, as for the writer's own sort
+                // (`insert_sorted`), its rows' strings not known.
+                let headroom = sort_plan.sorted.then(|| {
+                    reserve_headroom(
+                        &context,
+                        session_headroom(
+                            &arrow_schema,
+                            schema_row_bytes(&arrow_schema),
+                            &write_options,
+                        ),
+                    )
+                });
                 // Up to the first batch with rows: an input of none is answered
                 // below as before.
                 let mut first = None;
@@ -403,6 +417,8 @@ impl ExecutionPlan for DuckLakeInsertExec {
                         break;
                     }
                 }
+                // The session is charged what it holds from here (`stream_into`).
+                drop(headroom);
                 match first {
                     Some(first) => {
                         // Boxed: a write session is kilobytes, and this future is
@@ -642,23 +658,18 @@ async fn insert_sorted(
         rows += batch.num_rows();
         batches.push(batch);
     }
-    // Room for the session beside the sort: what one row group of these rows
-    // takes ([`session_headroom`]), held until the sort's first row. Without
-    // it a sort that just fits the pool keeps it all, and the session then
+    // Room for the session beside the sort ([`session_headroom`]), held
+    // until the sort's first row. Without it a sort that just fits the pool
+    // keeps it all, or its merge takes what is left, and the session then
     // finds none (refused at the pool, where with a disk manager the sort
-    // would have spilled). Not taken when the pool cannot spare it.
-    let estimate = session_headroom(&batches, rows, target.write_options);
+    // would have spilled).
+    let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
     held.free();
-    let headroom =
-        datafusion::execution::memory_pool::MemoryConsumer::new("DuckLakeInsertExec headroom")
-            .register(context.memory_pool());
-    if headroom.try_grow(estimate).is_err() {
-        tracing::debug!(
-            estimate,
-            "no headroom for an insert's session beside its sort"
-        );
-    }
     let schema = input.schema();
+    let headroom = reserve_headroom(
+        context,
+        session_headroom(&schema, bytes / rows.max(1), target.write_options),
+    );
     let rest: SendableRecordBatchStream = Box::pin(
         datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
@@ -692,17 +703,75 @@ async fn insert_sorted(
     Ok(Sorted::Written(rows))
 }
 
-/// What a write session of rows like `batches` (`rows` of them) holds at
-/// most beside a sort: one row group of them buffered (`max_row_group_rows`,
-/// DuckDB's 122,880 by default, at most `max_row_group_bytes`) and, for
+/// What an open file's column encoders hold whatever its rows, a column:
+/// `PARQUET_2_0`'s delta encoders and a dictionary's fallback allocate about
+/// 1 MiB each (parquet 59, measured: a 1,000-row row group of `BIGINT`
+/// dictionary keys holds 1.1 MiB under `PARQUET_2_0`, 76 KiB under
+/// `PARQUET_1_0`). An upper bound for `PARQUET_1_0`.
+const ENCODER_BYTES_PER_COLUMN: usize = 1 << 20;
+
+/// The Parquet leaf columns `data_type` writes.
+fn leaf_columns(data_type: &DataType) -> usize {
+    match data_type {
+        DataType::Struct(fields) => fields.iter().map(|f| leaf_columns(f.data_type())).sum(),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => leaf_columns(field.data_type()),
+        DataType::Dictionary(_, value) => leaf_columns(value),
+        _ => 1,
+    }
+    .max(1)
+}
+
+/// A row of `schema` in memory when nothing else is known of it: each
+/// fixed-width column's width, and a view's 16 bytes for any other (its
+/// strings not counted).
+fn schema_row_bytes(schema: &Schema) -> usize {
+    schema
+        .fields()
+        .iter()
+        .map(|field| field.data_type().primitive_width().unwrap_or(16))
+        .sum()
+}
+
+/// `estimate` bytes of `context`'s pool, held for a session beside a sort
+/// until its first row ([`session_headroom`]). Not taken when the pool cannot
+/// spare it: the session then takes what it finds.
+fn reserve_headroom(
+    context: &Arc<TaskContext>,
+    estimate: usize,
+) -> datafusion::execution::memory_pool::MemoryReservation {
+    let headroom =
+        datafusion::execution::memory_pool::MemoryConsumer::new("DuckLakeInsertExec headroom")
+            .register(context.memory_pool());
+    if headroom.try_grow(estimate).is_err() {
+        tracing::debug!(
+            estimate,
+            "no headroom for an insert's session beside its sort"
+        );
+    }
+    headroom
+}
+
+/// What a write session of rows of `schema`, `per_row` bytes each, holds at
+/// most beside a sort: its columns' encoders ([`ENCODER_BYTES_PER_COLUMN`]),
+/// one row group of rows buffered (`max_row_group_rows`, DuckDB's 122,880 by
+/// default, at most `max_row_group_bytes`) and, for
 /// [`Staging::Parts`](crate::Staging::Parts) (`wasm32`'s default), a part.
 fn session_headroom(
-    batches: &[RecordBatch],
-    rows: usize,
+    schema: &Schema,
+    per_row: usize,
     options: &crate::table_writer::DuckLakeWriteOptions,
 ) -> usize {
-    let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
-    let per_row = bytes / rows.max(1);
+    let encoders = schema
+        .fields()
+        .iter()
+        .map(|field| leaf_columns(field.data_type()))
+        .sum::<usize>()
+        .saturating_mul(ENCODER_BYTES_PER_COLUMN);
     let mut group = per_row.saturating_mul(options.max_row_group_rows.unwrap_or(122_880));
     if let Some(cap) = options.max_row_group_bytes {
         group = group.min(cap);
@@ -715,7 +784,7 @@ fn session_headroom(
         None if cfg!(target_arch = "wasm32") => crate::Staging::DEFAULT_PART_BYTES,
         _ => 0,
     };
-    group.saturating_add(part)
+    group.saturating_add(part).saturating_add(encoders)
 }
 
 /// Begin the write session of `target` (refusing a partition spec gone live
