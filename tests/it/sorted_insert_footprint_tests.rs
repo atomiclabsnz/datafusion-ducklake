@@ -266,3 +266,31 @@ async fn a_sorted_insert_in_many_partitions_under_either_pool_is_written() {
     }
     assert!(failed.is_empty(), "refused:\n{}", failed.join("\n"));
 }
+
+/// The writer's sort (`(c0 + 1)`) of the same rows in 16 partitions under
+/// 64 MiB, either pool: the collected path takes it (the fork before slice 4
+/// writes it, and so does this head, by that path). Streamed through the
+/// spilling sort instead, a fair pool's spillable share for it is a slice of
+/// the pool among the plan's spillable consumers (review round 2: refused).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writer_sorted_insert_the_collected_path_takes_is_written_under_either_pool() {
+    let mut failed = Vec::new();
+    for fair in [false, true] {
+        let pool: Arc<dyn MemoryPool> = if fair {
+            Arc::new(FairSpillPool::new(64 * MIB))
+        } else {
+            Arc::new(GreedyMemoryPool::new(64 * MIB))
+        };
+        if let Err(e) = write_wide(30, 100_000, pool, true, Some(16), "(c0 + 1)").await {
+            failed.push(format!(
+                "{}: {e}",
+                if fair {
+                    "fair"
+                } else {
+                    "greedy"
+                }
+            ));
+        }
+    }
+    assert!(failed.is_empty(), "refused:\n{}", failed.join("\n"));
+}
