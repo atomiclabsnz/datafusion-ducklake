@@ -788,8 +788,9 @@ async fn merge(lake: &Lake, runtime: RuntimeEnvBuilder, target: u64) -> Result<u
         .map_err(|e| e.to_string())
 }
 
-/// A sorted compaction past a small pool spills and lays its files out as the
-/// same compaction in memory does; with nothing to spill to it is refused, not
+/// A sorted compaction past a small pool spills and writes the files the same
+/// compaction in memory does (the same rows each, in key order; ties as
+/// DataFusion's sort leaves them); with nothing to spill to it is refused, not
 /// written unsorted, and the bin it had already merged is removed: the
 /// catalog and the files are as they were.
 #[tokio::test(flavor = "multi_thread")]
@@ -835,10 +836,24 @@ async fn a_sorted_compaction_spills_or_is_refused_whole() {
             .collect()
     };
     let spilled = rows(&lake);
+    // The same files, each with the same rows. Not in the same order among the
+    // rows that tie on `(k % 7)`: compaction's sort has no tie-break (before
+    // slice 4 neither), and DataFusion's sort orders ties as its runs fall,
+    // which a pool changes. The big bin's ties are equal rows (the fixture).
+    let as_set = |files: &[Vec<(Option<i64>, String)>]| -> Vec<Vec<(Option<i64>, String)>> {
+        files
+            .iter()
+            .map(|file| {
+                let mut file = file.clone();
+                file.sort();
+                file
+            })
+            .collect()
+    };
     assert_eq!(
-        spilled,
-        rows(&reference),
-        "the same files, rows in the same order"
+        as_set(&spilled),
+        as_set(&rows(&reference)),
+        "the same files, the same rows"
     );
     for file in &spilled {
         let key = |row: &(Option<i64>, String)| row.0.map_or(i64::MAX, |k| k % 7);
