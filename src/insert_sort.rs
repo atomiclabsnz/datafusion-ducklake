@@ -139,6 +139,7 @@ pub(crate) fn sort_stream(
     let lengths = Arc::new(Mutex::new(VecDeque::new()));
     let evaluated = {
         let augmented = Arc::clone(&augmented);
+        let input_schema = Arc::clone(&input_schema);
         let failed = Arc::clone(&failed);
         let lengths = Arc::clone(&lengths);
         let mut next_position = 0u64;
@@ -149,12 +150,31 @@ pub(crate) fn sort_stream(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push_back(rows);
-            let mut columns = batch.columns().to_vec();
+            // As the planned schema types them: the sort's own batches are
+            // built against it.
+            let mut columns = batch
+                .columns()
+                .iter()
+                .zip(input_schema.fields())
+                .map(|(column, field)| as_planned(Arc::clone(column), field.data_type()))
+                .collect::<Result<Vec<_>>>()?;
             let mut values: Vec<ArrayRef> = Vec::with_capacity(keys.len());
             if !failed.load(Ordering::Relaxed) {
                 for (key, data_type) in keys.iter().zip(&key_types) {
                     match key.expr.evaluate(&batch).and_then(|v| v.into_array(rows)) {
-                        Ok(array) if array.data_type() == data_type => values.push(array),
+                        // Its type up to nested field names and metadata: a
+                        // list or struct key named otherwise than the planned
+                        // schema names it (a batch's own schema may) is the
+                        // same key, and `sort_batches_by_spec` sorts by it.
+                        Ok(array) if array.data_type().equals_datatype(data_type) => {
+                            match as_planned(array, data_type) {
+                                Ok(array) => values.push(array),
+                                Err(_) => {
+                                    failed.store(true, Ordering::Relaxed);
+                                    break;
+                                },
+                            }
+                        },
                         // The key's failure, not the write's: every row keeps its
                         // arrival order (below), as `sort_batches_by_spec` keeps it.
                         _ => {
@@ -255,6 +275,17 @@ pub(crate) fn sort_stream(
             lengths,
         ),
     )))
+}
+
+/// `array` typed as `planned`: itself when it is, else cast to it. A batch
+/// may name a list's or a struct's fields otherwise than its stream's schema
+/// (`DataType::equals_datatype` holds), while the sort builds its batches
+/// against the schema, which must match exactly.
+fn as_planned(array: ArrayRef, planned: &DataType) -> Result<ArrayRef> {
+    if array.data_type() == planned {
+        return Ok(array);
+    }
+    Ok(arrow::compute::cast(&array, planned)?)
 }
 
 /// `input` sorted by `ordering` in a `SortExec` over `context`, kept in `slot`.
@@ -433,7 +464,7 @@ impl PartitionStream for OnceStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Array, Int64Array, StringArray};
     use arrow::compute::SortOptions;
     use datafusion::execution::memory_pool::FairSpillPool;
     use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -648,5 +679,64 @@ mod tests {
             matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
             "{error}"
         );
+    }
+
+    /// A list key whose batches name its item field otherwise than the stream's
+    /// schema does (`element` against `item`) is the same key: the rows are
+    /// sorted by it, not left in arrival order as a failing key's are.
+    #[tokio::test]
+    async fn a_key_named_otherwise_than_its_schema_still_sorts() {
+        let list = |name: &str| DataType::List(Arc::new(Field::new(name, DataType::Int64, true)));
+        let planned = Arc::new(Schema::new(vec![Field::new("k", list("item"), true)]));
+        let own = Arc::new(Schema::new(vec![Field::new("k", list("element"), true)]));
+        let batches: Vec<RecordBatch> = (0..4i64)
+            .map(|b| {
+                let values = (0..5i64).map(|i| Some(vec![Some((b * 5 + i) * 7 % 20)]));
+                let array = arrow::array::GenericListArray::<i32>::from_iter_primitive::<
+                    arrow::datatypes::Int64Type,
+                    _,
+                    _,
+                >(values);
+                let array = arrow::array::ListArray::new(
+                    Arc::new(Field::new("element", DataType::Int64, true)),
+                    array.offsets().clone(),
+                    Arc::clone(array.values()),
+                    None,
+                );
+                RecordBatch::try_new(Arc::clone(&own), vec![Arc::new(array)]).unwrap()
+            })
+            .collect();
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&planned),
+            stream::iter(batches.into_iter().map(Ok)),
+        ));
+        let keys =
+            vec![PhysicalSortExpr::new(Arc::new(Column::new("k", 0)), SortOptions::default())];
+        let slot = SortSlot::default();
+        let sorted: Vec<RecordBatch> = sort_stream(input, keys, spilling_context(1 << 30), &slot)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let firsts: Vec<i64> = sorted
+            .iter()
+            .flat_map(|batch| {
+                let list = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::ListArray>()
+                    .unwrap();
+                (0..list.len())
+                    .map(|row| {
+                        list.value(row)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .value(0)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(firsts, (0..20).collect::<Vec<_>>(), "sorted by the key");
     }
 }

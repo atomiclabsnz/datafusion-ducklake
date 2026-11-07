@@ -1349,6 +1349,15 @@ impl DuckLakeTable {
                     // checked the rows arrived in source order.)
                     let expected: i64 = bin.iter().filter_map(|tf| tf.max_row_count).sum();
                     if file.record_count != expected {
+                        // Written but not yet among `outputs`, so the cleanup
+                        // below would not see it: removed here.
+                        table_writer
+                            .remove_unstaged(
+                                schema_name,
+                                self.table_name(),
+                                vec![(file.path.clone(), file.path_is_relative)],
+                            )
+                            .await;
                         return Err(DuckLakeError::Internal(format!(
                             "rowid-adjacent merge wrote {} rows, its sources hold {expected}",
                             file.record_count

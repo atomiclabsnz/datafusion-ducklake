@@ -737,21 +737,46 @@ fn schema_row_bytes(schema: &Schema) -> usize {
         .sum()
 }
 
-/// `estimate` bytes of `context`'s pool, held for a session beside a sort
-/// until its first row ([`session_headroom`]). Not taken when the pool cannot
-/// spare it: the session then takes what it finds.
+/// Up to `estimate` bytes of `context`'s pool, held for a session beside a
+/// sort until the sort's first row ([`session_headroom`]), so that a sort that
+/// spills leaves the session room: DataFusion's spill merge takes what the pool
+/// has free.
+///
+/// Never at the sort's expense: only where the sort can spill (a disk manager
+/// that makes files), and at most half of what the pool has free past the
+/// sort's own merge reservation (`sort_spill_reservation_bytes`, which every
+/// batch the sort takes needs). So the headroom only makes a sort spill sooner;
+/// it never refuses a write the sort alone would have taken. With nothing to
+/// spill to none is held, as before the sort streamed: the sort holds what it
+/// holds whether or not the session has room. Not taken when the pool cannot
+/// spare it.
 fn reserve_headroom(
     context: &Arc<TaskContext>,
     estimate: usize,
 ) -> datafusion::execution::memory_pool::MemoryReservation {
+    let pool = context.memory_pool();
     let headroom =
         datafusion::execution::memory_pool::MemoryConsumer::new("DuckLakeInsertExec headroom")
-            .register(context.memory_pool());
-    if headroom.try_grow(estimate).is_err() {
-        tracing::debug!(
-            estimate,
-            "no headroom for an insert's session beside its sort"
-        );
+            .register(pool);
+    if !context.runtime_env().disk_manager.tmp_files_enabled() {
+        return headroom;
+    }
+    let merge = context
+        .session_config()
+        .options()
+        .execution
+        .sort_spill_reservation_bytes;
+    let bytes = match pool.memory_limit() {
+        datafusion::execution::memory_pool::MemoryLimit::Finite(limit) => {
+            let spare = limit.saturating_sub(pool.reserved()).saturating_sub(merge) / 2;
+            estimate.min(spare)
+        },
+        datafusion::execution::memory_pool::MemoryLimit::Infinite => estimate,
+        // A pool that does not say its limit: what it can spare is not known.
+        datafusion::execution::memory_pool::MemoryLimit::Unknown => 0,
+    };
+    if headroom.try_grow(bytes).is_err() {
+        tracing::debug!(bytes, "no headroom for an insert's session beside its sort");
     }
     headroom
 }

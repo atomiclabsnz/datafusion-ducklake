@@ -117,6 +117,7 @@ mod session_parquet_options_tests;
 mod session_refresh_tests;
 mod snapshot_readback_tests;
 mod sort_expression_tests;
+mod sorted_insert_footprint_tests;
 mod sorted_insert_spill_tests;
 mod sorted_write_duckdb_tests;
 mod sorted_write_tests;
