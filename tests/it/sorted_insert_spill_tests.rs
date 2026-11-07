@@ -371,6 +371,15 @@ async fn a_writer_sorted_insert_spills_and_lays_out_as_the_in_memory_sort() {
         assert_eq!(spills(&plan), (0, 0), "{keys:?}: in memory");
         let expected = layout(&lake, "c");
         assert!(expected.len() > 5, "{keys:?}: rolls into many files");
+        // A file rolls between batches, and the sorted rows are cut back to
+        // the lengths they arrived in (997, the sort's own being 8,192): every
+        // file but the last holds a whole number of them, as before.
+        assert!(
+            expected[..expected.len() - 1]
+                .iter()
+                .all(|file| file.0 % 997 == 0),
+            "{keys:?}: files roll at the input's batch boundaries"
+        );
         let rows: Vec<_> = expected.iter().flat_map(|f| f.2.clone()).collect();
         assert!(
             rows == order,
