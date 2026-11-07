@@ -360,13 +360,14 @@ impl DuckLakeTable {
                     if !dropped.is_empty()
                         && let Some(written_at) = table_file.begin_snapshot
                     {
-                        if !fields_at.contains_key(&written_at) {
-                            let fields = self
-                                .provider()
-                                .get_table_fields(self.table_id(), written_at)?;
-                            fields_at.insert(written_at, fields);
-                        }
-                        for field in &fields_at[&written_at] {
+                        let fields = match fields_at.entry(written_at) {
+                            std::collections::hash_map::Entry::Occupied(at) => at.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(at) => at.insert(
+                                self.provider()
+                                    .get_table_fields(self.table_id(), written_at)?,
+                            ),
+                        };
+                        for field in fields.iter() {
                             if dropped.contains(&field.column_id) {
                                 retired.insert(field.column_id, field.clone());
                             }

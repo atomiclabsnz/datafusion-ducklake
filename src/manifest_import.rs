@@ -572,7 +572,7 @@ impl DuckLakeTableWriter {
                 stat.min_value = None;
                 stat.max_value = None;
             }
-            if !known.is_some_and(|f| f.null_count.is_some()) {
+            if known.is_none_or(|f| f.null_count.is_none()) {
                 stat.null_count = None;
                 stat.value_count = None;
             }
