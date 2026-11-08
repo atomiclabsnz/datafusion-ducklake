@@ -143,6 +143,8 @@ pub(crate) mod inlined_reclaim;
 #[cfg(feature = "write")]
 pub mod insert_exec;
 #[cfg(feature = "write")]
+pub(crate) mod insert_sort;
+#[cfg(feature = "write")]
 pub mod keyed_mutation;
 #[cfg(feature = "write")]
 pub mod maintenance;
