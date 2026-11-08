@@ -231,14 +231,10 @@ impl ExecutionPlan for DuckLakeDeleteExec {
         let output_schema = make_delete_count_schema();
 
         let stream = stream::once(async move {
-            let selection = match predicate {
-                Some(predicate) => Selection::Predicate(predicate),
-                None => Selection::All,
-            };
             let deleted = run_delete(
                 table,
                 &session_state,
-                selection,
+                predicate,
                 writer,
                 object_store_url,
                 &schema_name,
@@ -261,10 +257,10 @@ impl ExecutionPlan for DuckLakeDeleteExec {
 /// Run the delete and return the number of rows deleted. See the module docs for
 /// the two paths (filtered positional delete vs. delete-all truncate).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_delete(
+async fn run_delete(
     table: Arc<DuckLakeTable>,
     session_state: &SessionState,
-    selection: Selection,
+    predicate: Option<Arc<dyn PhysicalExpr>>,
     writer: Arc<dyn MetadataWriter>,
     object_store_url: Arc<ObjectStoreUrl>,
     schema_name: &str,
@@ -288,7 +284,7 @@ pub(crate) async fn run_delete(
     // Delete-all (no WHERE) on a writer without staged row mutations:
     // metadata-only truncate — end every live data file in one snapshot. Skip
     // the empty table entirely (no-op, no snapshot).
-    if matches!(selection, Selection::All) && !capable {
+    if predicate.is_none() && !capable {
         if table_files.is_empty() && inlined_data.is_empty() {
             return Ok(0);
         }
@@ -317,8 +313,8 @@ pub(crate) async fn run_delete(
     };
     let inlined_deletes = table.inlined_deletes_by_file()?;
 
-    let mut selection = match selection {
-        Selection::All => {
+    let predicate = match predicate {
+        None => {
             return delete_all(
                 &table,
                 state,
@@ -333,7 +329,7 @@ pub(crate) async fn run_delete(
             )
             .await;
         },
-        selection => selection,
+        Some(p) => p,
     };
 
     let mut entries: Vec<DeleteFileEntry> = Vec::new();
@@ -342,35 +338,18 @@ pub(crate) async fn run_delete(
     let mut total_deleted: u64 = 0;
 
     for inlined in &inlined_data {
-        let matches: Vec<bool> = match &mut selection {
-            Selection::Predicate(predicate) => {
-                let values = predicate.evaluate(&inlined.batch)?;
-                let matches = values.into_array(inlined.batch.num_rows())?;
-                let matches = matches
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| {
-                        DataFusionError::Internal(
-                            "DELETE predicate did not evaluate to a boolean array".to_string(),
-                        )
-                    })?;
-                (0..inlined.row_ids.len())
-                    .map(|row| matches.is_valid(row) && matches.value(row))
-                    .collect()
-            },
-            Selection::Located {
-                inlined: ids,
-                ..
-            } => inlined.row_ids.iter().map(|id| ids.remove(id)).collect(),
-            // Taken by `delete_all` above.
-            Selection::All => {
-                return Err(DataFusionError::Internal(
-                    "a delete of every row reached the selective path".to_string(),
-                ));
-            },
-        };
+        let values = predicate.evaluate(&inlined.batch)?;
+        let matches = values.into_array(inlined.batch.num_rows())?;
+        let matches = matches
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "DELETE predicate did not evaluate to a boolean array".to_string(),
+                )
+            })?;
         for (row, row_id) in inlined.row_ids.iter().enumerate() {
-            if matches[row] {
+            if matches.is_valid(row) && matches.value(row) {
                 inlined_rows.push(InlinedRowRef {
                     table_name: inlined.table_name.clone(),
                     row_id: *row_id,
@@ -390,21 +369,9 @@ pub(crate) async fn run_delete(
 
         // Physical positions matching the predicate (raw scan; delete files NOT
         // applied — resolution is over the file's own rows).
-        let matched: HashSet<i64> = match &mut selection {
-            Selection::Predicate(predicate) => {
-                table
-                    .resolve_positions(state, &tf.file, Arc::clone(predicate))
-                    .await?
-            },
-            Selection::Located {
-                files,
-                ..
-            } => files
-                .remove(&tf.data_file_id)
-                .map(|positions| positions.into_iter().collect())
-                .unwrap_or_default(),
-            Selection::All => HashSet::new(),
-        };
+        let matched = table
+            .resolve_positions(state, &tf.file, Arc::clone(&predicate))
+            .await?;
         if matched.is_empty() {
             continue;
         }
@@ -463,28 +430,6 @@ pub(crate) async fn run_delete(
         });
     }
 
-    // Rows named by where they live must all have been found live at the
-    // table's snapshot: a row named in a file or an inlined table this snapshot
-    // does not have would be a row the caller meant to delete and did not.
-    if let Selection::Located {
-        files,
-        inlined,
-    } = &selection
-    {
-        if let Some(file) = files.keys().min() {
-            return Err(DataFusionError::Execution(format!(
-                "data file {file} is not a live data file of '{table_name}' at snapshot \
-                 {base_snapshot}: the rows named in it are not deleted"
-            )));
-        }
-        if let Some(row_id) = inlined.iter().min() {
-            return Err(DataFusionError::Execution(format!(
-                "row {row_id} is not a live inlined row of '{table_name}' at snapshot \
-                 {base_snapshot}: it is not deleted"
-            )));
-        }
-    }
-
     if capable && (!inlined_rows.is_empty() || deletions.needs_staged_commit()) {
         commit_row_deletes(
             &table,
@@ -525,22 +470,6 @@ pub(crate) async fn run_delete(
     }
 
     Ok(total_deleted)
-}
-
-/// Which rows a delete removes.
-pub(crate) enum Selection {
-    /// Every row of the table.
-    All,
-    /// The rows a predicate over the table's physical columns is true for.
-    Predicate(Arc<dyn PhysicalExpr>),
-    /// The rows named by where they live: `files`, each data file's physical
-    /// positions (delete files not applied, as [`DuckLakeTable::resolve_positions`]
-    /// answers), and `inlined`, the row ids of inlined rows. Consumed as the
-    /// delete finds each; what is left once it has looked everywhere is refused.
-    Located {
-        files: HashMap<i64, Vec<i64>>,
-        inlined: HashSet<i64>,
-    },
 }
 
 /// A live data file a statement deletes rows from.

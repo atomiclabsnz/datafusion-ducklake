@@ -1,28 +1,24 @@
-//! A table's rows with where each lives, and a delete of rows named so.
+//! A table's live rows with where each lives, for a keyed merge that names
+//! the rows it deletes by a join.
 //!
 //! A keyed merge whose delta is larger than memory cannot delete by a predicate
 //! that holds the delta's keys (`key IN (…)`, or a set of them). It can join
 //! the table with the delta instead — a join DataFusion can spill — if the
 //! table's rows carry where they live, and then delete the rows the join
-//! named. These are those two halves:
+//! named and append the delta in one snapshot
+//! ([`DuckLakeTable::replace_located_rows`]).
 //!
-//! - [`DuckLakeTable::located_rows`]: a [`TableProvider`] of the table's rows,
-//!   each as some of its columns, then [`LOCATED_FILE_COLUMN`] (the catalog id
-//!   of the data file holding it, NULL for an inlined row) and
-//!   [`LOCATED_ROW_COLUMN`] (its physical position in that file, or the inlined
-//!   row's row id). A data file is read raw, delete files NOT applied, as
-//!   [`DuckLakeTable::resolve_positions`] reads it for a `DELETE`: the delete
-//!   skips a row already deleted, so naming one changes nothing.
-//! - [`DuckLakeTable::delete_located_rows`]: the rows so named deleted in one
-//!   snapshot, recorded as a SQL `DELETE` over the same rows records them (it
-//!   is the same code, with the rows named instead of found by a predicate). A
-//!   row named in a file or an inlined table the table's snapshot does not have
-//!   live is refused, before anything is written.
-//!
-//! Both read the table at the snapshot it was opened at, so the rows one names
-//! are rows of the snapshot the other deletes from.
+//! [`DuckLakeTable::located_rows`] is a [`TableProvider`] of the table's live
+//! rows at its snapshot, each as some of its columns, then
+//! [`LOCATED_FILE_COLUMN`] (the catalog id of the data file holding it, NULL
+//! for an inlined row) and [`LOCATED_ROW_COLUMN`] (its physical position in
+//! that file — a delete file's `pos` — or the inlined row's row id). A data
+//! file's rows deleted at the snapshot (by its delete file, or by an inlined
+//! deletion) are not among them, so an old version of a row an `UPDATE` or an
+//! upsert replaced is never matched.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, new_null_array};
@@ -42,7 +38,7 @@ use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
 
-use crate::delete_exec::{Selection, run_delete};
+use crate::delete_filter::DeleteFilterExec;
 use crate::table::DuckLakeTable;
 
 /// The column of [`DuckLakeTable::located_rows`] naming the data file a row is
@@ -87,64 +83,6 @@ impl DuckLakeTable {
             schema: Arc::new(Schema::new(fields)),
         }))
     }
-
-    /// Delete, in one snapshot, the rows named by where they live: `files`,
-    /// each data file's physical positions (by catalog `data_file_id`), and
-    /// `inlined`, inlined rows' row ids — as [`Self::located_rows`] names them.
-    /// Returns how many rows were deleted; a row already deleted is not counted
-    /// and not deleted again, and when nothing is deleted nothing is committed.
-    ///
-    /// Recorded as a SQL `DELETE` of the same rows records them, with its
-    /// conflict checks: a commit since this table's snapshot that conflicts
-    /// aborts it. A data file or an inlined row this table's snapshot does not
-    /// have live is refused, and nothing is written. The table must have been
-    /// opened from a writable catalog.
-    pub async fn delete_located_rows(
-        &self,
-        state: &dyn Session,
-        files: HashMap<i64, Vec<i64>>,
-        inlined: HashSet<i64>,
-    ) -> DataFusionResult<u64> {
-        let writer = self.writer().ok_or_else(|| {
-            DataFusionError::Plan(
-                "Table is read-only. Use DuckLakeCatalog::with_writer() to enable writes."
-                    .to_string(),
-            )
-        })?;
-        let schema_name = self.schema_name().ok_or_else(|| {
-            DataFusionError::Internal("Schema name not set for writable table".to_string())
-        })?;
-        self.write_options()
-            .validate()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let session_state = state
-            .as_any()
-            .downcast_ref::<datafusion::execution::SessionState>()
-            .ok_or_else(|| {
-                DataFusionError::NotImplemented(
-                    "a delete on a DuckLake table requires a DataFusion SessionState session"
-                        .to_string(),
-                )
-            })?;
-        if files.is_empty() && inlined.is_empty() {
-            return Ok(0);
-        }
-        run_delete(
-            Arc::new(self.clone()),
-            session_state,
-            Selection::Located {
-                files,
-                inlined,
-            },
-            Arc::clone(writer),
-            Arc::clone(self.object_store_url()),
-            schema_name,
-            self.table_name(),
-            self.table_id(),
-            self.snapshot_id(),
-        )
-        .await
-    }
 }
 
 /// [`DuckLakeTable::located_rows`]'s provider.
@@ -172,6 +110,7 @@ impl LocatedRows {
         &self,
         state: &dyn Session,
         file: &crate::metadata_provider::DuckLakeTableFile,
+        inlined_deletes: Option<&HashSet<i64>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let physical = self.table.physical_schema();
         // A predicate over the columns to read, so the positional scan reads them
@@ -198,6 +137,22 @@ impl LocatedRows {
             .table
             .positional_plan(state, &file.file, &reads, false)
             .await?;
+        // Only the rows live at the snapshot: not those its delete file or an
+        // inlined deletion deletes.
+        let deleted = self
+            .table
+            .deleted_positions_at_snapshot(state, file, inlined_deletes)
+            .await?;
+        let plan: Arc<dyn ExecutionPlan> = if deleted.is_empty() {
+            plan
+        } else {
+            Arc::new(DeleteFilterExec::try_new(
+                plan,
+                file.file.path.clone(),
+                Arc::new(deleted),
+                read.len(),
+            )?)
+        };
         let input = plan.schema();
         let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = Vec::new();
         for (out, &index) in self.columns.iter().enumerate() {
@@ -274,8 +229,12 @@ impl TableProvider for LocatedRows {
             .table
             .files()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let inlined_deletes = self.table.inlined_deletes_by_file()?;
         for file in &files {
-            children.push(self.file_plan(state, file).await?);
+            children.push(
+                self.file_plan(state, file, inlined_deletes.get(&file.data_file_id))
+                    .await?,
+            );
         }
         let inlined = self.inlined_batches()?;
         if !inlined.is_empty() {

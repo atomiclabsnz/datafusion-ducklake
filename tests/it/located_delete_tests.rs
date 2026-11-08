@@ -1,13 +1,15 @@
-//! `DuckLakeTable::located_rows` and `delete_located_rows` (ADR-0037 slice 5 in
-//! ferrion): a delete of rows named by where they live leaves the table a SQL
-//! `DELETE` of the same rows leaves.
+//! `DuckLakeTable::located_rows` and `replace_located_rows` (ADR-0037 slice 5
+//! in ferrion): a merge whose matched rows are named by where they live leaves
+//! the table `upsert_by_keys` of the same delta leaves, in one snapshot.
 //!
 //! Each scenario builds the same table twice — two data files, a delete file
-//! over one, inlined rows with one of them deleted, NULL ids — and deletes one
-//! set of ids from each: by `DELETE … WHERE id IN (…)` in one, by naming the
-//! rows [`located_rows`] finds for those ids in the other. Both must report the
-//! same count, commit the same number of snapshots, and read back the same rows
-//! with the same row ids, at the head and at the snapshot before.
+//! over one, inlined rows with one of them deleted, NULL ids, and a row two
+//! upserts replaced (its old versions in a data file under its delete file) —
+//! and merges one delta into each: by `upsert_by_keys` in one, by naming the
+//! rows [`located_rows`] finds for the delta's ids and handing them and the
+//! delta to `replace_located_rows` in the other. Both must report the same
+//! counts, commit one snapshot, and read back the same rows with the same row
+//! ids, at the head and at the snapshot before.
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
@@ -95,6 +97,71 @@ async fn lake() -> TempDir {
     temp
 }
 
+/// Two upserts of id 7 (its first versions left in a data file, deleted): a
+/// located scan that returned dead rows would find it three times.
+async fn upsert_seven_twice(temp: &TempDir) {
+    for s in ["7a", "7b"] {
+        let ctx = writable(temp).await;
+        let provider = table(&ctx).await;
+        let mut delta = rows(&[Some(7)]);
+        delta = RecordBatch::try_new(
+            delta.schema(),
+            vec![Arc::clone(delta.column(0)), Arc::new(StringArray::from(vec![s]))],
+        )
+        .unwrap();
+        as_ducklake(&provider)
+            .keyed_mutation(&["id"])
+            .upsert_by_keys(&ctx.state(), vec![delta])
+            .await
+            .unwrap();
+    }
+}
+
+/// Every object under the lake's data directory.
+fn objects(temp: &TempDir) -> BTreeSet<String> {
+    fn walk(dir: &std::path::Path, out: &mut BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.insert(path.display().to_string());
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(&temp.path().join("data"), &mut out);
+    out
+}
+
+/// The delta for `ids`: each id with `s` = `new<id>`, and two NULL ids.
+fn delta(ids: &BTreeSet<i32>) -> Vec<RecordBatch> {
+    let mut all: Vec<Option<i32>> = ids.iter().copied().map(Some).collect();
+    all.extend([None, None]);
+    let names: Vec<String> = all
+        .iter()
+        .map(|id| format!("new{}", id.map_or("null".into(), |i| i.to_string())))
+        .collect();
+    let batch = rows(&all);
+    vec![
+        RecordBatch::try_new(
+            batch.schema(),
+            vec![Arc::clone(batch.column(0)), Arc::new(StringArray::from(names))],
+        )
+        .unwrap(),
+    ]
+}
+
+fn stream(batches: Vec<RecordBatch>) -> datafusion::execution::SendableRecordBatchStream {
+    let schema = batches[0].schema();
+    Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches.into_iter().map(Ok)),
+        ),
+    )
+}
+
 async fn table(ctx: &SessionContext) -> Arc<dyn TableProvider> {
     ctx.catalog("ducklake")
         .unwrap()
@@ -161,12 +228,12 @@ async fn snapshots(temp: &TempDir) -> i64 {
     n
 }
 
-/// The rows of `located_rows(["id"])` whose id is in `ids`, as the delete takes them.
+/// The live rows of `located_rows(["id"])` whose id is in `ids`, as the merge takes them.
 async fn locate(
     ctx: &SessionContext,
     table: &DuckLakeTable,
     ids: &BTreeSet<i32>,
-) -> (HashMap<i64, Vec<i64>>, HashSet<i64>) {
+) -> (HashMap<i64, Vec<i64>>, HashSet<i64>, usize) {
     let located = table.located_rows(&["id"]).unwrap();
     let schema = located.schema();
     assert_eq!(
@@ -180,11 +247,15 @@ async fn locate(
     let batches = ctx.read_table(located).unwrap().collect().await.unwrap();
     let mut files: HashMap<i64, Vec<i64>> = HashMap::new();
     let mut inlined = HashSet::new();
+    let mut sevens = 0;
     for b in &batches {
         let id = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
         let file = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         let row = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         for i in 0..b.num_rows() {
+            if !id.is_null(i) && id.value(i) == 7 {
+                sevens += 1;
+            }
             if id.is_null(i) || !ids.contains(&id.value(i)) {
                 continue;
             }
@@ -195,117 +266,177 @@ async fn locate(
             }
         }
     }
-    (files, inlined)
+    (files, inlined, sevens)
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_located_delete_leaves_the_table_a_sql_delete_leaves() {
+async fn a_located_merge_leaves_the_table_an_upsert_leaves() {
     let all: BTreeSet<i32> = (0..80).chain([100, 101]).collect();
     let scenarios: Vec<(&str, BTreeSet<i32>)> = vec![
         ("one file", [1, 2, 5].into()),
         ("both files and inlined", [0, 39, 40, 79, 100].into()),
+        ("a row two upserts replaced", [7, 8].into()),
         ("already deleted, with live", [3, 41, 101, 4].into()),
         ("only already deleted", [3, 41, 101].into()),
         ("no match", [1000, 2000].into()),
+        ("past the inlining limit", (10..30).collect()),
         ("every id", all),
     ];
     for (name, ids) in scenarios {
-        let by_sql = lake().await;
+        let by_key = lake().await;
         let by_location = lake().await;
-        let before = snapshots(&by_sql).await;
+        upsert_seven_twice(&by_key).await;
+        upsert_seven_twice(&by_location).await;
+        let before = snapshots(&by_key).await;
         assert_eq!(before, snapshots(&by_location).await);
-        assert_eq!(read(&by_sql, None).await, read(&by_location, None).await);
+        assert_eq!(read(&by_key, None).await, read(&by_location, None).await);
 
-        let list = ids
-            .iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let ctx = writable(&by_sql).await;
-        let counted = ctx
-            .sql(&format!("DELETE FROM ducklake.main.t WHERE id IN ({list})"))
-            .await
-            .unwrap()
-            .collect()
+        let ctx = writable(&by_key).await;
+        let provider = table(&ctx).await;
+        let by_keys = as_ducklake(&provider)
+            .keyed_mutation(&["id"])
+            .upsert_by_keys(&ctx.state(), delta(&ids))
             .await
             .unwrap();
-        let sql_count = counted[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::UInt64Array>()
-            .unwrap()
-            .value(0);
 
         let ctx = writable(&by_location).await;
         let provider = table(&ctx).await;
         let lake_table = as_ducklake(&provider);
-        let (files, inlined) = locate(&ctx, lake_table, &ids).await;
-        let located_count = lake_table
-            .delete_located_rows(&ctx.state(), files, inlined)
+        let (files, inlined, sevens) = locate(&ctx, lake_table, &ids).await;
+        assert_eq!(
+            sevens, 1,
+            "{name}: only the live version of id 7 is located"
+        );
+        let by_located = lake_table
+            .replace_located_rows(&ctx.state(), files, inlined, stream(delta(&ids)))
             .await
             .unwrap();
 
-        assert_eq!(located_count, sql_count, "{name}: the count");
+        assert_eq!(
+            by_located.rows_deleted, by_keys.rows_deleted,
+            "{name}: deleted"
+        );
+        assert_eq!(
+            by_located.rows_inserted, by_keys.rows_inserted,
+            "{name}: inserted"
+        );
         assert_eq!(
             snapshots(&by_location).await,
-            snapshots(&by_sql).await,
-            "{name}: the snapshots committed"
+            before + 1,
+            "{name}: one snapshot"
         );
+        assert_eq!(snapshots(&by_key).await, before + 1);
         let head = read(&by_location, None).await;
         assert_eq!(
             head,
-            read(&by_sql, None).await,
+            read(&by_key, None).await,
             "{name}: the rows at the head"
         );
         assert_eq!(
             read(&by_location, Some(before)).await,
-            read(&by_sql, Some(before)).await,
+            read(&by_key, Some(before)).await,
             "{name}: the rows before"
         );
-        if name == "every id" {
-            assert_eq!(
-                head.len(),
-                6,
-                "{name}: only the NULL ids are left: {head:?}"
-            );
-        }
     }
 }
 
-/// A row named in a data file or an inlined table the snapshot does not have live
-/// is refused, and nothing is committed — not even the rows named rightly beside it.
+/// A location the snapshot does not have live — a data file, a position outside
+/// its rows, an inlined row id — is refused before anything is written: no
+/// snapshot, and no object left in the lake's data directory, though the delta is
+/// past the inlining limit (so it would be written to Parquet).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_row_the_snapshot_does_not_have_is_refused_and_nothing_is_deleted() {
+async fn a_location_the_snapshot_does_not_have_is_refused_before_anything_is_written() {
     let temp = lake().await;
-    let before = (snapshots(&temp).await, read(&temp, None).await);
+    let before = (
+        snapshots(&temp).await,
+        read(&temp, None).await,
+        objects(&temp),
+    );
     let ctx = writable(&temp).await;
     let provider = table(&ctx).await;
     let lake_table = as_ducklake(&provider);
-    let (mut files, inlined) = locate(&ctx, lake_table, &[1, 100].into()).await;
+    let ids: BTreeSet<i32> = [1, 100].into_iter().chain(200..220).collect();
+    let (files, inlined, _) = locate(&ctx, lake_table, &ids).await;
     assert!(
         !files.is_empty() && !inlined.is_empty(),
         "the fixture's rows"
     );
+    let some_file = *files.keys().next().unwrap();
 
-    files.insert(987_654, vec![0]);
-    let refused = lake_table
-        .delete_located_rows(&ctx.state(), files.clone(), inlined.clone())
-        .await
-        .expect_err("a file that is not live");
-    assert!(refused.to_string().contains("987654"), "{refused}");
-    files.remove(&987_654);
-
-    let mut stale = inlined.clone();
-    stale.insert(555_555);
-    let refused = lake_table
-        .delete_located_rows(&ctx.state(), files, stale)
-        .await
-        .expect_err("an inlined row that is not live");
-    assert!(refused.to_string().contains("555555"), "{refused}");
-
+    let mut stale = files.clone();
+    stale.insert(987_654, vec![0]);
+    let mut negative = files.clone();
+    negative.get_mut(&some_file).unwrap().push(-1);
+    let mut past = files.clone();
+    past.get_mut(&some_file).unwrap().push(1_000_000);
+    let mut stale_inlined = inlined.clone();
+    stale_inlined.insert(555_555);
+    for (what, files, inlined, says) in [
+        ("a file that is not live", stale, inlined.clone(), "987654"),
+        ("a negative position", negative, inlined.clone(), "-1"),
+        ("a position past the file", past, inlined.clone(), "1000000"),
+        (
+            "an inlined row that is not live",
+            files.clone(),
+            stale_inlined,
+            "555555",
+        ),
+    ] {
+        let refused = lake_table
+            .replace_located_rows(&ctx.state(), files, inlined, stream(delta(&ids)))
+            .await
+            .expect_err(what);
+        assert!(refused.to_string().contains(says), "{what}: {refused}");
+    }
     assert_eq!(
-        (snapshots(&temp).await, read(&temp, None).await),
+        (
+            snapshots(&temp).await,
+            read(&temp, None).await,
+            objects(&temp)
+        ),
         before,
-        "nothing was committed"
+        "nothing was committed or left behind"
+    );
+}
+
+/// The delete and the append are one commit: a delta that fails after its write
+/// to Parquet began (past the inlining limit) leaves the table whole — its
+/// matched rows not deleted — with no snapshot and no object left behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delta_that_fails_mid_stream_leaves_the_table_whole() {
+    let temp = lake().await;
+    let before = (
+        snapshots(&temp).await,
+        read(&temp, None).await,
+        objects(&temp),
+    );
+    let ctx = writable(&temp).await;
+    let provider = table(&ctx).await;
+    let lake_table = as_ducklake(&provider);
+    let ids: BTreeSet<i32> = (0..40).collect();
+    let (files, inlined, _) = locate(&ctx, lake_table, &ids).await;
+    let good = delta(&ids);
+    let schema = good[0].schema();
+    let failing = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(good.into_iter().map(Ok).chain([Err(
+                datafusion::error::DataFusionError::Execution("the delta's source failed".into()),
+            )])),
+        ),
+    );
+    let refused = lake_table
+        .replace_located_rows(&ctx.state(), files, inlined, failing)
+        .await
+        .expect_err("the delta failed");
+    assert!(refused.to_string().contains("source failed"), "{refused}");
+    assert_eq!(
+        (
+            snapshots(&temp).await,
+            read(&temp, None).await,
+            objects(&temp)
+        ),
+        before,
+        "the table is whole"
     );
 }
