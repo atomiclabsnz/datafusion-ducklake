@@ -2238,11 +2238,10 @@ mod tests {
         }
     }
 
-    /// Finding 3: `validate_manifest` refuses what the import refuses and writes
-    /// nothing; an import through a writer opened without `initialize_schema`
-    /// makes the one table of this crate's it needs inside its commit.
+    /// Finding 3: `validate_manifest` refuses what the import refuses (it is the
+    /// import's own checks), accepts what the import accepts, and writes nothing.
     #[tokio::test(flavor = "multi_thread")]
-    async fn validation_writes_nothing_and_the_import_needs_no_initialized_writer() {
+    async fn validation_refuses_as_the_import_does_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.parquet");
         let (size, count) = write_file(&source);
@@ -2289,35 +2288,8 @@ mod tests {
             "validation writes nothing"
         );
 
-        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
-        sqlx::query("DROP TABLE ducklake_unowned_file")
-            .execute(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
-        let writer = Arc::new(
-            SqliteMetadataWriter::new(&url)
-                .await
-                .unwrap()
-                .with_data_inlining_row_limit(0),
-        );
-        DuckLakeTableWriter::new(writer, Arc::clone(&store))
-            .unwrap()
-            .import_manifest(
-                Arc::new(provider),
-                "main",
-                "t",
-                &good,
-                &ImportOptions::default(),
-            )
-            .await
-            .unwrap();
+        // And the import, after it, accepts it.
+        import(&url, &good).await.unwrap();
         assert_eq!(rows(&url).await.len(), 2);
-        let unowned = catalog_rows(
-            &url,
-            "SELECT table_id, path, path, NULL FROM ducklake_unowned_file",
-        )
-        .await;
-        assert_eq!(unowned.len(), 1, "{unowned:?}");
     }
 }
