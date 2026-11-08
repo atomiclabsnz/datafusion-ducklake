@@ -46,9 +46,45 @@ pub struct TableManifest {
     pub partition_spec: Option<PartitionSpec>,
     /// Every data file live at the snapshot, by ascending `data_file_id`.
     pub files: Vec<ManifestDataFile>,
+    /// Columns the table no longer has whose ids some file may still carry: a
+    /// column dropped after the file was written. A file column with one of
+    /// these ids is not a column of the table, and an import reserves the ids,
+    /// so no column added later takes one and reads the dropped column's
+    /// values. [`DuckLakeTable::export_manifest`] fills it with the dropped
+    /// columns whose ids a live file holds, as the table had them when the file
+    /// was written.
+    pub retired_fields: Vec<DuckLakeTableField>,
 }
 
 impl TableManifest {
+    /// A manifest of `files` for a table with `fields`, as another table
+    /// format's snapshot describes it, to import with
+    /// [`DuckLakeTableWriter::import_manifest`](crate::DuckLakeTableWriter::import_manifest).
+    /// `table_id` and `snapshot_id` describe the source and are not read by
+    /// the import.
+    pub fn new(
+        table_id: i64,
+        snapshot_id: i64,
+        fields: Vec<DuckLakeTableField>,
+        partition_spec: Option<PartitionSpec>,
+        files: Vec<ManifestDataFile>,
+    ) -> Self {
+        Self {
+            table_id,
+            snapshot_id,
+            fields,
+            partition_spec,
+            files,
+            retired_fields: Vec::new(),
+        }
+    }
+
+    /// Set [`Self::retired_fields`].
+    pub fn with_retired_fields(mut self, retired_fields: Vec<DuckLakeTableField>) -> Self {
+        self.retired_fields = retired_fields;
+        self
+    }
+
     /// The files whose columns this manifest could not bind to the table's
     /// column ids ([`ColumnBinding::Unresolved`]).
     pub fn unresolved_files(&self) -> impl Iterator<Item = &ManifestDataFile> {
@@ -98,6 +134,67 @@ pub struct ManifestDataFile {
     /// Positions (0-based physical row indexes) of the rows the snapshot does
     /// not show, ascending and distinct.
     pub deleted_positions: Vec<i64>,
+}
+
+impl ManifestDataFile {
+    /// A file at `path` (an absolute URL), with no statistics, no partition,
+    /// and no deleted positions until the `with_` methods give them.
+    /// `data_file_id` identifies the file in its source and is not read by the
+    /// import.
+    pub fn new(
+        data_file_id: i64,
+        path: impl Into<String>,
+        file_size_bytes: i64,
+        record_count: i64,
+        column_binding: ColumnBinding,
+    ) -> Self {
+        Self {
+            data_file_id,
+            path: path.into(),
+            file_size_bytes,
+            record_count,
+            footer_size: None,
+            column_statistics: Vec::new(),
+            partition_id: None,
+            partition_values: Vec::new(),
+            column_binding,
+            deleted_positions: Vec::new(),
+        }
+    }
+
+    /// Set [`Self::footer_size`]. An import stores the length it measures.
+    pub fn with_footer_size(mut self, footer_size: Option<i64>) -> Self {
+        self.footer_size = footer_size;
+        self
+    }
+
+    /// Set [`Self::column_statistics`]: what another format adopting the file
+    /// may carry. [`DuckLakeTableWriter::import_manifest`](crate::DuckLakeTableWriter::import_manifest)
+    /// ignores them and takes every statistic from the file's footer.
+    pub fn with_column_statistics(
+        mut self,
+        column_statistics: Vec<DuckLakeFileColumnStatistics>,
+    ) -> Self {
+        self.column_statistics = column_statistics;
+        self
+    }
+
+    /// Set [`Self::partition_id`] and [`Self::partition_values`].
+    pub fn with_partition(
+        mut self,
+        partition_id: Option<i64>,
+        partition_values: Vec<(i32, Option<String>)>,
+    ) -> Self {
+        self.partition_id = partition_id;
+        self.partition_values = partition_values;
+        self
+    }
+
+    /// Set [`Self::deleted_positions`]: ascending and distinct.
+    pub fn with_deleted_positions(mut self, deleted_positions: Vec<i64>) -> Self {
+        self.deleted_positions = deleted_positions;
+        self
+    }
 }
 
 /// How a data file's physical columns map onto the table's `column_id`s.
@@ -198,6 +295,12 @@ impl DuckLakeTable {
 
         let inlined_deletes = self.inlined_deletes_by_file()?;
         let mut mappings: HashMap<i64, DuckLakeNameMapping> = HashMap::new();
+        let live_ids: HashSet<i64> = self.fields().iter().map(|f| f.column_id).collect();
+        // Columns the table has dropped whose ids a live file still carries, as the
+        // table had them when the file was written.
+        let mut retired: std::collections::BTreeMap<i64, DuckLakeTableField> =
+            std::collections::BTreeMap::new();
+        let mut fields_at: HashMap<i64, Vec<DuckLakeTableField>> = HashMap::new();
         let mut files = Vec::with_capacity(listed.len());
         for metadata in listed {
             let table_file = metadata.file;
@@ -242,6 +345,50 @@ impl DuckLakeTable {
                         .filter(|field| !has_field_id(field))
                         .map(|field| field.name().clone())
                         .collect();
+                    let mut ids = Vec::new();
+                    for field in facts.arrow_schema.fields() {
+                        file_field_ids(field, &mut ids);
+                    }
+                    let dropped: Vec<i64> = ids
+                        .into_iter()
+                        .filter(|id| !live_ids.contains(id) && !retired.contains_key(id))
+                        .filter(|id| {
+                            *id != i64::from(crate::row_id::ROW_ID_PARQUET_FIELD_ID)
+                                && *id != i64::from(crate::row_id::SNAPSHOT_ID_PARQUET_FIELD_ID)
+                        })
+                        .collect();
+                    if !dropped.is_empty()
+                        && let Some(written_at) = table_file.begin_snapshot
+                    {
+                        let fields = match fields_at.entry(written_at) {
+                            std::collections::hash_map::Entry::Occupied(at) => at.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(at) => at.insert(
+                                self.provider()
+                                    .get_table_fields(self.table_id(), written_at)?,
+                            ),
+                        };
+                        for field in fields.iter() {
+                            if dropped.contains(&field.column_id) {
+                                retired.insert(field.column_id, field.clone());
+                            }
+                        }
+                    }
+                    // An id no column held when the file was written: a column an
+                    // import retired (its reservation row begins and ends at one
+                    // snapshot, so no snapshot shows it), read by id.
+                    let unseen: Vec<i64> = dropped
+                        .iter()
+                        .copied()
+                        .filter(|id| !retired.contains_key(id))
+                        .collect();
+                    if !unseen.is_empty() {
+                        for field in self
+                            .provider()
+                            .get_column_rows_by_id(self.table_id(), &unseen)?
+                        {
+                            retired.insert(field.column_id, field);
+                        }
+                    }
                     let binding = if columns.is_empty() {
                         ColumnBinding::FieldIds
                     } else {
@@ -277,6 +424,7 @@ impl DuckLakeTable {
             fields: self.fields().to_vec(),
             partition_spec: self.partition_spec().cloned(),
             files,
+            retired_fields: retired.into_values().collect(),
         })
     }
 
@@ -295,4 +443,24 @@ impl DuckLakeTable {
 
 fn has_field_id(field: &Field) -> bool {
     field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY)
+}
+
+/// Every field id of `field` and the fields nested in it.
+fn file_field_ids(field: &Field, out: &mut Vec<i64>) {
+    use arrow::datatypes::DataType;
+    if let Some(id) = field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .and_then(|id| id.parse().ok())
+    {
+        out.push(id);
+    }
+    match field.data_type() {
+        DataType::Struct(children) => children.iter().for_each(|c| file_field_ids(c, out)),
+        DataType::List(child)
+        | DataType::LargeList(child)
+        | DataType::FixedSizeList(child, _)
+        | DataType::Map(child, _) => file_field_ids(child, out),
+        _ => {},
+    }
 }

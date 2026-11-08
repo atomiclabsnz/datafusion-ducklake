@@ -627,6 +627,14 @@ impl MetadataProvider for MemoizedMetadataProvider {
         self.inner.get_name_mapping(mapping_id)
     }
 
+    fn get_column_rows_by_id(
+        &self,
+        table_id: i64,
+        column_ids: &[i64],
+    ) -> Result<Vec<DuckLakeTableField>> {
+        self.inner.get_column_rows_by_id(table_id, column_ids)
+    }
+
     fn get_table_files_for_select(
         &self,
         table_id: i64,

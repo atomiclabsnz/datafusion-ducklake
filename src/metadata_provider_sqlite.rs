@@ -1418,6 +1418,39 @@ impl MetadataProvider for SqliteMetadataProvider {
         })
     }
 
+    fn get_column_rows_by_id(
+        &self,
+        table_id: i64,
+        column_ids: &[i64],
+    ) -> Result<Vec<DuckLakeTableField>> {
+        block_on(async {
+            let mut out = Vec::new();
+            for column_id in column_ids {
+                let row = sqlx::query(
+                    "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
+                     FROM ducklake_column
+                     WHERE table_id = ? AND column_id = ?
+                     ORDER BY begin_snapshot DESC
+                     LIMIT 1",
+                )
+                .bind(table_id)
+                .bind(column_id)
+                .fetch_optional(&self.pool)
+                .await?;
+                if let Some(row) = row {
+                    out.push(DuckLakeTableField {
+                        column_id: row.try_get(0)?,
+                        column_name: row.try_get(1)?,
+                        column_type: row.try_get(2)?,
+                        is_nullable: row.try_get::<Option<bool>, _>(3)?.unwrap_or(true),
+                        parent_column: row.try_get(4)?,
+                    });
+                }
+            }
+            Ok(out)
+        })
+    }
+
     fn get_name_mapping(&self, mapping_id: i64) -> Result<DuckLakeNameMapping> {
         block_on(async {
             let rows = sqlx::query(SQL_GET_NAME_MAPPING)

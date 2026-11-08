@@ -1620,6 +1620,35 @@ impl MetadataProvider for DuckdbMetadataProvider {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    fn get_column_rows_by_id(
+        &self,
+        table_id: i64,
+        column_ids: &[i64],
+    ) -> crate::Result<Vec<DuckLakeTableField>> {
+        let conn = self.connection();
+        let mut stmt = conn.prepare(
+            "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
+             FROM ducklake_column WHERE table_id = ? AND column_id = ?
+             ORDER BY begin_snapshot DESC LIMIT 1",
+        )?;
+        let mut out = Vec::new();
+        for column_id in column_ids {
+            let mut rows = stmt.query_map(params![table_id, column_id], |row| {
+                Ok(DuckLakeTableField {
+                    column_id: row.get(0)?,
+                    column_name: row.get(1)?,
+                    column_type: row.get(2)?,
+                    is_nullable: row.get::<_, Option<bool>>(3)?.unwrap_or(true),
+                    parent_column: row.get(4)?,
+                })
+            })?;
+            if let Some(row) = rows.next() {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+
     fn get_name_mapping(&self, mapping_id: i64) -> crate::Result<DuckLakeNameMapping> {
         let conn = self.connection();
         let mut stmt = conn.prepare(SQL_GET_NAME_MAPPING)?;

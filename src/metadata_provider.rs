@@ -2690,6 +2690,19 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
             })
     }
 
+    /// The latest catalog row of each column of `table_id` whose id is in
+    /// `column_ids`, at any snapshot: ended columns included, and the
+    /// never-visible row an import reserves a dropped column's id with (it begins
+    /// and ends at one snapshot, so no snapshot's columns show it). Default: none,
+    /// for a provider that cannot read them.
+    fn get_column_rows_by_id(
+        &self,
+        _table_id: i64,
+        _column_ids: &[i64],
+    ) -> Result<Vec<DuckLakeTableField>> {
+        Ok(Vec::new())
+    }
+
     /// Load a data file's `map_by_name` mapping.
     fn get_name_mapping(&self, mapping_id: i64) -> Result<DuckLakeNameMapping> {
         Err(crate::DuckLakeError::Unsupported(format!(
