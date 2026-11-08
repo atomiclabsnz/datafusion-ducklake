@@ -6244,6 +6244,19 @@ impl MetadataWriter for SqliteMetadataWriter {
     ) -> Result<CommitIds> {
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
+            // The one table of this crate's an import writes that a catalog DuckDB created
+            // lacks, made inside the commit: an import through a writer opened without
+            // `initialize_schema` (as a caller that must not change a catalog it may refuse
+            // does) then changes the catalog in its commit, or not at all.
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS ducklake_unowned_file (
+                     path VARCHAR NOT NULL,
+                     table_id BIGINT,
+                     begin_snapshot BIGINT
+                 )",
+            )
+            .execute(&mut *tx)
+            .await?;
             // The manifest's ids are its files' field ids, which no retry changes: a column of
             // the table's name under another id, or a new column whose id a column of the table
             // has or had, is refused as the manifest's error, not as a conflict to retry.

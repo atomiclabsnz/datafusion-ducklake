@@ -373,6 +373,22 @@ impl DuckLakeTable {
                             }
                         }
                     }
+                    // An id no column held when the file was written: a column an
+                    // import retired (its reservation row begins and ends at one
+                    // snapshot, so no snapshot shows it), read by id.
+                    let unseen: Vec<i64> = dropped
+                        .iter()
+                        .copied()
+                        .filter(|id| !retired.contains_key(id))
+                        .collect();
+                    if !unseen.is_empty() {
+                        for field in self
+                            .provider()
+                            .get_column_rows_by_id(self.table_id(), &unseen)?
+                        {
+                            retired.insert(field.column_id, field);
+                        }
+                    }
                     let binding = if columns.is_empty() {
                         ColumnBinding::FieldIds
                     } else {

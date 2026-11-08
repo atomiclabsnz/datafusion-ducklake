@@ -255,70 +255,21 @@ impl DuckLakeTableWriter {
         manifest: &TableManifest,
         options: &ImportOptions,
     ) -> Result<ImportResult> {
-        let (columns, column_ids) = manifest_columns(&manifest.fields)?;
-        let table_ids: HashSet<i64> = manifest
-            .fields
-            .iter()
-            .map(|field| field.column_id)
-            .collect();
-        if let Some(live) = manifest
-            .retired_fields
-            .iter()
-            .find(|field| table_ids.contains(&field.column_id))
-        {
-            return Err(ImportError::RetiredFieldIsLive {
-                column: live.column_name.clone(),
-                field_id: live.column_id,
-            }
-            .into());
-        }
-        let retired_ids: HashSet<i64> = manifest
-            .retired_fields
-            .iter()
-            .map(|field| field.column_id)
-            .collect();
-        validate_retired(&manifest.retired_fields, &table_ids, &retired_ids)?;
-
-        let head = provider.get_current_snapshot()?;
-        if let Some(schema) = provider.get_schema_by_name(schema_name, head)?
-            && let Some(table) = provider.get_table_by_name(schema.schema_id, table_name, head)?
-        {
-            let existing = provider.get_table_fields(table.table_id, head)?;
-            if !options.allow_schema_evolution
-                && field_signature(&existing) != field_signature(&manifest.fields)
-            {
-                return Err(ImportError::SchemaMismatch {
-                    table: format!("{schema_name}.{table_name}"),
-                    existing: describe_fields(&existing),
-                    manifest: describe_fields(&manifest.fields),
-                }
-                .into());
-            }
-        }
-
-        let (catalog_store, _) = parse_object_store_url(&self.metadata_writer().get_data_path()?)?;
-        let mut seen = HashSet::new();
-        let mut checked = Vec::with_capacity(manifest.files.len());
-        for file in &manifest.files {
-            if !seen.insert(file.path.as_str()) {
-                return Err(ImportError::DuplicateFile {
-                    path: file.path.clone(),
-                }
-                .into());
-            }
-            let (store, key) = parse_object_store_url(&file.path)?;
-            if store != catalog_store {
-                return Err(ImportError::ForeignObjectStore {
-                    path: file.path.clone(),
-                    expected: catalog_store.to_string(),
-                }
-                .into());
-            }
-            checked.push(
-                self.check_file(file, key, &manifest.fields, &table_ids, &retired_ids)
-                    .await?,
-            );
-        }
+        let data_path = self.metadata_writer().get_data_path()?;
+        let Prepared {
+            columns,
+            column_ids,
+            checked,
+        } = prepare(
+            self.object_store(),
+            provider.as_ref(),
+            &data_path,
+            schema_name,
+            table_name,
+            manifest,
+            options,
+        )
+        .await?;
 
         let setup = self.metadata_writer().begin_write_transaction(
             schema_name,
@@ -330,14 +281,8 @@ impl DuckLakeTableWriter {
         let base_snapshot = options.base_snapshot.unwrap_or(setup.base_snapshot_id);
         let live_spec = self.metadata_writer().live_partition_spec(setup.table_id)?;
         let keep_partitions = match (&live_spec, &manifest.partition_spec) {
-            (Some(live), Some(exported)) => {
-                let keys = |spec: &crate::partition::PartitionSpec| {
-                    spec.columns
-                        .iter()
-                        .map(|c| (c.partition_key_index, c.column_id, c.transform.clone()))
-                        .collect::<Vec<_>>()
-                };
-                (keys(live) == keys(exported)).then_some((live.partition_id, exported.partition_id))
+            (Some(live), Some(exported)) if partition_keys(live) == partition_keys(exported) => {
+                Some((live.partition_id, exported.partition_id))
             },
             _ => None,
         };
@@ -414,190 +359,342 @@ impl DuckLakeTableWriter {
             },
         }
     }
+}
 
-    /// Check one manifest file against its footer and the table's column ids.
-    async fn check_file(
-        &self,
-        file: &ManifestDataFile,
-        key: String,
-        fields: &[DuckLakeTableField],
-        table_ids: &HashSet<i64>,
-        retired_ids: &HashSet<i64>,
-    ) -> Result<CheckedFile> {
-        let (metadata, footer_size) =
-            read_footer(self.object_store(), &key, file.file_size_bytes).await?;
-        let footer_rows = metadata.file_metadata().num_rows();
-        if footer_rows != file.record_count {
-            return Err(ImportError::RecordCountMismatch {
-                path: file.path.clone(),
-                manifest: file.record_count,
-                footer: footer_rows,
+/// The manifest's columns and its files, every check an import makes before it
+/// writes having passed.
+struct Prepared {
+    columns: Vec<ColumnDef>,
+    column_ids: Vec<i64>,
+    checked: Vec<CheckedFile>,
+}
+
+/// Check `manifest` against the catalog `provider` reads and the files in
+/// `store` (the object store of the catalog's `data_path`), exactly as
+/// [`DuckLakeTableWriter::import_manifest`] does before it writes anything,
+/// without a writer: so a caller can refuse a manifest before it opens one (a
+/// writer on a catalog DuckDB created sets up its own tables and counters).
+///
+/// Reads the catalog and each file's footer; writes nothing. An import that
+/// follows can still fail on a concurrent change (another writer creating the
+/// table or committing first), as any write can.
+pub async fn validate_manifest(
+    store: &Arc<dyn ObjectStore>,
+    provider: &dyn MetadataProvider,
+    schema_name: &str,
+    table_name: &str,
+    manifest: &TableManifest,
+    options: &ImportOptions,
+) -> Result<()> {
+    let data_path = provider.get_data_path()?;
+    prepare(
+        store,
+        provider,
+        &data_path,
+        schema_name,
+        table_name,
+        manifest,
+        options,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Every check of an import that precedes its first write: the shared body of
+/// [`validate_manifest`] and [`DuckLakeTableWriter::import_manifest`], so the two
+/// cannot disagree.
+async fn prepare(
+    store: &Arc<dyn ObjectStore>,
+    provider: &dyn MetadataProvider,
+    data_path: &str,
+    schema_name: &str,
+    table_name: &str,
+    manifest: &TableManifest,
+    options: &ImportOptions,
+) -> Result<Prepared> {
+    let (columns, column_ids) = manifest_columns(&manifest.fields)?;
+    let table_ids: HashSet<i64> = manifest
+        .fields
+        .iter()
+        .map(|field| field.column_id)
+        .collect();
+    if let Some(live) = manifest
+        .retired_fields
+        .iter()
+        .find(|field| table_ids.contains(&field.column_id))
+    {
+        return Err(ImportError::RetiredFieldIsLive {
+            column: live.column_name.clone(),
+            field_id: live.column_id,
+        }
+        .into());
+    }
+    let retired_ids: HashSet<i64> = manifest
+        .retired_fields
+        .iter()
+        .map(|field| field.column_id)
+        .collect();
+    validate_retired(&manifest.retired_fields, &table_ids, &retired_ids)?;
+
+    let head = provider.get_current_snapshot()?;
+    let mut live_spec = None;
+    if let Some(schema) = provider.get_schema_by_name(schema_name, head)?
+        && let Some(table) = provider.get_table_by_name(schema.schema_id, table_name, head)?
+    {
+        let existing = provider.get_table_fields(table.table_id, head)?;
+        if !options.allow_schema_evolution
+            && field_signature(&existing) != field_signature(&manifest.fields)
+        {
+            return Err(ImportError::SchemaMismatch {
+                table: format!("{schema_name}.{table_name}"),
+                existing: describe_fields(&existing),
+                manifest: describe_fields(&manifest.fields),
             }
             .into());
         }
-        let metadata = Arc::new(metadata);
-        let arrow_schema: SchemaRef =
-            ArrowReaderMetadata::try_new(Arc::clone(&metadata), ArrowReaderOptions::new())?
-                .schema()
-                .clone();
-
-        // The column id each top-level column of the file holds, if any.
-        let (file_column_ids, name_mapping) = match &file.column_binding {
-            ColumnBinding::FieldIds => {
-                let mut ids = Vec::with_capacity(arrow_schema.fields().len());
-                for field in arrow_schema.fields() {
-                    let Some(id) = field_id(field) else {
-                        return Err(ImportError::MissingFieldId {
-                            path: file.path.clone(),
-                            column: field.name().clone(),
-                        }
-                        .into());
-                    };
-                    // A dropped column's values, which the table no longer shows.
-                    if id == i64::from(ROW_ID_PARQUET_FIELD_ID)
-                        || id == i64::from(SNAPSHOT_ID_PARQUET_FIELD_ID)
-                        || retired_ids.contains(&id)
-                    {
-                        ids.push(None);
-                        continue;
-                    }
-                    if !table_ids.contains(&id) {
-                        return Err(ImportError::FieldIdMismatch {
-                            path: file.path.clone(),
-                            column: field.name().clone(),
-                            field_id: id,
-                        }
-                        .into());
-                    }
-                    ids.push(Some(id));
-                }
-                // A nested field id must name a column too: a dropped struct member's
-                // id left unreserved could be given to a member added later.
-                for field in arrow_schema.fields() {
-                    let mut nested = Vec::new();
-                    nested_ids(field, &mut nested);
-                    if let Some((column, id)) = nested
-                        .into_iter()
-                        .find(|(_, id)| !table_ids.contains(id) && !retired_ids.contains(id))
-                    {
-                        return Err(ImportError::FieldIdMismatch {
-                            path: file.path.clone(),
-                            column,
-                            field_id: id,
-                        }
-                        .into());
-                    }
-                }
-                (ids, None)
-            },
-            ColumnBinding::NameMapping(mapping) => {
-                for entry in &mapping.entries {
-                    if !table_ids.contains(&entry.target_field_id)
-                        && !retired_ids.contains(&entry.target_field_id)
-                    {
-                        return Err(ImportError::FieldIdMismatch {
-                            path: file.path.clone(),
-                            column: entry.source_name.clone(),
-                            field_id: entry.target_field_id,
-                        }
-                        .into());
-                    }
-                }
-                let by_name: HashMap<&str, i64> = mapping
-                    .entries
-                    .iter()
-                    .filter(|entry| {
-                        entry.parent_column.is_none() && table_ids.contains(&entry.target_field_id)
-                    })
-                    .map(|entry| (entry.source_name.as_str(), entry.target_field_id))
-                    .collect();
-                let ids = arrow_schema
-                    .fields()
-                    .iter()
-                    .map(|field| by_name.get(field.name().as_str()).copied())
-                    .collect();
-                (ids, Some(mapping.entries.clone()))
-            },
-            ColumnBinding::Unresolved {
-                columns,
-            } => {
-                return Err(ImportError::MissingFieldId {
-                    path: file.path.clone(),
-                    column: columns.first().cloned().unwrap_or_default(),
-                }
-                .into());
-            },
-        };
-
-        let mut previous = -1;
-        for &position in &file.deleted_positions {
-            if position <= previous || position >= file.record_count {
-                return Err(ImportError::PositionOutOfRange {
-                    path: file.path.clone(),
-                    position,
-                    record_count: file.record_count,
-                }
-                .into());
-            }
-            previous = position;
-        }
-
-        let leaf_of = leaf_of_id(&metadata, &file.column_binding, &file_column_ids);
-        check_types_and_nulls(
-            &file.path,
-            fields,
-            &arrow_schema,
-            &file_column_ids,
-            &leaf_of,
-            &metadata,
-        )?;
-        let facts = column_facts(&arrow_schema, &metadata, &file_column_ids);
-
-        // Always the footer's (see the module docs), and only what every row
-        // group records exactly. `compute_column_stats` labels file column `i`
-        // with `ids[i]`; a column the table does not hold gets an id no stat is
-        // kept for.
-        let labels: Vec<i64> = file_column_ids.iter().map(|id| id.unwrap_or(-1)).collect();
-        let column_stats: Vec<ColumnStat> = crate::stats_collect::compute_column_stats(
-            &arrow_schema,
-            &metadata,
-            &labels,
-            footer_rows,
-            &[],
-        )
-        .into_iter()
-        .map(|mut stat| {
-            let known = facts.get(&stat.column_id);
-            if !known.is_some_and(|f| f.exact_bounds) {
-                stat.min_value = None;
-                stat.max_value = None;
-            }
-            if known.is_none_or(|f| f.null_count.is_none()) {
-                stat.null_count = None;
-                stat.value_count = None;
-            }
-            stat
-        })
-        .collect();
-        let mut stat_ids = HashSet::new();
-        let column_stats = column_stats
-            .into_iter()
-            .filter(|stat| table_ids.contains(&stat.column_id) && stat_ids.insert(stat.column_id))
-            .collect();
-
-        let mut info = DataFileInfo::new(key, file.file_size_bytes, file.record_count)
-            // The length measured, whatever the manifest says: DuckDB refuses a
-            // file whose stored footer length differs from the file's own.
-            .with_footer_size(footer_size)
-            .with_column_stats(column_stats);
-        info.path_is_relative = false;
-        Ok(CheckedFile {
-            info,
-            facts,
-            name_mapping,
-            deleted_positions: file.deleted_positions.clone(),
-        })
+        live_spec = provider.get_partition_spec(table.table_id, head)?;
     }
+    let kept_spec = match (&live_spec, &manifest.partition_spec) {
+        (Some(live), Some(exported)) if partition_keys(live) == partition_keys(exported) => {
+            Some((live.clone(), exported.partition_id))
+        },
+        _ => None,
+    };
+
+    let (catalog_store, _) = parse_object_store_url(data_path)?;
+    let mut seen = HashSet::new();
+    let mut checked = Vec::with_capacity(manifest.files.len());
+    for file in &manifest.files {
+        if !seen.insert(file.path.as_str()) {
+            return Err(ImportError::DuplicateFile {
+                path: file.path.clone(),
+            }
+            .into());
+        }
+        let (file_store, key) = parse_object_store_url(&file.path)?;
+        if file_store != catalog_store {
+            return Err(ImportError::ForeignObjectStore {
+                path: file.path.clone(),
+                expected: catalog_store.to_string(),
+            }
+            .into());
+        }
+        let file_checked =
+            check_file(store, file, key, &manifest.fields, &table_ids, &retired_ids).await?;
+        if let Some((spec, exported_id)) = &kept_spec
+            && file.partition_id == Some(*exported_id)
+        {
+            verify_partition_values(
+                &file.path,
+                spec,
+                &file.partition_values,
+                &file_checked.facts,
+            )?;
+        }
+        checked.push(file_checked);
+    }
+    Ok(Prepared {
+        columns,
+        column_ids,
+        checked,
+    })
+}
+
+/// A partition spec's keys, as two specs are compared to decide whether a
+/// file's values carry over.
+fn partition_keys(
+    spec: &crate::partition::PartitionSpec,
+) -> Vec<(i32, i64, crate::partition::PartitionTransform)> {
+    spec.columns
+        .iter()
+        .map(|c| (c.partition_key_index, c.column_id, c.transform.clone()))
+        .collect()
+}
+
+/// Check one manifest file against its footer and the table's column ids.
+async fn check_file(
+    store: &Arc<dyn ObjectStore>,
+    file: &ManifestDataFile,
+    key: String,
+    fields: &[DuckLakeTableField],
+    table_ids: &HashSet<i64>,
+    retired_ids: &HashSet<i64>,
+) -> Result<CheckedFile> {
+    let (metadata, footer_size) = read_footer(store, &key, file.file_size_bytes).await?;
+    let footer_rows = metadata.file_metadata().num_rows();
+    if footer_rows != file.record_count {
+        return Err(ImportError::RecordCountMismatch {
+            path: file.path.clone(),
+            manifest: file.record_count,
+            footer: footer_rows,
+        }
+        .into());
+    }
+    let metadata = Arc::new(metadata);
+    let arrow_schema: SchemaRef =
+        ArrowReaderMetadata::try_new(Arc::clone(&metadata), ArrowReaderOptions::new())?
+            .schema()
+            .clone();
+
+    // The column id each top-level column of the file holds, if any.
+    let (file_column_ids, name_mapping) = match &file.column_binding {
+        ColumnBinding::FieldIds => {
+            let mut ids = Vec::with_capacity(arrow_schema.fields().len());
+            for field in arrow_schema.fields() {
+                let Some(id) = field_id(field) else {
+                    return Err(ImportError::MissingFieldId {
+                        path: file.path.clone(),
+                        column: field.name().clone(),
+                    }
+                    .into());
+                };
+                // A dropped column's values, which the table no longer shows.
+                if id == i64::from(ROW_ID_PARQUET_FIELD_ID)
+                    || id == i64::from(SNAPSHOT_ID_PARQUET_FIELD_ID)
+                    || retired_ids.contains(&id)
+                {
+                    ids.push(None);
+                    continue;
+                }
+                if !table_ids.contains(&id) {
+                    return Err(ImportError::FieldIdMismatch {
+                        path: file.path.clone(),
+                        column: field.name().clone(),
+                        field_id: id,
+                    }
+                    .into());
+                }
+                ids.push(Some(id));
+            }
+            // A nested field id must name a column too: a dropped struct member's
+            // id left unreserved could be given to a member added later.
+            for field in arrow_schema.fields() {
+                let mut nested = Vec::new();
+                nested_ids(field, &mut nested);
+                if let Some((column, id)) = nested
+                    .into_iter()
+                    .find(|(_, id)| !table_ids.contains(id) && !retired_ids.contains(id))
+                {
+                    return Err(ImportError::FieldIdMismatch {
+                        path: file.path.clone(),
+                        column,
+                        field_id: id,
+                    }
+                    .into());
+                }
+            }
+            (ids, None)
+        },
+        ColumnBinding::NameMapping(mapping) => {
+            for entry in &mapping.entries {
+                if !table_ids.contains(&entry.target_field_id)
+                    && !retired_ids.contains(&entry.target_field_id)
+                {
+                    return Err(ImportError::FieldIdMismatch {
+                        path: file.path.clone(),
+                        column: entry.source_name.clone(),
+                        field_id: entry.target_field_id,
+                    }
+                    .into());
+                }
+            }
+            let by_name: HashMap<&str, i64> = mapping
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.parent_column.is_none() && table_ids.contains(&entry.target_field_id)
+                })
+                .map(|entry| (entry.source_name.as_str(), entry.target_field_id))
+                .collect();
+            let ids = arrow_schema
+                .fields()
+                .iter()
+                .map(|field| by_name.get(field.name().as_str()).copied())
+                .collect();
+            (ids, Some(mapping.entries.clone()))
+        },
+        ColumnBinding::Unresolved {
+            columns,
+        } => {
+            return Err(ImportError::MissingFieldId {
+                path: file.path.clone(),
+                column: columns.first().cloned().unwrap_or_default(),
+            }
+            .into());
+        },
+    };
+
+    let mut previous = -1;
+    for &position in &file.deleted_positions {
+        if position <= previous || position >= file.record_count {
+            return Err(ImportError::PositionOutOfRange {
+                path: file.path.clone(),
+                position,
+                record_count: file.record_count,
+            }
+            .into());
+        }
+        previous = position;
+    }
+
+    let leaf_of = leaf_of_id(&metadata, &file.column_binding, &file_column_ids);
+    check_types_and_nulls(
+        &file.path,
+        fields,
+        &arrow_schema,
+        &file_column_ids,
+        &leaf_of,
+        &metadata,
+    )?;
+    let facts = column_facts(&arrow_schema, &metadata, &file_column_ids);
+    let exact_types = bounds_carry_over(fields, &arrow_schema, &file_column_ids)?;
+
+    // Always the footer's (see the module docs), and only what every row
+    // group records exactly. `compute_column_stats` labels file column `i`
+    // with `ids[i]`; a column the table does not hold gets an id no stat is
+    // kept for.
+    let labels: Vec<i64> = file_column_ids.iter().map(|id| id.unwrap_or(-1)).collect();
+    let column_stats: Vec<ColumnStat> = crate::stats_collect::compute_column_stats(
+        &arrow_schema,
+        &metadata,
+        &labels,
+        footer_rows,
+        &[],
+    )
+    .into_iter()
+    .map(|mut stat| {
+        let known = facts.get(&stat.column_id);
+        // A bound is the file's value: written only when the table's type reads
+        // that value as itself (a float32 0.1 is not the float64 0.1).
+        if !known.is_some_and(|f| f.exact_bounds) || !exact_types.contains(&stat.column_id) {
+            stat.min_value = None;
+            stat.max_value = None;
+        }
+        if known.is_none_or(|f| f.null_count.is_none()) {
+            stat.null_count = None;
+            stat.value_count = None;
+        }
+        stat
+    })
+    .collect();
+    let mut stat_ids = HashSet::new();
+    let column_stats = column_stats
+        .into_iter()
+        .filter(|stat| table_ids.contains(&stat.column_id) && stat_ids.insert(stat.column_id))
+        .collect();
+
+    let mut info = DataFileInfo::new(key, file.file_size_bytes, file.record_count)
+        // The length measured, whatever the manifest says: DuckDB refuses a
+        // file whose stored footer length differs from the file's own.
+        .with_footer_size(footer_size)
+        .with_column_stats(column_stats);
+    info.path_is_relative = false;
+    Ok(CheckedFile {
+        info,
+        facts,
+        name_mapping,
+        deleted_positions: file.deleted_positions.clone(),
+    })
 }
 
 /// The first id at which Iceberg and DuckLake reserve field ids for their own
@@ -739,6 +836,45 @@ fn decimal_of(data_type: &arrow::datatypes::DataType) -> Option<(u8, i8)> {
     }
 }
 
+/// The column ids whose file values the table's type reads as the same values,
+/// so a bound taken from the file is the table's: see [`bound_carries`].
+fn bounds_carry_over(
+    fields: &[DuckLakeTableField],
+    arrow_schema: &SchemaRef,
+    file_column_ids: &[Option<i64>],
+) -> Result<HashSet<i64>> {
+    let held = file_types(arrow_schema, file_column_ids);
+    let mut out = HashSet::new();
+    for field in fields {
+        if let Some(file_type) = held.get(&field.column_id)
+            && !matches!(
+                field.column_type.to_ascii_lowercase().as_str(),
+                "struct" | "list" | "map"
+            )
+            && bound_carries(
+                file_type,
+                &crate::types::ducklake_to_arrow_type(&field.column_type)?,
+            )
+        {
+            out.insert(field.column_id);
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a file's minimum or maximum, of type `file`, is the same value read
+/// as the table's `table`: the same type (any string or binary encoding of it,
+/// any time zone label of a zoned instant), a wider integer, or a decimal's
+/// precision widened at the same scale. Never a float read as a wider float:
+/// a `float` bound printed as `0.1` is not the `double` the column holds.
+fn bound_carries(file: &arrow::datatypes::DataType, table: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType::*;
+    match (file, table) {
+        (Float16 | Float32 | Float64, _) | (_, Float16 | Float32 | Float64) => file == table,
+        _ => reads_as(file, table),
+    }
+}
+
 /// Whether DuckDB reads a file column of type `file` as a table column of type
 /// `table`: the same type (any string or binary encoding of it, any time zone
 /// of a zoned timestamp), a wider integer of the same signedness or a wider
@@ -805,6 +941,27 @@ fn check_types_and_nulls(
             field.column_type.to_ascii_lowercase().as_str(),
             "struct" | "list" | "map"
         );
+        if nested && let Some(file_type) = held.get(&field.column_id) {
+            use arrow::datatypes::DataType;
+            let kind = field.column_type.to_ascii_lowercase();
+            let same_kind = match kind.as_str() {
+                "struct" => matches!(file_type, DataType::Struct(_)),
+                "list" => matches!(
+                    file_type,
+                    DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..)
+                ),
+                _ => matches!(file_type, DataType::Map(..)),
+            };
+            if !same_kind {
+                return Err(ImportError::ColumnTypeMismatch {
+                    path: path.to_string(),
+                    column: field.column_name.clone(),
+                    file_type: file_type.to_string(),
+                    table_type: field.column_type.clone(),
+                }
+                .into());
+            }
+        }
         if !nested && let Some(file_type) = held.get(&field.column_id) {
             let table_type = crate::types::ducklake_to_arrow_type(&field.column_type)?;
             if !reads_as(file_type, &table_type) {
@@ -1938,5 +2095,229 @@ mod tests {
         .await;
         assert_eq!(kept.len(), 1, "{kept:?}");
         assert_eq!(kept[0].1.as_deref(), Some("4"));
+    }
+
+    // ---- Review round 2 ---------------------------------------------------------------------
+
+    /// Finding 1: a float32 file under a float64 column keeps no bounds (the
+    /// float32 `0.1` would prune the float64 `0.10000000149011612` away); an int32
+    /// file under an int64 column keeps its exact ones.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_promoted_float_file_keeps_no_bounds_and_its_values_are_found() {
+        use arrow::array::Float32Array;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("float.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            with_id("id", DataType::Int32, 1),
+            with_id("f", DataType::Float32, 2),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Float32Array::from(vec![0.1, 0.5])),
+            ],
+        )
+        .unwrap();
+        let size = write_batch(&path, &batch);
+        let url = target(dir.path()).await;
+        let manifest = TableManifest::new(
+            1,
+            1,
+            vec![field(1, "id", "int64"), field(2, "f", "float64")],
+            None,
+            vec![file_at(&path, size, 2)],
+        );
+        import(&url, &manifest).await.unwrap();
+        let stats = catalog_rows(
+            &url,
+            "SELECT column_id, min_value, max_value, null_count FROM ducklake_file_column_stats \
+             ORDER BY column_id",
+        )
+        .await;
+        assert_eq!(
+            stats,
+            vec![(1, Some("1".into()), Some("2".into()), Some(0)), (2, None, None, Some(0))],
+            "the widened int keeps its bounds, the widened float none"
+        );
+        for (filter, expected) in [
+            ("f = CAST(CAST(0.1 AS FLOAT) AS DOUBLE)", vec!["1"]),
+            ("f = 0.10000000149011612", vec!["1"]),
+            ("f > 0.1", vec!["1", "2"]),
+            ("f < 0.2", vec!["1"]),
+            ("id = 2", vec!["2"]),
+        ] {
+            let got: Vec<String> = sql(
+                &url,
+                &format!("SELECT id FROM lake.main.t WHERE {filter} ORDER BY id"),
+            )
+            .await
+            .into_iter()
+            .map(|row| row[0].clone().unwrap())
+            .collect();
+            assert_eq!(got, expected, "{filter}");
+        }
+    }
+
+    /// Finding 2: an id an import reserved (a never-visible row) is carried by an
+    /// export as retired, so the export imports again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_export_carries_an_imported_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.parquet");
+        let (size, count) = write_file(&source);
+        let url = target(dir.path()).await;
+        import(
+            &url,
+            &manifest(&source, size, count).with_retired_fields(vec![field(3, "gone", "varchar")]),
+        )
+        .await
+        .unwrap();
+        let provider: Arc<dyn crate::MetadataProvider> =
+            Arc::new(SqliteMetadataProvider::new(&url).await.unwrap());
+        let head = provider.get_current_snapshot().unwrap();
+        let catalog = DuckLakeCatalog::with_snapshot(Arc::clone(&provider), head).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_catalog("lake", Arc::new(catalog));
+        let table = ctx
+            .catalog("lake")
+            .unwrap()
+            .schema("main")
+            .unwrap()
+            .table("t")
+            .await
+            .unwrap()
+            .unwrap();
+        let table = (table.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<crate::DuckLakeTable>()
+            .unwrap();
+        let exported = table.export_manifest(&ctx.state()).await.unwrap();
+        assert_eq!(
+            exported
+                .retired_fields
+                .iter()
+                .map(|f| (f.column_id, f.column_name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "gone")]
+        );
+        let other = tempfile::tempdir().unwrap();
+        let url2 = target(other.path()).await;
+        import(&url2, &exported).await.unwrap();
+        assert_eq!(rows(&url2).await.len(), 2);
+    }
+
+    /// Finding 4: a nested table column over a file column of another kind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_nested_column_over_a_scalar_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.parquet");
+        let (size, count) = write_file(&source);
+        let url = target(dir.path()).await;
+        let child = |id: i64, name: &str| DuckLakeTableField {
+            parent_column: Some(2),
+            ..field(id, name, "int32")
+        };
+        for (kind, children) in [
+            ("struct", vec![child(10, "x")]),
+            ("list", vec![child(10, "element")]),
+            ("map", vec![child(10, "key"), child(11, "value")]),
+        ] {
+            let mut fields = vec![field(1, "id", "int32"), field(2, "name", kind)];
+            fields.extend(children);
+            let manifest =
+                TableManifest::new(1, 1, fields, None, vec![file_at(&source, size, count)])
+                    .with_retired_fields(vec![field(3, "gone", "varchar")]);
+            let refused = import(&url, &manifest).await.unwrap_err();
+            assert!(
+                matches!(
+                    refused,
+                    DuckLakeError::Import(ImportError::ColumnTypeMismatch { .. })
+                ),
+                "{kind}: {refused}"
+            );
+        }
+    }
+
+    /// Finding 3: `validate_manifest` refuses what the import refuses and writes
+    /// nothing; an import through a writer opened without `initialize_schema`
+    /// makes the one table of this crate's it needs inside its commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validation_writes_nothing_and_the_import_needs_no_initialized_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.parquet");
+        let (size, count) = write_file(&source);
+        let url = target(dir.path()).await;
+        let db = dir.path().join("target.sqlite");
+        let provider = SqliteMetadataProvider::new(&url).await.unwrap();
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+        let before = std::fs::read(&db).unwrap();
+        let refused = crate::validate_manifest(
+            &store,
+            &provider,
+            "main",
+            "t",
+            &manifest(&source, size, count),
+            &ImportOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                DuckLakeError::Import(ImportError::FieldIdMismatch {
+                    field_id: 3,
+                    ..
+                })
+            ),
+            "{refused}"
+        );
+        let good =
+            manifest(&source, size, count).with_retired_fields(vec![field(3, "gone", "varchar")]);
+        crate::validate_manifest(
+            &store,
+            &provider,
+            "main",
+            "t",
+            &good,
+            &ImportOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before,
+            "validation writes nothing"
+        );
+
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        sqlx::query("DROP TABLE ducklake_unowned_file")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let writer = Arc::new(
+            SqliteMetadataWriter::new(&url)
+                .await
+                .unwrap()
+                .with_data_inlining_row_limit(0),
+        );
+        DuckLakeTableWriter::new(writer, Arc::clone(&store))
+            .unwrap()
+            .import_manifest(
+                Arc::new(provider),
+                "main",
+                "t",
+                &good,
+                &ImportOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows(&url).await.len(), 2);
+        let unowned = catalog_rows(
+            &url,
+            "SELECT table_id, path, path, NULL FROM ducklake_unowned_file",
+        )
+        .await;
+        assert_eq!(unowned.len(), 1, "{unowned:?}");
     }
 }

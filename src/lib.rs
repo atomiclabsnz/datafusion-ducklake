@@ -229,7 +229,7 @@ pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use keyed_mutation::{KeyedMutation, KeyedMutationResult};
 #[cfg(feature = "write")]
-pub use manifest_import::{ImportError, ImportOptions, ImportResult};
+pub use manifest_import::{ImportError, ImportOptions, ImportResult, validate_manifest};
 #[cfg(feature = "write")]
 pub use metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
