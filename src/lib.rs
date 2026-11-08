@@ -147,6 +147,8 @@ pub(crate) mod insert_sort;
 #[cfg(feature = "write")]
 pub mod keyed_mutation;
 #[cfg(feature = "write")]
+pub mod located_rows;
+#[cfg(feature = "write")]
 pub mod maintenance;
 #[cfg(feature = "write")]
 pub mod manifest_import;
@@ -230,6 +232,8 @@ pub use inlined_flush::FlushedInlinedTable;
 pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use keyed_mutation::{KeyedMutation, KeyedMutationResult};
+#[cfg(feature = "write")]
+pub use located_rows::{LOCATED_FILE_COLUMN, LOCATED_ROW_COLUMN};
 #[cfg(feature = "write")]
 pub use manifest_import::{ImportError, ImportOptions, ImportResult, validate_manifest};
 #[cfg(feature = "write")]
