@@ -440,3 +440,50 @@ async fn a_delta_that_fails_mid_stream_leaves_the_table_whole() {
         "the table is whole"
     );
 }
+
+/// A delete file of more positions than one of its batches holds (65,536): a merge
+/// matching 100,000 rows of one data file deletes exactly them, as `upsert_by_keys` does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_file_of_many_batches_deletes_every_position() {
+    let build = || async {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let writer = SqliteMetadataWriter::new_with_init(&url(&temp))
+            .await
+            .unwrap()
+            .with_data_inlining_row_limit(0);
+        writer.set_data_path(data.to_str().unwrap()).unwrap();
+        let writer =
+            DuckLakeTableWriter::new(Arc::new(writer), Arc::new(LocalFileSystem::new())).unwrap();
+        let ids: Vec<Option<i32>> = (0..200_000).map(Some).collect();
+        writer
+            .write_table("main", "t", &[rows(&ids)])
+            .await
+            .unwrap();
+        temp
+    };
+    let evens: BTreeSet<i32> = (0..200_000).step_by(2).collect();
+    let by_key = build().await;
+    let by_location = build().await;
+    let ctx = writable(&by_key).await;
+    let provider = table(&ctx).await;
+    as_ducklake(&provider)
+        .keyed_mutation(&["id"])
+        .upsert_by_keys(&ctx.state(), delta(&evens))
+        .await
+        .unwrap();
+    let ctx = writable(&by_location).await;
+    let provider = table(&ctx).await;
+    let lake_table = as_ducklake(&provider);
+    let (files, inlined, _) = locate(&ctx, lake_table, &evens).await;
+    assert_eq!(files.values().map(Vec::len).sum::<usize>(), 100_000);
+    let replaced = lake_table
+        .replace_located_rows(&ctx.state(), files, inlined, stream(delta(&evens)))
+        .await
+        .unwrap();
+    assert_eq!(replaced.rows_deleted, 100_000);
+    let head = read(&by_location, None).await;
+    assert_eq!(head.len(), 200_002);
+    assert_eq!(head, read(&by_key, None).await);
+}
