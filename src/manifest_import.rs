@@ -638,6 +638,18 @@ async fn check_file(
     }
 
     let leaf_of = leaf_of_id(&metadata, &file.column_binding, &file_column_ids);
+    // The columns a name mapping reads from the file's Hive path (`is_partition`), by
+    // target column id: a file never holds them, so a `NOT NULL` one is held to its path
+    // value instead of to a null count.
+    let hive_columns: HashMap<i64, &str> = match &file.column_binding {
+        ColumnBinding::NameMapping(mapping) => mapping
+            .entries
+            .iter()
+            .filter(|entry| entry.is_partition && entry.parent_column.is_none())
+            .map(|entry| (entry.target_field_id, entry.source_name.as_str()))
+            .collect(),
+        _ => HashMap::new(),
+    };
     check_types_and_nulls(
         &file.path,
         fields,
@@ -645,6 +657,7 @@ async fn check_file(
         &file_column_ids,
         &leaf_of,
         &metadata,
+        &hive_columns,
     )?;
     let facts = column_facts(&arrow_schema, &metadata, &file_column_ids);
     let exact_types = bounds_carry_over(fields, &arrow_schema, &file_column_ids)?;
@@ -934,6 +947,7 @@ fn check_types_and_nulls(
     file_column_ids: &[Option<i64>],
     leaf_of: &HashMap<i64, usize>,
     metadata: &ParquetMetaData,
+    hive_columns: &HashMap<i64, &str>,
 ) -> Result<()> {
     let held = file_types(arrow_schema, file_column_ids);
     for field in fields {
@@ -985,6 +999,19 @@ fn check_types_and_nulls(
             }
             .into())
         };
+        if let Some(source_name) = hive_columns.get(&field.column_id) {
+            // Read from the path exactly as a scan reads it: NULL spellings, decoding and the
+            // column's type included.
+            let table_type = crate::types::ducklake_to_arrow_type(&field.column_type)?;
+            match crate::table::DuckLakeTable::hive_partition_value(path, source_name, &table_type)
+            {
+                Ok(value) if !value.is_null() => continue,
+                Ok(_) => return violated("reads NULL from the file's Hive path"),
+                Err(_) => {
+                    return violated("has no value of its type in the file's Hive path");
+                },
+            }
+        }
         if !held.contains_key(&field.column_id) {
             return violated("is not in the file, which reads it as NULL");
         }
@@ -1453,6 +1480,68 @@ mod tests {
             None,
             vec![file],
         )
+    }
+
+    /// A `NOT NULL` column a name mapping reads from the file's Hive path (#594: a Delta
+    /// partition column, which no Delta file holds) imports when the path spells a value, and
+    /// is refused when it spells NULL.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_not_null_hive_partition_column_is_held_to_its_path_value() {
+        use crate::metadata_provider::{DuckLakeNameMapping, DuckLakeNameMappingEntry};
+        for (dir_name, accepted) in
+            [("region=eu", true), ("region=__HIVE_DEFAULT_PARTITION__", false)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join(dir_name);
+            std::fs::create_dir_all(&data).unwrap();
+            let path = data.join("f.parquet");
+            let (size, count) = write_file(&path);
+            let entry = |column_id: i64, source: &str, target: i64, is_partition: bool| {
+                DuckLakeNameMappingEntry {
+                    column_id,
+                    source_name: source.to_string(),
+                    target_field_id: target,
+                    parent_column: None,
+                    is_partition,
+                }
+            };
+            let mapping = DuckLakeNameMapping {
+                mapping_id: 0,
+                table_id: 0,
+                mapping_type: "map_by_name".to_string(),
+                entries: vec![entry(1, "id", 1, false), entry(2, "region", 4, true)],
+            };
+            let file = ManifestDataFile::new(
+                1,
+                format!("file://{}", path.display()),
+                size,
+                count,
+                ColumnBinding::NameMapping(mapping),
+            );
+            let mut region = field(4, "region", "varchar");
+            region.is_nullable = false;
+            let manifest = TableManifest::new(
+                7,
+                9,
+                vec![field(1, "id", "int32"), region],
+                None,
+                vec![file],
+            );
+            let url = target(dir.path()).await;
+            let result = import(&url, &manifest).await;
+            if accepted {
+                result.unwrap();
+                assert_eq!(
+                    rows(&url).await,
+                    (1..=3)
+                        .map(|i| vec![Some(i.to_string()), Some("eu".to_string())])
+                        .collect::<Vec<_>>()
+                );
+            } else {
+                let e = result.unwrap_err().to_string();
+                assert!(e.contains("reads NULL from the file's Hive path"), "{e}");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
