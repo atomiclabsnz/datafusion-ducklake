@@ -601,8 +601,13 @@ async fn check_file(
             let by_name: HashMap<&str, i64> = mapping
                 .entries
                 .iter()
+                // A Hive-path column is read from the path, never from the file: a file column
+                // of the same name binds nothing, so no statistic of it is written (a scan
+                // would prune the path's values by the file's).
                 .filter(|entry| {
-                    entry.parent_column.is_none() && table_ids.contains(&entry.target_field_id)
+                    entry.parent_column.is_none()
+                        && !entry.is_partition
+                        && table_ids.contains(&entry.target_field_id)
                 })
                 .map(|entry| (entry.source_name.as_str(), entry.target_field_id))
                 .collect();
@@ -1482,66 +1487,130 @@ mod tests {
         )
     }
 
+    /// A manifest of one file under `<dir>/<segment>/f.parquet` (columns `id`, `name`, `gone`,
+    /// or `batch`'s), mapped by name, with column 4 `key` of `key_type` read from the Hive
+    /// path under `key_name`.
+    fn hive_manifest(
+        path: &std::path::Path,
+        size: i64,
+        count: i64,
+        key_name: &str,
+        key_type: &str,
+        nullable: bool,
+    ) -> TableManifest {
+        use crate::metadata_provider::{DuckLakeNameMapping, DuckLakeNameMappingEntry};
+        let entry = |column_id: i64, source: &str, target: i64, is_partition: bool| {
+            DuckLakeNameMappingEntry {
+                column_id,
+                source_name: source.to_string(),
+                target_field_id: target,
+                parent_column: None,
+                is_partition,
+            }
+        };
+        let mapping = DuckLakeNameMapping {
+            mapping_id: 0,
+            table_id: 0,
+            mapping_type: "map_by_name".to_string(),
+            entries: vec![entry(1, "id", 1, false), entry(2, key_name, 4, true)],
+        };
+        let file = ManifestDataFile::new(
+            1,
+            format!("file://{}", path.display()),
+            size,
+            count,
+            ColumnBinding::NameMapping(mapping),
+        );
+        let mut key = field(4, key_name, key_type);
+        key.is_nullable = nullable;
+        TableManifest::new(7, 9, vec![field(1, "id", "int32"), key], None, vec![file])
+    }
+
     /// A `NOT NULL` column a name mapping reads from the file's Hive path (#594: a Delta
     /// partition column, which no Delta file holds) imports when the path spells a value, and
-    /// is refused when it spells NULL.
+    /// is refused when it spells NULL in any of the scan's spellings, or no value of its type.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_not_null_hive_partition_column_is_held_to_its_path_value() {
-        use crate::metadata_provider::{DuckLakeNameMapping, DuckLakeNameMappingEntry};
-        for (dir_name, accepted) in
-            [("region=eu", true), ("region=__HIVE_DEFAULT_PARTITION__", false)]
-        {
+        for (segment, key_type, expected) in [
+            ("region=eu", "varchar", Ok("eu")),
+            (
+                "region=__HIVE_DEFAULT_PARTITION__",
+                "varchar",
+                Err("reads NULL"),
+            ),
+            ("region=NULL", "varchar", Err("reads NULL")),
+            ("region=nUlL", "varchar", Err("reads NULL")),
+            ("region=", "varchar", Ok("")),
+            ("n=7", "int32", Ok("7")),
+            ("n=", "int32", Err("reads NULL")),
+            ("n=abc", "int32", Err("has no value of its type")),
+        ] {
             let dir = tempfile::tempdir().unwrap();
-            let data = dir.path().join(dir_name);
+            let data = dir.path().join(segment);
             std::fs::create_dir_all(&data).unwrap();
             let path = data.join("f.parquet");
             let (size, count) = write_file(&path);
-            let entry = |column_id: i64, source: &str, target: i64, is_partition: bool| {
-                DuckLakeNameMappingEntry {
-                    column_id,
-                    source_name: source.to_string(),
-                    target_field_id: target,
-                    parent_column: None,
-                    is_partition,
-                }
-            };
-            let mapping = DuckLakeNameMapping {
-                mapping_id: 0,
-                table_id: 0,
-                mapping_type: "map_by_name".to_string(),
-                entries: vec![entry(1, "id", 1, false), entry(2, "region", 4, true)],
-            };
-            let file = ManifestDataFile::new(
-                1,
-                format!("file://{}", path.display()),
-                size,
-                count,
-                ColumnBinding::NameMapping(mapping),
-            );
-            let mut region = field(4, "region", "varchar");
-            region.is_nullable = false;
-            let manifest = TableManifest::new(
-                7,
-                9,
-                vec![field(1, "id", "int32"), region],
-                None,
-                vec![file],
-            );
+            let key_name = segment.split('=').next().unwrap();
+            let manifest = hive_manifest(&path, size, count, key_name, key_type, false);
             let url = target(dir.path()).await;
             let result = import(&url, &manifest).await;
-            if accepted {
-                result.unwrap();
-                assert_eq!(
-                    rows(&url).await,
-                    (1..=3)
-                        .map(|i| vec![Some(i.to_string()), Some("eu".to_string())])
-                        .collect::<Vec<_>>()
-                );
-            } else {
-                let e = result.unwrap_err().to_string();
-                assert!(e.contains("reads NULL from the file's Hive path"), "{e}");
+            match expected {
+                Ok(value) => {
+                    result.unwrap_or_else(|e| panic!("{segment}: {e}"));
+                    assert_eq!(
+                        sql(&url, &format!("SELECT {key_name} FROM lake.main.t")).await,
+                        vec![vec![Some(value.to_string())]; 3],
+                        "{segment}"
+                    );
+                },
+                Err(reason) => {
+                    let e = result.expect_err(segment).to_string();
+                    assert!(e.contains(reason), "{segment}: {e}");
+                },
             }
         }
+    }
+
+    /// A file that also holds a column named like a Hive-path column: the scan reads the path,
+    /// and the file's column binds nothing, so no statistic of it is written that would prune
+    /// the path's value away.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_column_named_like_a_hive_column_writes_no_statistic() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("region=eu");
+        std::fs::create_dir_all(&data).unwrap();
+        let path = data.join("f.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["us", "us", "us"])),
+            ],
+        )
+        .unwrap();
+        let size = write_batch(&path, &batch);
+        let manifest = hive_manifest(&path, size, 3, "region", "varchar", true);
+        let url = target(dir.path()).await;
+        import(&url, &manifest).await.unwrap();
+        assert_eq!(
+            catalog_rows(
+                &url,
+                "SELECT column_id, min_value, max_value, null_count \
+                 FROM ducklake_file_column_stats WHERE column_id = 4"
+            )
+            .await,
+            vec![],
+            "no statistic of the Hive-path column"
+        );
+        assert_eq!(
+            sql(&url, "SELECT count(*) FROM lake.main.t WHERE region = 'eu'").await,
+            vec![vec![Some("3".to_string())]],
+            "the path's value, not pruned by the file's"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
