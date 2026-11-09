@@ -2554,6 +2554,66 @@ impl DuckLakeTable {
         ))
     }
 
+    /// The positional scan of `data_file` [`Self::resolve_positions`] runs: the
+    /// data columns `predicate` references (or every column, where a file's
+    /// renames leave them unnarrowable), then the reader's physical row
+    /// position, delete files NOT applied. Returns the plan, `predicate` rebound
+    /// against the plan's data columns, and the catalog indices of those data
+    /// columns, in the plan's order (the position column follows them). `prune` lets the reader prune on `predicate` where that is safe
+    /// ([`Self::predicate_is_prunable`]); a caller that reads the columns rather
+    /// than evaluating the predicate passes `false`.
+    pub(crate) async fn positional_plan(
+        &self,
+        state: &dyn Session,
+        data_file: &DuckLakeFileData,
+        predicate: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        prune: bool,
+    ) -> DataFusionResult<(
+        Arc<dyn ExecutionPlan>,
+        Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        Vec<usize>,
+    )> {
+        let file_cfg = self.build_file_read_config(state, data_file).await?;
+
+        let (table_schema, pos_table_idx, _pos_name) = positional_table_schema_reserving(
+            file_cfg.read_schema.clone(),
+            self.physical_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str()),
+        );
+        let (columns, evaluated) = self.positional_read_columns(predicate, &file_cfg)?;
+        let mut proj = columns.clone();
+        proj.push(pos_table_idx);
+
+        // Hand the predicate to the reader when it is safe to prune on, so a
+        // DELETE/UPDATE reads only the row groups that can contain matches
+        // instead of every row of the file. Positions stay true under pruning
+        // because the reader derives them from row-group offsets, and a row the
+        // reader drops could not have matched anyway.
+        //
+        // The reader takes the ORIGINAL predicate, not `evaluated`: a pushed
+        // predicate is bound against `table_schema` — every data column in
+        // catalog order, whatever the projection — so its indices are the
+        // catalog's. `evaluated` is bound against the narrower batch this plan
+        // emits.
+        let mut source = self.create_parquet_source(state, table_schema)?;
+        if prune && self.predicate_is_prunable(predicate, &file_cfg) {
+            source = source.with_predicate(Arc::clone(predicate));
+        }
+
+        let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
+            self.scan_config_builder(Arc::new(source))
+                .with_file_group(FileGroup::new(vec![self.partitioned_file(data_file)?]))
+                .with_projection_indices(Some(proj))?
+                .build(),
+        );
+        let plan = self.split_across_partitions(plan, state, &file_cfg)?;
+
+        let plan = self.present_file_read_config(plan, &file_cfg, &columns);
+        Ok((plan, evaluated, columns))
+    }
+
     /// Scan `data_file` and return the physical positions of rows matching
     /// `predicate`, without applying delete files. These are the positions used
     /// by a delete file's `pos` column and
@@ -2602,45 +2662,10 @@ impl DuckLakeTable {
         // see `positional_read_columns` — then the position column. On a file
         // that embeds a rowid column that column sits last in `read_schema`,
         // past every data column, so it is never projected.
-        let file_cfg = self.build_file_read_config(state, data_file).await?;
-
-        let (table_schema, pos_table_idx, _pos_name) = positional_table_schema_reserving(
-            file_cfg.read_schema.clone(),
-            self.physical_schema
-                .fields()
-                .iter()
-                .map(|field| field.name().as_str()),
-        );
-        let (columns, evaluated) = self.positional_read_columns(&predicate, &file_cfg)?;
-        let mut proj = columns.clone();
-        proj.push(pos_table_idx);
-        let pos_idx = proj.len() - 1;
-
-        // Hand the predicate to the reader when it is safe to prune on, so a
-        // DELETE/UPDATE reads only the row groups that can contain matches
-        // instead of every row of the file. Positions stay true under pruning
-        // because the reader derives them from row-group offsets, and a row the
-        // reader drops could not have matched anyway.
-        //
-        // The reader takes the ORIGINAL predicate, not `evaluated`: a pushed
-        // predicate is bound against `table_schema` — every data column in
-        // catalog order, whatever the projection — so its indices are the
-        // catalog's. `evaluated` is bound against the narrower batch this plan
-        // emits.
-        let mut source = self.create_parquet_source(state, table_schema)?;
-        if self.predicate_is_prunable(&predicate, &file_cfg) {
-            source = source.with_predicate(Arc::clone(&predicate));
-        }
-
-        let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
-            self.scan_config_builder(Arc::new(source))
-                .with_file_group(FileGroup::new(vec![self.partitioned_file(data_file)?]))
-                .with_projection_indices(Some(proj))?
-                .build(),
-        );
-        let plan = self.split_across_partitions(plan, state, &file_cfg)?;
-
-        let plan = self.present_file_read_config(plan, &file_cfg, &columns);
+        let (plan, evaluated, columns) = self
+            .positional_plan(state, data_file, &predicate, true)
+            .await?;
+        let pos_idx = columns.len();
 
         let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
 
