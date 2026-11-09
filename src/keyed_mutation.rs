@@ -222,13 +222,189 @@ impl DuckLakeTable {
         positions: Vec<(i64, Vec<i64>)>,
         inlined_rows: Vec<InlinedRowRef>,
     ) -> crate::Result<KeyedMutationResult> {
-        let mutation = KeyedMutation {
+        let mutation = self.by_position();
+        let context = mutation.context(state)?;
+        let matched = self
+            .match_located(&mutation, state, positions, inlined_rows)
+            .await?;
+        let rows_deleted = matched.row_count();
+        if rows_deleted == 0 {
+            return Ok(KeyedMutationResult::default());
+        }
+        let snapshot_id = mutation
+            .commit(&context, state, matched, StagedTableData::None)
+            .await?;
+        Ok(KeyedMutationResult {
+            snapshot_id,
+            rows_deleted,
+            ..KeyedMutationResult::default()
+        })
+    }
+
+    /// Delete the live rows named by where they live and append `rows`, in
+    /// ONE snapshot: a keyed merge whose matched rows a join named (ADR-0037
+    /// slice 5 in ferrion), as [`KeyedMutation::upsert_by_keys`] commits its
+    /// delete and its append. `files` are `(data_file_id, physical
+    /// positions)` of this table's live data files, `inlined` the row ids of
+    /// live inlined rows, as [`DuckLakeTable::located_rows`] names them. A
+    /// row already deleted is neither counted nor deleted again.
+    ///
+    /// Every location is checked before anything is written: a data file not
+    /// live at this table's snapshot, a file given more than once, a position
+    /// outside its rows, or a row id no live inlined row has, is refused with
+    /// [`DuckLakeError::InvalidConfig`]. `rows` are then staged as they
+    /// stream — inlined when the whole statement is at most the table's
+    /// inlining limit, as official's insert inlines it, else written to
+    /// Parquet as they come; each batch must carry every column of the table,
+    /// of its type or a lossless widening ([module docs](self)). A table whose
+    /// insert sorts its rows has them collected and sorted first. The
+    /// deletions and the new rows commit together, with the conflict checks
+    /// of a SQL `UPDATE`; a failure anywhere leaves nothing, the files it
+    /// wrote removed. Nothing to delete and no rows commits nothing.
+    ///
+    /// What is held: the locations (8 bytes a matched row and the file
+    /// bookkeeping), the inlining limit's rows while the statement could
+    /// still be inlined, and the write session's open file, which is charged
+    /// to `state`'s memory pool.
+    pub async fn replace_located_rows(
+        &self,
+        state: &dyn Session,
+        files: HashMap<i64, Vec<i64>>,
+        inlined: std::collections::HashSet<i64>,
+        mut rows: datafusion::execution::SendableRecordBatchStream,
+    ) -> crate::Result<KeyedMutationResult> {
+        use futures::StreamExt;
+        let mutation = self.by_position();
+        let context = mutation.context(state)?;
+        let mut inlined_rows = Vec::with_capacity(inlined.len());
+        if !inlined.is_empty() {
+            let mut wanted = inlined;
+            for data in self.inlined_data_with_row_ids()? {
+                for row_id in &data.row_ids {
+                    if wanted.remove(row_id) {
+                        inlined_rows.push(InlinedRowRef {
+                            table_name: data.table_name.clone(),
+                            row_id: *row_id,
+                        });
+                    }
+                }
+            }
+            if let Some(row_id) = wanted.iter().min() {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "row {row_id} is not a live inlined row of '{}' at snapshot {}",
+                    self.table_name(),
+                    self.snapshot_id()
+                )));
+            }
+        }
+        let matched = self
+            .match_located(&mutation, state, files.into_iter().collect(), inlined_rows)
+            .await?;
+        let rows_deleted = matched.row_count();
+
+        let all: Vec<usize> = (0..context.physical_schema.fields().len()).collect();
+        let limit = context.inline_limit;
+        let mut buffered: Vec<RecordBatch> = Vec::new();
+        let mut count = 0usize;
+        let mut session: Option<crate::table_writer::TableWriteSession> = None;
+        let reservation = datafusion::execution::memory_pool::MemoryConsumer::new(
+            "ducklake replace_located_rows: the write session",
+        )
+        .register(&state.runtime_env().memory_pool);
+        let mut collected = false;
+        let staged: crate::Result<StagedTableData> = async {
+            while let Some(batch) = rows.next().await {
+                let batch = batch?;
+                let conformed = context.conform(&[batch], &all, true)?;
+                for batch in conformed {
+                    count += batch.num_rows();
+                    match session.as_mut() {
+                        Some(open) => {
+                            crate::table_writer::validate_not_null_batches(
+                                &context.physical_schema,
+                                std::slice::from_ref(&batch),
+                            )?;
+                            let batch = RecordBatch::try_new(
+                                Arc::clone(&context.physical_schema),
+                                batch.columns().to_vec(),
+                            )?;
+                            open.write_batch_async(&batch).await?;
+                            reservation.try_resize(open.memory_size())?;
+                        },
+                        None => buffered.push(batch),
+                    }
+                }
+                if session.is_none() && !collected && count > limit {
+                    // Past the inlining limit: to Parquet. A table whose insert
+                    // sorts goes on collecting, and is staged whole at the end.
+                    if context.sorts_when_written() {
+                        collected = true;
+                        continue;
+                    }
+                    let mut open = context
+                        .table_writer
+                        .begin_write(
+                            &context.schema_name,
+                            &context.table_name,
+                            &context.physical_schema,
+                            WriteMode::Append,
+                        )?
+                        .with_base_snapshot_id(context.base_snapshot);
+                    crate::table_writer::validate_not_null_batches(
+                        &context.physical_schema,
+                        &buffered,
+                    )?;
+                    for batch in std::mem::take(&mut buffered) {
+                        let batch = RecordBatch::try_new(
+                            Arc::clone(&context.physical_schema),
+                            batch.columns().to_vec(),
+                        )?;
+                        open.write_batch_async(&batch).await?;
+                    }
+                    reservation.try_resize(open.memory_size())?;
+                    session = Some(open);
+                }
+            }
+            match session.take() {
+                Some(open) => Ok(open.finish_staged().await?.unwrap_or(StagedTableData::None)),
+                None if buffered.is_empty() => Ok(StagedTableData::None),
+                None => context.stage_new_rows(std::mem::take(&mut buffered)).await,
+            }
+        }
+        .await;
+        let data = staged?;
+        drop(reservation);
+        if rows_deleted == 0 && matches!(data, StagedTableData::None) {
+            return Ok(KeyedMutationResult::default());
+        }
+        let snapshot_id = mutation.commit(&context, state, matched, data).await?;
+        Ok(KeyedMutationResult {
+            snapshot_id,
+            rows_deleted,
+            rows_inserted: count as u64,
+            ..KeyedMutationResult::default()
+        })
+    }
+
+    /// A mutation that names rows by where they live, not by key.
+    fn by_position(&self) -> KeyedMutation<'_> {
+        KeyedMutation {
             table: self,
             key_columns: Vec::new(),
             concurrency: None,
             by_position: true,
-        };
-        let context = mutation.context(state)?;
+        }
+    }
+
+    /// `positions` and `inlined_rows` as the rows they name, each checked:
+    /// see [`Self::delete_positions`].
+    async fn match_located(
+        &self,
+        mutation: &KeyedMutation<'_>,
+        state: &dyn Session,
+        positions: Vec<(i64, Vec<i64>)>,
+        inlined_rows: Vec<InlinedRowRef>,
+    ) -> crate::Result<MatchedRows> {
         let mut live: HashMap<i64, DuckLakeTableFile> = self
             .files()?
             .into_iter()
@@ -308,18 +484,7 @@ impl DuckLakeTable {
             files,
             inlined_rows,
         };
-        let rows_deleted = matched.row_count();
-        if rows_deleted == 0 {
-            return Ok(KeyedMutationResult::default());
-        }
-        let snapshot_id = mutation
-            .commit(&context, state, matched, StagedTableData::None)
-            .await?;
-        Ok(KeyedMutationResult {
-            snapshot_id,
-            rows_deleted,
-            ..KeyedMutationResult::default()
-        })
+        Ok(matched)
     }
 }
 
@@ -851,6 +1016,13 @@ impl MutationContext {
     /// missing column, or one whose type does not widen to the table's
     /// without loss, is refused for every batch before any is converted;
     /// `exact` refuses a batch with columns besides them too.
+    /// Whether rows this mutation writes to Parquet are sorted first (the
+    /// table's `SET SORTED BY` order), as [`Self::stage_new_rows`] sorts them.
+    fn sorts_when_written(&self) -> bool {
+        self.sort_spec.is_some()
+            && crate::table_writer::insert_sorts(self.sort_on_insert, self.inlining_enabled, false)
+    }
+
     fn conform(
         &self,
         batches: &[RecordBatch],

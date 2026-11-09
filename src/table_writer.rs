@@ -795,6 +795,9 @@ pub(crate) fn is_transport_error(error: &crate::error::DuckLakeError) -> bool {
     }
 }
 
+/// The most positions [`DuckLakeTableWriter::write_delete_file`] puts in one batch.
+const DELETE_FILE_BATCH_ROWS: usize = 65_536;
+
 impl DuckLakeTableWriter {
     pub fn new(
         metadata: Arc<dyn MetadataWriter>,
@@ -1988,17 +1991,22 @@ impl DuckLakeTableWriter {
             .iter()
             .map(|field| field.as_ref().clone())
             .collect();
-        let mut columns: Vec<arrow::array::ArrayRef> = vec![
-            Arc::new(StringArray::from(vec![data_file_path; positions.len()])),
-            Arc::new(Int64Array::from(positions.to_vec())),
-        ];
-        if let Some((snapshots, written)) = snapshots {
-            fields.push(embedded_snapshot_id_field());
-            columns.push(Arc::new(Int64Array::from(snapshots.to_vec())));
-            written.push(object_path.clone());
-        }
+        let snapshots = match snapshots {
+            Some((snapshots, written)) => {
+                if snapshots.len() != positions.len() {
+                    return Err(crate::DuckLakeError::Internal(format!(
+                        "a delete file of {} positions given {} snapshots",
+                        positions.len(),
+                        snapshots.len()
+                    )));
+                }
+                fields.push(embedded_snapshot_id_field());
+                written.push(object_path.clone());
+                Some(snapshots)
+            },
+            None => None,
+        };
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema.clone(), columns)?;
 
         // Stage, then upload — the same path `finish()` uses for data files.
         let props = WriterProperties::builder()
@@ -2006,8 +2014,24 @@ impl DuckLakeTableWriter {
             .set_compression(self.compression)
             .build();
         let mut writer =
-            ArrowWriter::try_new(StageWriter::new(self.staging)?, schema, Some(props))?;
-        writer.write(&batch)?;
+            ArrowWriter::try_new(StageWriter::new(self.staging)?, schema.clone(), Some(props))?;
+        // In batches of at most `DELETE_FILE_BATCH_ROWS` positions: the `file_path`
+        // column repeats the data file's path on every row, so one batch of a merge's
+        // millions of positions would be hundreds of megabytes of the same string
+        // (ADR-0037 slice 5 in ferrion, measured). Encoded, it is a dictionary.
+        for (at, chunk) in positions.chunks(DELETE_FILE_BATCH_ROWS).enumerate() {
+            let mut columns: Vec<arrow::array::ArrayRef> = vec![
+                Arc::new(StringArray::from(vec![data_file_path; chunk.len()])),
+                Arc::new(Int64Array::from(chunk.to_vec())),
+            ];
+            if let Some(snapshots) = snapshots {
+                let from = at * DELETE_FILE_BATCH_ROWS;
+                columns.push(Arc::new(Int64Array::from(
+                    snapshots[from..from + chunk.len()].to_vec(),
+                )));
+            }
+            writer.write(&RecordBatch::try_new(schema.clone(), columns)?)?;
+        }
         let mut staged = writer.into_inner()?.finish()?;
         let file_size = staged.len()? as i64;
         let footer_size = staged.footer_size()?;
