@@ -47,6 +47,10 @@ futures = "0.3"
 bytes = "1"
 tracing = "0.1"
 thiserror = "2.0"
+# The positions a merge deletes, per data file, as a set (`replace_located_rows`): a
+# compressed bitmap holds a file's millions of matched rows in a fraction of the 8 bytes a
+# row a list takes. Pure Rust, so the `wasm32` build takes it.
+roaring = { version = "0.11", default-features = false, features = ["std"] }
 
 # Encryption support (optional)
 base64 = { version = "0.22", optional = true }

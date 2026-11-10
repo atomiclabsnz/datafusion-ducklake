@@ -767,7 +767,7 @@ async fn commit_new_versions(
                 schema_name,
                 table_name,
                 &target,
-                positions,
+                crate::delete_exec::Positions::Sorted(positions),
                 inline_limit,
                 base_snapshot,
             )

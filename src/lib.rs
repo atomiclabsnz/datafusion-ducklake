@@ -200,6 +200,9 @@ pub use metadata_provider::{
     TagObjectType, TagTarget,
 };
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
+/// The set type [`DuckLakeTable::replace_located_rows`] takes a data file's positions in, so a
+/// caller names the very version this crate links.
+pub use roaring;
 pub use rowid_lookup::{RowIdLayout, RowIdLocation, RowLocation};
 pub use schema::DuckLakeSchema;
 pub use snapshot_consistency::register_snapshot_consistency;

@@ -13,7 +13,9 @@
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use datafusion_ducklake::roaring::RoaringTreemap;
 use std::sync::Arc;
 
 use arrow::array::{Array, Int32Array, Int64Array, StringArray};
@@ -233,7 +235,7 @@ async fn locate(
     ctx: &SessionContext,
     table: &DuckLakeTable,
     ids: &BTreeSet<i32>,
-) -> (HashMap<i64, Vec<i64>>, HashSet<i64>, usize) {
+) -> (BTreeMap<i64, RoaringTreemap>, HashSet<i64>, usize) {
     let located = table.located_rows(&["id"]).unwrap();
     let schema = located.schema();
     assert_eq!(
@@ -245,7 +247,7 @@ async fn locate(
         ["id", LOCATED_FILE_COLUMN, LOCATED_ROW_COLUMN]
     );
     let batches = ctx.read_table(located).unwrap().collect().await.unwrap();
-    let mut files: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut files: BTreeMap<i64, RoaringTreemap> = BTreeMap::new();
     let mut inlined = HashSet::new();
     let mut sevens = 0;
     for b in &batches {
@@ -262,7 +264,10 @@ async fn locate(
             if file.is_null(i) {
                 inlined.insert(row.value(i));
             } else {
-                files.entry(file.value(i)).or_default().push(row.value(i));
+                files
+                    .entry(file.value(i))
+                    .or_default()
+                    .insert(u64::try_from(row.value(i)).unwrap());
             }
         }
     }
@@ -364,16 +369,14 @@ async fn a_location_the_snapshot_does_not_have_is_refused_before_anything_is_wri
     let some_file = *files.keys().next().unwrap();
 
     let mut stale = files.clone();
-    stale.insert(987_654, vec![0]);
-    let mut negative = files.clone();
-    negative.get_mut(&some_file).unwrap().push(-1);
+    stale.insert(987_654, [0u64].into_iter().collect());
+    // (A negative position cannot be given: a set holds none.)
     let mut past = files.clone();
-    past.get_mut(&some_file).unwrap().push(1_000_000);
+    past.get_mut(&some_file).unwrap().insert(1_000_000);
     let mut stale_inlined = inlined.clone();
     stale_inlined.insert(555_555);
     for (what, files, inlined, says) in [
         ("a file that is not live", stale, inlined.clone(), "987654"),
-        ("a negative position", negative, inlined.clone(), "-1"),
         ("a position past the file", past, inlined.clone(), "1000000"),
         (
             "an inlined row that is not live",
@@ -477,7 +480,10 @@ async fn a_delete_file_of_many_batches_deletes_every_position() {
     let provider = table(&ctx).await;
     let lake_table = as_ducklake(&provider);
     let (files, inlined, _) = locate(&ctx, lake_table, &evens).await;
-    assert_eq!(files.values().map(Vec::len).sum::<usize>(), 100_000);
+    assert_eq!(
+        files.values().map(RoaringTreemap::len).sum::<u64>(),
+        100_000
+    );
     let replaced = lake_table
         .replace_located_rows(&ctx.state(), files, inlined, stream(delta(&evens)))
         .await
