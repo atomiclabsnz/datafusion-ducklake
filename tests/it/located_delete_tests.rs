@@ -13,7 +13,9 @@
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use datafusion_ducklake::roaring::RoaringTreemap;
 use std::sync::Arc;
 
 use arrow::array::{Array, Int32Array, Int64Array, StringArray};
@@ -233,7 +235,7 @@ async fn locate(
     ctx: &SessionContext,
     table: &DuckLakeTable,
     ids: &BTreeSet<i32>,
-) -> (HashMap<i64, Vec<i64>>, HashSet<i64>, usize) {
+) -> (BTreeMap<i64, RoaringTreemap>, HashSet<i64>, usize) {
     let located = table.located_rows(&["id"]).unwrap();
     let schema = located.schema();
     assert_eq!(
@@ -245,7 +247,7 @@ async fn locate(
         ["id", LOCATED_FILE_COLUMN, LOCATED_ROW_COLUMN]
     );
     let batches = ctx.read_table(located).unwrap().collect().await.unwrap();
-    let mut files: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut files: BTreeMap<i64, RoaringTreemap> = BTreeMap::new();
     let mut inlined = HashSet::new();
     let mut sevens = 0;
     for b in &batches {
@@ -262,7 +264,10 @@ async fn locate(
             if file.is_null(i) {
                 inlined.insert(row.value(i));
             } else {
-                files.entry(file.value(i)).or_default().push(row.value(i));
+                files
+                    .entry(file.value(i))
+                    .or_default()
+                    .insert(u64::try_from(row.value(i)).unwrap());
             }
         }
     }
@@ -364,16 +369,14 @@ async fn a_location_the_snapshot_does_not_have_is_refused_before_anything_is_wri
     let some_file = *files.keys().next().unwrap();
 
     let mut stale = files.clone();
-    stale.insert(987_654, vec![0]);
-    let mut negative = files.clone();
-    negative.get_mut(&some_file).unwrap().push(-1);
+    stale.insert(987_654, [0u64].into_iter().collect());
+    // (A negative position cannot be given: a set holds none.)
     let mut past = files.clone();
-    past.get_mut(&some_file).unwrap().push(1_000_000);
+    past.get_mut(&some_file).unwrap().insert(1_000_000);
     let mut stale_inlined = inlined.clone();
     stale_inlined.insert(555_555);
     for (what, files, inlined, says) in [
         ("a file that is not live", stale, inlined.clone(), "987654"),
-        ("a negative position", negative, inlined.clone(), "-1"),
         ("a position past the file", past, inlined.clone(), "1000000"),
         (
             "an inlined row that is not live",
@@ -477,7 +480,10 @@ async fn a_delete_file_of_many_batches_deletes_every_position() {
     let provider = table(&ctx).await;
     let lake_table = as_ducklake(&provider);
     let (files, inlined, _) = locate(&ctx, lake_table, &evens).await;
-    assert_eq!(files.values().map(Vec::len).sum::<usize>(), 100_000);
+    assert_eq!(
+        files.values().map(RoaringTreemap::len).sum::<u64>(),
+        100_000
+    );
     let replaced = lake_table
         .replace_located_rows(&ctx.state(), files, inlined, stream(delta(&evens)))
         .await
@@ -486,4 +492,48 @@ async fn a_delete_file_of_many_batches_deletes_every_position() {
     let head = read(&by_location, None).await;
     assert_eq!(head.len(), 200_002);
     assert_eq!(head, read(&by_key, None).await);
+}
+
+/// A set of positions naming rows the snapshot already deleted (here every
+/// physical row of both data files, ids 3 and 41 deleted by their delete files
+/// among them) deletes and counts only the live ones, as a list of positions
+/// does: a file whose every live row is named is dropped, not given a delete
+/// file that names its deleted rows twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_set_naming_deleted_rows_deletes_only_the_live_ones() {
+    let temp = lake().await;
+    let ctx = writable(&temp).await;
+    let provider = table(&ctx).await;
+    let lake_table = as_ducklake(&provider);
+    let all: BTreeSet<i32> = (0..80).collect();
+    let (located, _, _) = locate(&ctx, lake_table, &all).await;
+    assert_eq!(located.len(), 2, "the fixture's two data files");
+    let every: BTreeMap<i64, RoaringTreemap> = located
+        .keys()
+        .map(|file| (*file, (0u64..40).collect()))
+        .collect();
+    let result = lake_table
+        .replace_located_rows(
+            &ctx.state(),
+            every,
+            HashSet::new(),
+            stream(delta(&[1000].into())),
+        )
+        .await
+        .unwrap();
+    // 40 rows in each file, one of each deleted already.
+    assert_eq!(result.rows_deleted, 78);
+    assert_eq!(result.rows_inserted, 3);
+    let ids: Vec<String> = read(&temp, None)
+        .await
+        .into_iter()
+        .map(|row| row.split(',').skip(1).collect::<Vec<_>>().join(","))
+        .collect();
+    let mut ids = ids;
+    ids.sort();
+    assert_eq!(
+        ids,
+        ["100,s100", "1000,new1000", "NULL,n", "NULL,newnull", "NULL,newnull"],
+        "only the inlined rows and the delta are left"
+    );
 }

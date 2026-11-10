@@ -405,7 +405,7 @@ async fn run_delete(
                     schema_name,
                     table_name,
                     &DeletionTarget::of_file(tf, &existing),
-                    newly_deleted,
+                    Positions::Sorted(newly_deleted),
                     inline_limit,
                     base_snapshot,
                 )
@@ -514,6 +514,56 @@ pub(crate) struct FileDeletions {
     /// The snapshot rewritten delete files date the statement's deletions to,
     /// once the first is written.
     commit_snapshot: Option<i64>,
+    /// Whether a new delete file records its positions in memory until the
+    /// commit ([`DeleteFileInfo::with_deleted_positions`]), which only a
+    /// commit that deletes and inserts nothing reads: set by
+    /// [`Self::inserting`] for one that inserts too, so a merge's millions of
+    /// positions are not held twice.
+    ///
+    /// [`DeleteFileInfo::with_deleted_positions`]: crate::metadata_writer::DeleteFileInfo::with_deleted_positions
+    inserting: bool,
+}
+
+/// A data file's positions a statement deletes, sorted and distinct.
+#[derive(Debug, Clone)]
+pub(crate) enum Positions {
+    /// As a sorted, distinct list.
+    Sorted(Vec<i64>),
+    /// As a set of them, which a merge that names millions of a file's rows
+    /// holds in a fraction of 8 bytes each (ADR-0037 slice 5 in ferrion).
+    Set(roaring::RoaringTreemap),
+}
+
+impl Positions {
+    /// How many.
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            Positions::Sorted(positions) => positions.len() as u64,
+            Positions::Set(set) => set.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The positions, ascending.
+    pub(crate) fn iter(&self) -> Box<dyn Iterator<Item = i64> + Send + '_> {
+        match self {
+            Positions::Sorted(positions) => Box::new(positions.iter().copied()),
+            // A set's members are positions it was given as `i64`s
+            // (`KeyedMutation`'s checks refuse a negative one), so each fits.
+            Positions::Set(set) => Box::new(set.iter().map(|p| p as i64)),
+        }
+    }
+
+    /// The positions as a sorted list.
+    pub(crate) fn into_vec(self) -> Vec<i64> {
+        match self {
+            Positions::Sorted(positions) => positions,
+            Positions::Set(set) => set.iter().map(|p| p as i64).collect(),
+        }
+    }
 }
 
 impl FileDeletions {
@@ -525,6 +575,14 @@ impl FileDeletions {
             commit_snapshot: Some(commit_snapshot),
             ..Self::default()
         }
+    }
+
+    /// These deletions, for a commit that also inserts rows: their new delete
+    /// files do not keep their positions in memory (see [`Self::inserting`]'s
+    /// field).
+    pub(crate) fn inserting(mut self, inserting: bool) -> Self {
+        self.inserting = inserting;
+        self
     }
 
     /// Add `other`'s deletions to these.
@@ -565,17 +623,18 @@ impl FileDeletions {
         schema_name: &str,
         table_name: &str,
         target: &DeletionTarget<'_>,
-        positions: Vec<i64>,
+        positions: Positions,
         inline_limit: usize,
         base_snapshot: i64,
     ) -> DataFusionResult<()> {
         if positions.is_empty() {
             return Ok(());
         }
-        if inline_limit > 0 && positions.len() <= inline_limit {
+        let count = usize::try_from(positions.len()).unwrap_or(usize::MAX);
+        if inline_limit > 0 && count <= inline_limit {
             self.inlined.push(InlinedFileDelete {
                 data_file_id: target.data_file_id,
-                positions,
+                positions: positions.into_vec(),
                 expected_delete_file: target.delete_file.map(|(id, _)| id),
             });
             return Ok(());
@@ -586,7 +645,7 @@ impl FileDeletions {
                 .is_some_and(|rows| usize::try_from(rows).is_ok_and(|rows| rows == count))
         };
         let Some((delete_file_id, existing)) = target.delete_file else {
-            if deletes_every_row(positions.len()) {
+            if deletes_every_row(count) {
                 self.dropped.push(DroppedDataFile {
                     data_file_id: target.data_file_id,
                     expected_delete_file: None,
@@ -594,7 +653,13 @@ impl FileDeletions {
                 return Ok(());
             }
             let delete = table_writer
-                .write_delete_file(schema_name, table_name, target.data_file_path, &positions)
+                .write_delete_file_of(
+                    schema_name,
+                    table_name,
+                    target.data_file_path,
+                    &positions,
+                    !self.inserting,
+                )
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
             self.positional.push(DeleteFileEntry {
@@ -604,7 +669,7 @@ impl FileDeletions {
             });
             return Ok(());
         };
-        if deletes_every_row(existing.len() + positions.len()) {
+        if deletes_every_row(existing.len() + count) {
             self.dropped.push(DroppedDataFile {
                 data_file_id: target.data_file_id,
                 expected_delete_file: Some(delete_file_id),
@@ -642,7 +707,8 @@ impl FileDeletions {
                     (*position, snapshot.or(fallback).unwrap_or(commit_snapshot))
                 })
                 .collect(),
-            positions,
+            positions: positions.into_vec(),
+            record_positions: !self.inserting,
         };
         let (delete, begin_snapshot, partial_max) = table_writer
             .write_rewritten_delete_file(schema_name, table_name, &source, commit_snapshot)
@@ -837,7 +903,7 @@ async fn delete_all(
                 schema_name,
                 table_name,
                 &DeletionTarget::of_file(tf, &existing),
-                positions,
+                Positions::Sorted(positions),
                 inline_limit,
                 base_snapshot,
             )

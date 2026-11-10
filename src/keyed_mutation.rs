@@ -107,7 +107,7 @@ use futures::future::BoxFuture;
 use crate::rowid_lookup::bounded;
 
 use crate::DuckLakeError;
-use crate::delete_exec::{DeletionTarget, FileDeletions, LatestDeleteFiles};
+use crate::delete_exec::{DeletionTarget, FileDeletions, LatestDeleteFiles, Positions};
 use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{InlinedRowRef, StagedTableData, WriteMode};
 use crate::table::{DuckLakeTable, UpdateSourceScan};
@@ -224,6 +224,10 @@ impl DuckLakeTable {
     ) -> crate::Result<KeyedMutationResult> {
         let mutation = self.by_position();
         let context = mutation.context(state)?;
+        let positions = positions
+            .into_iter()
+            .map(|(file, positions)| (file, Positions::Sorted(positions)))
+            .collect();
         let matched = self
             .match_located(&mutation, state, positions, inlined_rows)
             .await?;
@@ -244,10 +248,11 @@ impl DuckLakeTable {
     /// Delete the live rows named by where they live and append `rows`, in
     /// ONE snapshot: a keyed merge whose matched rows a join named (ADR-0037
     /// slice 5 in ferrion), as [`KeyedMutation::upsert_by_keys`] commits its
-    /// delete and its append. `files` are `(data_file_id, physical
-    /// positions)` of this table's live data files, `inlined` the row ids of
-    /// live inlined rows, as [`DuckLakeTable::located_rows`] names them. A
-    /// row already deleted is neither counted nor deleted again.
+    /// delete and its append. `files` are this table's live data files, each
+    /// by its `data_file_id` with the set of its physical positions to
+    /// delete, and `inlined` the row ids of live inlined rows, as
+    /// [`DuckLakeTable::located_rows`] names them. A row already deleted is
+    /// neither counted nor deleted again.
     ///
     /// Every location is checked before anything is written: a data file not
     /// live at this table's snapshot, a file given more than once, a position
@@ -262,14 +267,19 @@ impl DuckLakeTable {
     /// of a SQL `UPDATE`; a failure anywhere leaves nothing, the files it
     /// wrote removed. Nothing to delete and no rows commits nothing.
     ///
-    /// What is held: the locations (8 bytes a matched row and the file
-    /// bookkeeping), the inlining limit's rows while the statement could
-    /// still be inlined, and the write session's open file, which is charged
-    /// to `state`'s memory pool.
+    /// What is held: the locations as the caller gave them, sets of
+    /// positions (a compressed bitmap, a fraction of a byte a matched row
+    /// where the matched rows of a file are dense), each moved into its
+    /// file's delete file and, for a file with no delete file yet, never
+    /// copied to a list. A file that has one gets a rewritten delete file,
+    /// whose positions, the old with the new, are still listed until the
+    /// commit, as every rewrite lists them. Also held: the inlining limit's
+    /// rows while the statement could still be inlined, and the write
+    /// session's open file, which is charged to `state`'s memory pool.
     pub async fn replace_located_rows(
         &self,
         state: &dyn Session,
-        files: HashMap<i64, Vec<i64>>,
+        files: std::collections::BTreeMap<i64, roaring::RoaringTreemap>,
         inlined: std::collections::HashSet<i64>,
         mut rows: datafusion::execution::SendableRecordBatchStream,
     ) -> crate::Result<KeyedMutationResult> {
@@ -298,7 +308,15 @@ impl DuckLakeTable {
             }
         }
         let matched = self
-            .match_located(&mutation, state, files.into_iter().collect(), inlined_rows)
+            .match_located(
+                &mutation,
+                state,
+                files
+                    .into_iter()
+                    .map(|(file, positions)| (file, Positions::Set(positions)))
+                    .collect(),
+                inlined_rows,
+            )
             .await?;
         let rows_deleted = matched.row_count();
 
@@ -402,7 +420,7 @@ impl DuckLakeTable {
         &self,
         mutation: &KeyedMutation<'_>,
         state: &dyn Session,
-        positions: Vec<(i64, Vec<i64>)>,
+        positions: Vec<(i64, Positions)>,
         inlined_rows: Vec<InlinedRowRef>,
     ) -> crate::Result<MatchedRows> {
         let mut live: HashMap<i64, DuckLakeTableFile> = self
@@ -436,7 +454,15 @@ impl DuckLakeTable {
                     .await
                     .map_err(from_df)?,
             };
-            if let Some(position) = positions.iter().find(|p| **p < 0 || **p >= rows) {
+            let outside = match &positions {
+                Positions::Sorted(list) => list.iter().copied().find(|p| *p < 0 || *p >= rows),
+                // A set holds no negative position; its largest is its last.
+                Positions::Set(set) => set
+                    .max()
+                    .map(|p| i64::try_from(p).unwrap_or(i64::MAX))
+                    .filter(|p| *p >= rows),
+            };
+            if let Some(position) = outside {
                 return Err(DuckLakeError::InvalidConfig(format!(
                     "position {position} is outside data file {data_file_id}'s {rows} rows"
                 )));
@@ -456,15 +482,32 @@ impl DuckLakeTable {
                             },
                             None => HashMap::new(),
                         };
-                        let mut positions: Vec<i64> = positions
-                            .into_iter()
-                            .filter(|position| {
-                                !existing.contains_key(position)
-                                    && !inlined.is_some_and(|set| set.contains(position))
-                            })
-                            .collect();
-                        positions.sort_unstable();
-                        positions.dedup();
+                        let positions = match positions {
+                            Positions::Sorted(positions) => {
+                                let mut positions: Vec<i64> = positions
+                                    .into_iter()
+                                    .filter(|position| {
+                                        !existing.contains_key(position)
+                                            && !inlined.is_some_and(|set| set.contains(position))
+                                    })
+                                    .collect();
+                                positions.sort_unstable();
+                                positions.dedup();
+                                Positions::Sorted(positions)
+                            },
+                            // Already distinct and ordered: only what is deleted
+                            // already is taken out, by the deletions, not by
+                            // the (many more) positions.
+                            Positions::Set(mut set) => {
+                                for position in existing.keys().chain(inlined.into_iter().flatten())
+                                {
+                                    if let Ok(position) = u64::try_from(*position) {
+                                        set.remove(position);
+                                    }
+                                }
+                                Positions::Set(set)
+                            },
+                        };
                         Ok((!positions.is_empty()).then_some(FileMatch {
                             file,
                             existing,
@@ -835,7 +878,7 @@ impl<'a> KeyedMutation<'a> {
                         Ok(Some(FileMatch {
                             file,
                             existing,
-                            positions,
+                            positions: Positions::Sorted(positions),
                         }))
                     });
                 pending
@@ -899,22 +942,35 @@ impl<'a> KeyedMutation<'a> {
         };
         // Every file's outcome, so a failure still knows the delete files the
         // others wrote.
+        // Each file's positions are moved into its deletion, not copied: a
+        // merge's are millions. A commit that also inserts rows has its delete
+        // files keep no copy of them either (`FileDeletions::inserting`).
+        let inserting = !matches!(data, StagedTableData::None);
+        let MatchedRows {
+            files: matched_files,
+            inlined_rows,
+        } = matched;
         let pending: Vec<BoxFuture<'_, DataFusionResult<DataFusionResult<FileDeletions>>>> =
-            matched
-                .files
-                .iter()
+            matched_files
+                .into_iter()
                 .map(
                     |found| -> BoxFuture<'_, DataFusionResult<DataFusionResult<FileDeletions>>> {
                         Box::pin(async move {
-                            let mut deletions = FileDeletions::dated(commit_snapshot);
+                            let FileMatch {
+                                file,
+                                existing,
+                                positions,
+                            } = found;
+                            let mut deletions =
+                                FileDeletions::dated(commit_snapshot).inserting(inserting);
                             let recorded = deletions
                                 .record(
                                     table,
                                     &context.table_writer,
                                     &context.schema_name,
                                     &context.table_name,
-                                    &DeletionTarget::of_file(&found.file, &found.existing),
-                                    found.positions.clone(),
+                                    &DeletionTarget::of_file(&file, &existing),
+                                    positions,
                                     context.inline_limit,
                                     base_snapshot,
                                 )
@@ -974,7 +1030,7 @@ impl<'a> KeyedMutation<'a> {
                 None,
                 deletions.positional,
                 deletions.rewritten,
-                matched.inlined_rows,
+                inlined_rows,
                 deletions.inlined,
                 deletions.dropped,
             )
@@ -1213,8 +1269,8 @@ struct FileMatch {
     file: DuckLakeTableFile,
     /// The positions its live delete file deletes, with their snapshots.
     existing: HashMap<i64, Option<i64>>,
-    /// Matched positions not deleted already, sorted.
-    positions: Vec<i64>,
+    /// Matched positions not deleted already.
+    positions: Positions,
 }
 
 /// The live rows a keyed mutation matched.
@@ -1228,7 +1284,7 @@ impl MatchedRows {
     fn row_count(&self) -> u64 {
         self.files
             .iter()
-            .map(|file| file.positions.len() as u64)
+            .map(|file| file.positions.len())
             .sum::<u64>()
             + self.inlined_rows.len() as u64
     }

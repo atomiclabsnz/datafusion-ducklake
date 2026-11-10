@@ -649,6 +649,10 @@ pub(crate) struct RewrittenDeleteSource {
     pub(crate) existing: Vec<(i64, i64)>,
     /// The statement's positions.
     pub(crate) positions: Vec<i64>,
+    /// Whether the file keeps its positions in memory until the commit
+    /// ([`DeleteFileInfo::with_deleted_positions`]): only a commit that
+    /// inserts nothing reads them.
+    pub(crate) record_positions: bool,
 }
 
 /// A delete file a statement rewrote, with what it holds.
@@ -1890,8 +1894,52 @@ impl DuckLakeTableWriter {
         data_file_path: &str,
         positions: &[i64],
     ) -> Result<DeleteFileInfo> {
-        self.write_delete_file_inner(schema_name, table_name, data_file_path, positions, None)
-            .await
+        self.write_delete_file_inner(
+            schema_name,
+            table_name,
+            data_file_path,
+            &mut positions.iter().copied(),
+            positions.len(),
+            None,
+            Some(positions),
+        )
+        .await
+    }
+
+    /// [`Self::write_delete_file`] of `positions`, read as they are written
+    /// rather than gathered into one list first. Only when `record` does the
+    /// file keep them ([`DeleteFileInfo::with_deleted_positions`]), which a
+    /// commit that also inserts rows never reads.
+    pub(crate) async fn write_delete_file_of(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        data_file_path: &str,
+        positions: &crate::delete_exec::Positions,
+        record: bool,
+    ) -> Result<DeleteFileInfo> {
+        let count = usize::try_from(positions.len()).map_err(|_| {
+            crate::DuckLakeError::Internal("a delete file of more positions than memory".into())
+        })?;
+        let listed;
+        let recorded: Option<&[i64]> = match positions {
+            _ if !record => None,
+            crate::delete_exec::Positions::Sorted(positions) => Some(positions),
+            crate::delete_exec::Positions::Set(set) => {
+                listed = set.iter().map(|p| p as i64).collect::<Vec<_>>();
+                Some(&listed)
+            },
+        };
+        self.write_delete_file_inner(
+            schema_name,
+            table_name,
+            data_file_path,
+            &mut positions.iter(),
+            count,
+            None,
+            recorded,
+        )
+        .await
     }
 
     /// The object key of the delete file `file_name` that
@@ -1930,12 +1978,13 @@ impl DuckLakeTableWriter {
         let partial_max = deletions.iter().map(|(_, s)| *s).max().unwrap_or(date);
         let mut written = Vec::new();
         let delete = self
-            .write_delete_file_with_snapshots(
+            .write_delete_file_dated(
                 schema_name,
                 table_name,
                 &source.data_file_path,
                 &deletions,
                 &mut written,
+                source.record_positions,
             )
             .await?;
         Ok((delete, begin_snapshot, partial_max))
@@ -1957,6 +2006,28 @@ impl DuckLakeTableWriter {
         deletions: &[(i64, i64)],
         written: &mut Vec<ObjectPath>,
     ) -> Result<DeleteFileInfo> {
+        self.write_delete_file_dated(
+            schema_name,
+            table_name,
+            data_file_path,
+            deletions,
+            written,
+            true,
+        )
+        .await
+    }
+
+    /// [`Self::write_delete_file_with_snapshots`], the file keeping its
+    /// positions only when `record`.
+    async fn write_delete_file_dated(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        data_file_path: &str,
+        deletions: &[(i64, i64)],
+        written: &mut Vec<ObjectPath>,
+        record: bool,
+    ) -> Result<DeleteFileInfo> {
         let positions = deletions.iter().map(|(pos, _)| *pos).collect::<Vec<_>>();
         let snapshots = deletions
             .iter()
@@ -1966,19 +2037,27 @@ impl DuckLakeTableWriter {
             schema_name,
             table_name,
             data_file_path,
-            &positions,
+            &mut positions.iter().copied(),
+            positions.len(),
             Some((&snapshots, written)),
+            record.then_some(positions.as_slice()),
         )
         .await
     }
 
+    /// Write `count` `positions` (ascending) as a delete file, each with its
+    /// snapshot where `snapshots` are given, the file keeping `record` in
+    /// memory as its positions ([`DeleteFileInfo::with_deleted_positions`]).
+    #[allow(clippy::too_many_arguments)]
     async fn write_delete_file_inner(
         &self,
         schema_name: &str,
         table_name: &str,
         data_file_path: &str,
-        positions: &[i64],
+        positions: &mut (dyn Iterator<Item = i64> + Send),
+        count: usize,
         snapshots: Option<(&[i64], &mut Vec<ObjectPath>)>,
+        record: Option<&[i64]>,
     ) -> Result<DeleteFileInfo> {
         self.refuse_encrypted_parquet("write a delete file")?;
         use arrow::array::{Int64Array, StringArray};
@@ -1993,10 +2072,10 @@ impl DuckLakeTableWriter {
             .collect();
         let snapshots = match snapshots {
             Some((snapshots, written)) => {
-                if snapshots.len() != positions.len() {
+                if snapshots.len() != count {
                     return Err(crate::DuckLakeError::Internal(format!(
                         "a delete file of {} positions given {} snapshots",
-                        positions.len(),
+                        count,
                         snapshots.len()
                     )));
                 }
@@ -2019,18 +2098,35 @@ impl DuckLakeTableWriter {
         // column repeats the data file's path on every row, so one batch of a merge's
         // millions of positions would be hundreds of megabytes of the same string
         // (ADR-0037 slice 5 in ferrion, measured). Encoded, it is a dictionary.
-        for (at, chunk) in positions.chunks(DELETE_FILE_BATCH_ROWS).enumerate() {
+        // The positions are read a batch at a time, so a caller holding them
+        // as a set never has them as a list.
+        let mut written_rows = 0usize;
+        loop {
+            let chunk: Vec<i64> = (&mut *positions).take(DELETE_FILE_BATCH_ROWS).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let from = written_rows;
+            written_rows += chunk.len();
+            if written_rows > count {
+                break;
+            }
+            let rows = chunk.len();
             let mut columns: Vec<arrow::array::ArrayRef> = vec![
-                Arc::new(StringArray::from(vec![data_file_path; chunk.len()])),
-                Arc::new(Int64Array::from(chunk.to_vec())),
+                Arc::new(StringArray::from(vec![data_file_path; rows])),
+                Arc::new(Int64Array::from(chunk)),
             ];
             if let Some(snapshots) = snapshots {
-                let from = at * DELETE_FILE_BATCH_ROWS;
                 columns.push(Arc::new(Int64Array::from(
-                    snapshots[from..from + chunk.len()].to_vec(),
+                    snapshots[from..from + rows].to_vec(),
                 )));
             }
             writer.write(&RecordBatch::try_new(schema.clone(), columns)?)?;
+        }
+        if written_rows != count {
+            return Err(crate::DuckLakeError::Internal(format!(
+                "a delete file of {count} positions was given {written_rows}"
+            )));
         }
         let mut staged = writer.into_inner()?.finish()?;
         let file_size = staged.len()? as i64;
@@ -2039,11 +2135,13 @@ impl DuckLakeTableWriter {
 
         // Registered relative to the table path (like data files); the reader
         // resolves it against the same table data dir.
-        Ok(
-            DeleteFileInfo::new(file_name, file_size, positions.len() as i64)
+        Ok(match record {
+            Some(positions) => DeleteFileInfo::new(file_name, file_size, count as i64)
                 .with_footer_size(footer_size)
                 .with_deleted_positions(positions),
-        )
+            None => DeleteFileInfo::new(file_name, file_size, count as i64)
+                .with_footer_size(footer_size),
+        })
     }
 
     /// Write rows that carry their embedded row id and insert snapshot into one or
