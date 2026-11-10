@@ -54,6 +54,13 @@ pub struct TableManifest {
     /// columns whose ids a live file holds, as the table had them when the file
     /// was written.
     pub retired_fields: Vec<DuckLakeTableField>,
+    /// Older partition specs some file was written under: a file whose
+    /// [`ManifestDataFile::partition_id`] is one of these specs' `partition_id`
+    /// holds values that follow that spec. An import that creates the table
+    /// with [`ImportOptions::create_partitioned`](crate::ImportOptions::create_partitioned)
+    /// records each as a spec generation that is never live, before the live
+    /// [`Self::partition_spec`].
+    pub retired_partition_specs: Vec<PartitionSpec>,
 }
 
 impl TableManifest {
@@ -76,7 +83,14 @@ impl TableManifest {
             partition_spec,
             files,
             retired_fields: Vec::new(),
+            retired_partition_specs: Vec::new(),
         }
+    }
+
+    /// Set [`Self::retired_partition_specs`].
+    pub fn with_retired_partition_specs(mut self, specs: Vec<PartitionSpec>) -> Self {
+        self.retired_partition_specs = specs;
+        self
     }
 
     /// Set [`Self::retired_fields`].
@@ -425,6 +439,9 @@ impl DuckLakeTable {
             partition_spec: self.partition_spec().cloned(),
             files,
             retired_fields: retired.into_values().collect(),
+            // The export reads the live spec only; a file of an older generation
+            // is imported without its values.
+            retired_partition_specs: Vec::new(),
         })
     }
 

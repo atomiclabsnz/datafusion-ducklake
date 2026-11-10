@@ -2655,6 +2655,33 @@ impl PromotedFile {
     }
 }
 
+/// The partition specs a [`MetadataWriter::register_imported_files`] commit gives
+/// the table it creates. Each spec's `partition_id` is the manifest's, which the
+/// files' [`DataFileInfo::partition_id`] name; the commit allocates the catalog's
+/// own ids and stamps the files with them.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ImportedPartitioning {
+    /// The live spec, or `None` for a table that is unpartitioned now.
+    pub live: Option<crate::partition::PartitionSpec>,
+    /// Older specs some file was written under, oldest first: each is recorded
+    /// as a generation that begins and ends at the commit's snapshot.
+    pub retired: Vec<crate::partition::PartitionSpec>,
+}
+
+impl ImportedPartitioning {
+    /// `live`, after `retired`.
+    pub fn new(
+        live: Option<crate::partition::PartitionSpec>,
+        retired: Vec<crate::partition::PartitionSpec>,
+    ) -> Self {
+        Self {
+            live,
+            retired,
+        }
+    }
+}
+
 /// One file of a [`MetadataWriter::register_imported_files`] commit.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -5329,6 +5356,13 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// that is a live column of the table is refused
     /// ([`crate::manifest_import::ImportError::RetiredFieldIsLive`]).
     ///
+    /// With `partitioning`, the table must be one this commit creates (another
+    /// writer's table of the name is a [`crate::DuckLakeError::Conflict`]): each
+    /// retired spec is recorded as a generation that begins and ends at the
+    /// snapshot, then the live one, and each file's `partition_id` (the
+    /// manifest's) is replaced by the generation's catalog id. A file may then
+    /// be of any of those generations, or of none.
+    ///
     /// Default: unsupported. The SQLite writer implements it.
     #[allow(clippy::too_many_arguments)]
     fn register_imported_files(
@@ -5341,6 +5375,7 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         _columns: &[ColumnDef],
         _column_ids: &[i64],
         _retired: &[crate::metadata_provider::DuckLakeTableField],
+        _partitioning: Option<&ImportedPartitioning>,
     ) -> Result<CommitIds> {
         Err(DuckLakeError::Unsupported(
             "importing existing files is not supported by this metadata writer".to_string(),

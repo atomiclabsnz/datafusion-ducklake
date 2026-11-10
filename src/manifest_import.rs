@@ -39,12 +39,22 @@
 //!   the table or retired fields, as top-level ones must.
 //! - **Partition values are verified** before they are kept: an `identity`
 //!   value must equal the file's exact minimum and maximum of the column (NULL:
-//!   every value NULL), a `year` value the calendar year of both. Any other
-//!   transform's values cannot be verified from a footer and are refused.
+//!   every value NULL); a `year`, `month`, `day` or `hour` value must be that
+//!   calendar part of both, and both must share every coarser part too (a
+//!   `month` 6 file of June 2023 alone, not of every June); a `bucket(N)` value is
+//!   checked by reading the column and hashing every row as official DuckLake and
+//!   the Iceberg spec do ([`crate::partition::bucket_of`]: integers, dates,
+//!   microsecond times and timestamps, text, binary; any other type is refused).
 //!
-//! A new table is created unpartitioned. Partition values are kept when the target
-//! table's live partition spec has the manifest's keys; create the table and set
-//! its spec first to keep them.
+//! A new table is created unpartitioned, unless
+//! [`ImportOptions::create_partitioned`] gives it the manifest's partition specs
+//! in the import's own commit: every [`TableManifest::retired_partition_specs`]
+//! as a generation that is never live, then [`TableManifest::partition_spec`] as
+//! the live one, each file under the spec its `partition_id` names (or none),
+//! with its values verified against that spec. A live spec with a `bucket` key
+//! over a file of another spec is refused (official DuckLake would prune that
+//! file away). Into an existing table, partition values are kept when its live
+//! partition spec has the manifest's keys.
 //!
 //! The SQLite metadata writer implements the commit; other writers refuse it
 //! with [`crate::DuckLakeError::Unsupported`].
@@ -86,9 +96,22 @@ pub struct ImportOptions {
     /// or delete of the table after it aborts the commit. Defaults to the
     /// catalog head when the import begins.
     pub base_snapshot: Option<i64>,
+    /// Give the table the import creates the manifest's partition specs, in the
+    /// import's commit: [`TableManifest::retired_partition_specs`] as generations
+    /// that are never live, then [`TableManifest::partition_spec`] as the live
+    /// one. Each file keeps the values of the spec it names, verified against it
+    /// (see the module docs). Off by default, when a new table is created
+    /// unpartitioned. Refused for a table that exists.
+    pub create_partitioned: bool,
 }
 
 impl ImportOptions {
+    /// Set [`Self::create_partitioned`].
+    pub fn with_create_partitioned(mut self, create_partitioned: bool) -> Self {
+        self.create_partitioned = create_partitioned;
+        self
+    }
+
     /// Set [`Self::take_ownership`].
     pub fn with_take_ownership(mut self, take_ownership: bool) -> Self {
         self.take_ownership = take_ownership;
@@ -208,6 +231,13 @@ pub enum ImportError {
         column_id: i64,
         reason: String,
     },
+    /// The manifest's partition specs cannot be given to the table: see the
+    /// module docs.
+    #[error("partition spec {partition_id}: {reason}")]
+    UnsupportedPartitioning {
+        partition_id: i64,
+        reason: String,
+    },
     /// A retired field has the id of one of the table's columns.
     #[error("retired field '{column}' has id {field_id}, which a column of the table has")]
     RetiredFieldIsLive {
@@ -229,6 +259,9 @@ pub enum ImportError {
 /// One manifest file, checked and ready to register.
 struct CheckedFile {
     info: DataFileInfo,
+    /// The file's object key and footer, for a partition value only its rows show.
+    key: String,
+    metadata: Arc<ParquetMetaData>,
     /// What the footer shows of each top-level scalar column, by column id.
     facts: HashMap<i64, ColumnFacts>,
     name_mapping: Option<Vec<crate::metadata_provider::DuckLakeNameMappingEntry>>,
@@ -281,11 +314,20 @@ impl DuckLakeTableWriter {
         let base_snapshot = options.base_snapshot.unwrap_or(setup.base_snapshot_id);
         let live_spec = self.metadata_writer().live_partition_spec(setup.table_id)?;
         let keep_partitions = match (&live_spec, &manifest.partition_spec) {
+            _ if options.create_partitioned => None,
             (Some(live), Some(exported)) if partition_keys(live) == partition_keys(exported) => {
                 Some((live.partition_id, exported.partition_id))
             },
             _ => None,
         };
+        // The specs the commit sets, each file's values verified against its own
+        // by `prepare`.
+        let partitioning = options.create_partitioned.then(|| {
+            crate::metadata_writer::ImportedPartitioning::new(
+                manifest.partition_spec.clone(),
+                manifest.retired_partition_specs.clone(),
+            )
+        });
 
         let mut written: Vec<ObjectPath> = Vec::new();
         let mut imported = Vec::with_capacity(checked.len());
@@ -294,7 +336,12 @@ impl DuckLakeTableWriter {
         let result = async {
             for (file, manifest_file) in checked.into_iter().zip(&manifest.files) {
                 let mut info = file.info;
-                if let Some((live_id, exported_id)) = keep_partitions
+                if options.create_partitioned
+                    && let Some(partition_id) = manifest_file.partition_id
+                {
+                    info =
+                        info.with_partition(partition_id, manifest_file.partition_values.clone());
+                } else if let Some((live_id, exported_id)) = keep_partitions
                     && manifest_file.partition_id == Some(exported_id)
                 {
                     if let Some(spec) = &live_spec {
@@ -340,6 +387,7 @@ impl DuckLakeTableWriter {
                 &columns,
                 &column_ids,
                 &manifest.retired_fields,
+                partitioning.as_ref(),
             )
         }
         .await;
@@ -438,9 +486,11 @@ async fn prepare(
 
     let head = provider.get_current_snapshot()?;
     let mut live_spec = None;
+    let mut exists = false;
     if let Some(schema) = provider.get_schema_by_name(schema_name, head)?
         && let Some(table) = provider.get_table_by_name(schema.schema_id, table_name, head)?
     {
+        exists = true;
         let existing = provider.get_table_fields(table.table_id, head)?;
         if !options.allow_schema_evolution
             && field_signature(&existing) != field_signature(&manifest.fields)
@@ -455,10 +505,22 @@ async fn prepare(
         live_spec = provider.get_partition_spec(table.table_id, head)?;
     }
     let kept_spec = match (&live_spec, &manifest.partition_spec) {
+        _ if options.create_partitioned => None,
         (Some(live), Some(exported)) if partition_keys(live) == partition_keys(exported) => {
             Some((live.clone(), exported.partition_id))
         },
         _ => None,
+    };
+    let created_specs = if options.create_partitioned {
+        if exists {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "create_partitioned: table {schema_name}.{table_name} exists; the import sets \
+                 partition specs only on a table it creates"
+            )));
+        }
+        Some(created_partition_specs(manifest)?)
+    } else {
+        None
     };
 
     let (catalog_store, _) = parse_object_store_url(data_path)?;
@@ -481,15 +543,35 @@ async fn prepare(
         }
         let file_checked =
             check_file(store, file, key, &manifest.fields, &table_ids, &retired_ids).await?;
-        if let Some((spec, exported_id)) = &kept_spec
-            && file.partition_id == Some(*exported_id)
-        {
-            verify_partition_values(
+        let spec = match (&created_specs, &kept_spec) {
+            (Some(specs), _) => match file.partition_id {
+                // `created_partition_specs` checked every file names one of them.
+                Some(id) => specs.get(&id),
+                None if file.partition_values.is_empty() => None,
+                None => {
+                    return Err(ImportError::UnverifiedPartitionValue {
+                        path: file.path.clone(),
+                        column_id: 0,
+                        reason: "the file has partition values and no partition spec".to_string(),
+                    }
+                    .into());
+                },
+            },
+            (None, Some((spec, exported_id))) if file.partition_id == Some(*exported_id) => {
+                Some(spec)
+            },
+            _ => None,
+        };
+        if let Some(spec) = spec {
+            let buckets = verify_partition_values(
                 &file.path,
                 spec,
                 &file.partition_values,
                 &file_checked.facts,
             )?;
+            for bucket in buckets {
+                verify_bucket_value(store, file, &file_checked, &bucket).await?;
+            }
         }
         checked.push(file_checked);
     }
@@ -701,7 +783,7 @@ async fn check_file(
         .filter(|stat| table_ids.contains(&stat.column_id) && stat_ids.insert(stat.column_id))
         .collect();
 
-    let mut info = DataFileInfo::new(key, file.file_size_bytes, file.record_count)
+    let mut info = DataFileInfo::new(key.clone(), file.file_size_bytes, file.record_count)
         // The length measured, whatever the manifest says: DuckDB refuses a
         // file whose stored footer length differs from the file's own.
         .with_footer_size(footer_size)
@@ -709,6 +791,8 @@ async fn check_file(
     info.path_is_relative = false;
     Ok(CheckedFile {
         info,
+        key,
+        metadata,
         facts,
         name_mapping,
         deleted_positions: file.deleted_positions.clone(),
@@ -1060,6 +1144,8 @@ struct ColumnFacts {
     null_count: Option<u64>,
     /// The file's rows.
     rows: u64,
+    /// The column's index among the file's top-level columns.
+    root: usize,
 }
 
 /// [`ColumnFacts`] of each top-level scalar column the file binds, by column id.
@@ -1142,6 +1228,7 @@ fn column_facts(
                 bounds,
                 null_count: null_count(metadata, leaf),
                 rows,
+                root,
             },
         );
     }
@@ -1150,15 +1237,32 @@ fn column_facts(
 
 /// Refuse a partition value the file's footer does not show to be the file's:
 /// see the module docs.
+///
+/// Returns the `bucket` values, which only the file's rows show: the caller
+/// verifies each with [`verify_bucket_value`].
 fn verify_partition_values(
     path: &str,
     spec: &crate::partition::PartitionSpec,
     values: &[(i32, Option<String>)],
     facts: &HashMap<i64, ColumnFacts>,
-) -> Result<()> {
+) -> Result<Vec<BucketCheck>> {
     use crate::partition::PartitionTransform;
+    let mut buckets = Vec::new();
+    if let Some((index, _)) = values.iter().find(|(index, _)| {
+        !spec
+            .columns
+            .iter()
+            .any(|column| column.partition_key_index == *index)
+    }) {
+        return Err(ImportError::UnverifiedPartitionValue {
+            path: path.to_string(),
+            column_id: 0,
+            reason: format!("a value for partition key {index}, which the spec does not have"),
+        }
+        .into());
+    }
     for column in &spec.columns {
-        let refuse = |reason: String| -> Result<()> {
+        let refuse = |reason: String| -> Result<Vec<BucketCheck>> {
             Err(ImportError::UnverifiedPartitionValue {
                 path: path.to_string(),
                 column_id: column.column_id,
@@ -1187,6 +1291,20 @@ fn verify_partition_values(
                 "{value}, but the file holds NULLs (or records no null count)"
             ));
         }
+        if let PartitionTransform::Bucket(n) = &column.transform {
+            match value.trim().parse::<i64>() {
+                Ok(bucket) if bucket >= 0 && bucket < i64::from(*n) => {
+                    buckets.push(BucketCheck {
+                        column_id: column.column_id,
+                        root: fact.root,
+                        buckets: *n,
+                        value: bucket,
+                    });
+                    continue;
+                },
+                _ => return refuse(format!("{value} is not a bucket of bucket({n})")),
+            }
+        }
         let Some((min, max)) = &fact.bounds else {
             return refuse("the file records no exact minimum and maximum".to_string());
         };
@@ -1199,27 +1317,58 @@ fn verify_partition_values(
                     ));
                 }
             },
-            PartitionTransform::Year => {
-                let year_of = |v: &ScalarValue| -> Option<i32> {
-                    use chrono::Datelike;
-                    match v {
-                        ScalarValue::Date32(Some(days)) => {
-                            chrono::DateTime::from_timestamp(i64::from(*days) * 86_400, 0)
-                                .map(|d| d.year())
-                        },
-                        ScalarValue::TimestampMicrosecond(Some(us), None) => {
-                            chrono::DateTime::from_timestamp_micros(*us).map(|d| d.year())
-                        },
-                        _ => None,
-                    }
+            PartitionTransform::Year
+            | PartitionTransform::Month
+            | PartitionTransform::Day
+            | PartitionTransform::Hour => {
+                // The calendar parts DuckDB's `year`/`month`/`day`/`hour` give, down to
+                // the transform's: when the minimum and the maximum share every part
+                // down to it, so does every value between them, and the value is the
+                // last of those parts. A `month` value alone does not bound a file (a
+                // file of every June), so both ends must also share the year.
+                let depth = match &column.transform {
+                    PartitionTransform::Year => 1,
+                    PartitionTransform::Month => 2,
+                    PartitionTransform::Day => 3,
+                    _ => 4,
                 };
-                let year: Option<i32> = value.trim().parse().ok();
-                if year.is_none() || year_of(min) != year || year_of(max) != year {
+                let parts = |v: &ScalarValue| -> Option<Vec<i64>> {
+                    use chrono::{Datelike, Timelike};
+                    let (at, has_time) = match v {
+                        ScalarValue::Date32(Some(days)) => (
+                            chrono::DateTime::from_timestamp(i64::from(*days) * 86_400, 0)?,
+                            false,
+                        ),
+                        ScalarValue::TimestampMicrosecond(Some(us), None) => {
+                            (chrono::DateTime::from_timestamp_micros(*us)?, true)
+                        },
+                        _ => return None,
+                    };
+                    if depth == 4 && !has_time {
+                        return None;
+                    }
+                    let all = [
+                        i64::from(at.year()),
+                        i64::from(at.month()),
+                        i64::from(at.day()),
+                        i64::from(at.hour()),
+                    ];
+                    Some(all[..depth].to_vec())
+                };
+                let wanted: Option<i64> = value.trim().parse().ok();
+                let (low, high) = (parts(min), parts(max));
+                if wanted.is_none()
+                    || low.is_none()
+                    || low != high
+                    || low.as_ref().and_then(|p| p.last().copied()) != wanted
+                {
                     return refuse(format!(
-                        "year {value}, but the file's values run from {min} to {max}"
+                        "{} {value}, but the file's values run from {min} to {max}",
+                        column.transform.to_catalog_string()
                     ));
                 }
             },
+            PartitionTransform::Bucket(_) => {},
             other => {
                 return refuse(format!(
                     "a `{}` value cannot be verified from the file's footer",
@@ -1228,7 +1377,225 @@ fn verify_partition_values(
             },
         }
     }
+    Ok(buckets)
+}
+
+/// A `bucket` partition value of a file, which only its rows show.
+struct BucketCheck {
+    column_id: i64,
+    /// The column's index among the file's top-level columns.
+    root: usize,
+    buckets: u32,
+    value: i64,
+}
+
+/// Read the column `check` names from the file and refuse the value unless every
+/// row hashes to it ([`crate::partition::bucket_of`], official DuckLake's and the
+/// Iceberg spec's hash). The file's NULLs were refused by
+/// [`verify_partition_values`], which also left a NULL value out of `check`.
+async fn verify_bucket_value(
+    store: &Arc<dyn ObjectStore>,
+    file: &ManifestDataFile,
+    checked: &CheckedFile,
+    check: &BucketCheck,
+) -> Result<()> {
+    use futures::TryStreamExt as _;
+    use parquet::arrow::ProjectionMask;
+    use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+    let refuse = |reason: String| -> DuckLakeError {
+        ImportError::UnverifiedPartitionValue {
+            path: file.path.clone(),
+            column_id: check.column_id,
+            reason,
+        }
+        .into()
+    };
+    let size = u64::try_from(file.file_size_bytes).map_err(|_| refuse("a negative size".into()))?;
+    let reader = FooterKnownReader {
+        store: Arc::clone(store),
+        path: ObjectPath::from(checked.key.trim_start_matches('/')),
+        size,
+        metadata: Arc::clone(&checked.metadata),
+    };
+    // A failure to read the column is a value the import cannot verify, not a failed import:
+    // a caller may then import the files unpartitioned.
+    let unreadable = |e: &dyn std::fmt::Display| refuse(format!("reading the column: {e}"));
+    let metadata =
+        ArrowReaderMetadata::try_new(Arc::clone(&checked.metadata), ArrowReaderOptions::new())
+            .map_err(|e| unreadable(&e))?;
+    let mask = ProjectionMask::roots(
+        checked.metadata.file_metadata().schema_descr(),
+        [check.root],
+    );
+    let mut batches = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata)
+        .with_projection(mask)
+        .build()
+        .map_err(|e| unreadable(&e))?;
+    while let Some(batch) = batches.try_next().await.map_err(|e| unreadable(&e))? {
+        let column = batch.column(0);
+        for row in 0..column.len() {
+            let value =
+                ScalarValue::try_from_array(column.as_ref(), row).map_err(|e| unreadable(&e))?;
+            match crate::partition::bucket_of(&value, check.buckets) {
+                Some(bucket) if bucket == check.value => {},
+                Some(bucket) => {
+                    return Err(refuse(format!(
+                        "bucket {}, but row {row} of a batch holds {value}, of bucket {bucket}",
+                        check.value
+                    )));
+                },
+                None => {
+                    return Err(refuse(format!(
+                        "the file holds the column as {}, whose bucket official DuckLake does \
+                         not hash as Iceberg does (or a NULL)",
+                        column.data_type()
+                    )));
+                },
+            }
+        }
+    }
     Ok(())
+}
+
+/// A Parquet object whose footer has been read: ranges come from the store, the
+/// metadata from the footer already decoded.
+struct FooterKnownReader {
+    store: Arc<dyn ObjectStore>,
+    path: ObjectPath,
+    size: u64,
+    metadata: Arc<ParquetMetaData>,
+}
+
+impl parquet::arrow::async_reader::AsyncFileReader for FooterKnownReader {
+    fn get_bytes(
+        &mut self,
+        range: std::ops::Range<u64>,
+    ) -> futures::future::BoxFuture<'_, parquet::errors::Result<bytes::Bytes>> {
+        use futures::FutureExt as _;
+        async move {
+            if range.end > self.size {
+                return Err(parquet::errors::ParquetError::EOF(format!(
+                    "range {range:?} past the object's {} bytes",
+                    self.size
+                )));
+            }
+            self.store
+                .get_range(&self.path, range)
+                .await
+                .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))
+        }
+        .boxed()
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        _options: Option<&'a ArrowReaderOptions>,
+    ) -> futures::future::BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+        use futures::FutureExt as _;
+        let metadata = Arc::clone(&self.metadata);
+        async move { Ok(metadata) }.boxed()
+    }
+}
+
+/// The specs an import with [`ImportOptions::create_partitioned`] gives the
+/// table, by the manifest's `partition_id`, checked: each key a top-level column
+/// of the manifest, in key order from 0, under a transform official DuckLake
+/// implements; distinct ids; and every file of one of them, or of none.
+///
+/// Refused besides: a live spec with a `bucket` key when a file holds rows under
+/// another spec, or none. Official DuckLake (DuckDB 1.5.6) prunes an equality on
+/// a bucket key by every file's partition value at that key's index, whatever
+/// spec the file is of, so it would drop such a file (it does so after its own
+/// `SET PARTITIONED BY (bucket(…))` over unpartitioned files).
+fn created_partition_specs(
+    manifest: &TableManifest,
+) -> Result<HashMap<i64, crate::partition::PartitionSpec>> {
+    use crate::partition::PartitionTransform;
+    let top_level: HashSet<i64> = manifest
+        .fields
+        .iter()
+        .filter(|field| field.parent_column.is_none())
+        .map(|field| field.column_id)
+        .collect();
+    let mut specs = HashMap::new();
+    for spec in manifest
+        .retired_partition_specs
+        .iter()
+        .chain(manifest.partition_spec.iter())
+    {
+        let refuse = |reason: String| -> DuckLakeError {
+            ImportError::UnsupportedPartitioning {
+                partition_id: spec.partition_id,
+                reason,
+            }
+            .into()
+        };
+        if spec.columns.is_empty() {
+            return Err(refuse("it has no key".to_string()));
+        }
+        for (index, column) in spec.columns.iter().enumerate() {
+            if i64::from(column.partition_key_index) != index as i64 {
+                return Err(refuse(format!(
+                    "key {} is at position {index}; keys run from 0 in order",
+                    column.partition_key_index
+                )));
+            }
+            if !top_level.contains(&column.column_id) {
+                return Err(refuse(format!(
+                    "key {index} is of column {}, which is no top-level column of the table",
+                    column.column_id
+                )));
+            }
+            match &column.transform {
+                PartitionTransform::Bucket(0) | PartitionTransform::Unknown(_) => {
+                    return Err(refuse(format!(
+                        "key {index}'s transform `{}` is not one official DuckLake implements",
+                        column.transform.to_catalog_string()
+                    )));
+                },
+                _ => {},
+            }
+        }
+        if specs.insert(spec.partition_id, spec.clone()).is_some() {
+            return Err(refuse("it is listed twice".to_string()));
+        }
+    }
+    for file in &manifest.files {
+        if let Some(id) = file.partition_id
+            && !specs.contains_key(&id)
+        {
+            return Err(ImportError::UnsupportedPartitioning {
+                partition_id: id,
+                reason: format!(
+                    "file {} is of it, and the manifest has no such spec",
+                    file.path
+                ),
+            }
+            .into());
+        }
+    }
+    if let Some(live) = &manifest.partition_spec
+        && live
+            .columns
+            .iter()
+            .any(|column| matches!(column.transform, PartitionTransform::Bucket(_)))
+        && let Some(other) = manifest
+            .files
+            .iter()
+            .find(|file| file.record_count > 0 && file.partition_id != Some(live.partition_id))
+    {
+        return Err(ImportError::UnsupportedPartitioning {
+            partition_id: live.partition_id,
+            reason: format!(
+                "it has a bucket key and file {} holds rows of another spec (or of none): \
+                 official DuckLake (DuckDB 1.5.6) prunes an equality on a bucket key by every \
+                 file's value at the key's index, whatever its spec, and would drop the file",
+                other.path
+            ),
+        }
+        .into());
+    }
+    Ok(specs)
 }
 
 /// The footer of the Parquet object `key`, `size` bytes long, and the length
@@ -2253,6 +2620,286 @@ mod tests {
         .await;
         assert_eq!(kept.len(), 1, "{kept:?}");
         assert_eq!(kept[0].1.as_deref(), Some("4"));
+    }
+
+    // ---- Partition specs set by the import (ferrion#769) ----------------------------------
+
+    /// A file of columns `id` (field id 1, int32), `part` (2, int32) and `d` (3, date).
+    fn partitioned_file(
+        dir: &std::path::Path,
+        name: &str,
+        ids: Vec<i32>,
+        part: i32,
+        days: Vec<i32>,
+    ) -> ManifestDataFile {
+        use arrow::array::Date32Array;
+        let path = dir.join(name);
+        let rows = ids.len() as i64;
+        let schema = Arc::new(Schema::new(vec![
+            with_id("id", DataType::Int32, 1),
+            with_id("part", DataType::Int32, 2),
+            with_id("d", DataType::Date32, 3),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(vec![part; rows as usize])),
+                Arc::new(Date32Array::from(days)),
+            ],
+        )
+        .unwrap();
+        let size = write_batch(&path, &batch);
+        file_at(&path, size, rows)
+    }
+
+    fn spec_of(
+        partition_id: i64,
+        keys: &[(i64, crate::partition::PartitionTransform)],
+    ) -> crate::partition::PartitionSpec {
+        crate::partition::PartitionSpec {
+            partition_id,
+            columns: keys
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, (column_id, transform))| crate::partition::PartitionSpecColumn {
+                        partition_key_index: index as i32,
+                        column_id: *column_id,
+                        transform: transform.clone(),
+                    },
+                )
+                .collect(),
+            prune_safe: false,
+        }
+    }
+
+    fn partitioned_fields() -> Vec<DuckLakeTableField> {
+        vec![field(1, "id", "int32"), field(2, "part", "int32"), field(3, "d", "date")]
+    }
+
+    /// An evolved table: an identity spec, then `year`/`month`, the import sets
+    /// both in its own commit (the older one never live), and each file keeps its
+    /// own spec's values, a file of no spec none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_import_sets_every_partition_spec_in_its_commit() {
+        use crate::partition::PartitionTransform::{Identity, Month, Year};
+        let dir = tempfile::tempdir().unwrap();
+        let url = target(dir.path()).await;
+        // 2023-06-01 = 19509, 2023-06-30 = 19538, 2024-01-02 = 19724.
+        let plain = partitioned_file(dir.path(), "plain.parquet", vec![1], 0, vec![19_000]);
+        let old = partitioned_file(
+            dir.path(),
+            "old.parquet",
+            vec![2, 3],
+            7,
+            vec![19_509, 19_724],
+        )
+        .with_partition(Some(10), vec![(0, Some("7".into()))]);
+        let june = partitioned_file(
+            dir.path(),
+            "june.parquet",
+            vec![4, 5],
+            8,
+            vec![19_509, 19_538],
+        )
+        .with_partition(
+            Some(11),
+            vec![(0, Some("2023".into())), (1, Some("6".into()))],
+        );
+        let manifest = TableManifest::new(
+            1,
+            1,
+            partitioned_fields(),
+            Some(spec_of(11, &[(3, Year), (3, Month)])),
+            vec![plain, old, june],
+        )
+        .with_retired_partition_specs(vec![spec_of(10, &[(2, Identity)])]);
+        let options = ImportOptions::default().with_create_partitioned(true);
+        let imported = import_with(&url, &manifest, &options).await.unwrap();
+        let snapshot = imported.snapshot_id;
+
+        let generations = catalog_rows(
+            &url,
+            "SELECT partition_id, CAST(begin_snapshot AS TEXT), CAST(end_snapshot AS TEXT), NULL
+             FROM ducklake_partition_info ORDER BY partition_id",
+        )
+        .await;
+        assert_eq!(generations.len(), 2, "{generations:?}");
+        let (old_id, new_id) = (generations[0].0, generations[1].0);
+        assert_eq!(generations[0].1, Some(snapshot.to_string()));
+        assert_eq!(
+            generations[0].2,
+            Some(snapshot.to_string()),
+            "the older spec is never live"
+        );
+        assert_eq!(generations[1].2, None, "the newer spec is live");
+        let keys = catalog_rows(
+            &url,
+            "SELECT partition_id, CAST(partition_key_index AS TEXT) || ':' || CAST(column_id AS TEXT),
+                    transform, NULL
+             FROM ducklake_partition_column ORDER BY partition_id, partition_key_index",
+        )
+        .await;
+        assert_eq!(
+            keys,
+            vec![
+                (old_id, Some("0:2".into()), Some("identity".into()), None),
+                (new_id, Some("0:3".into()), Some("year".into()), None),
+                (new_id, Some("1:3".into()), Some("month".into()), None),
+            ]
+        );
+        let files = catalog_rows(
+            &url,
+            "SELECT record_count, path, NULL, partition_id FROM ducklake_data_file
+             ORDER BY data_file_id",
+        )
+        .await;
+        let ids: Vec<Option<i64>> = files.iter().map(|f| f.3).collect();
+        assert_eq!(ids, vec![None, Some(old_id), Some(new_id)], "{files:?}");
+        let values = catalog_rows(
+            &url,
+            "SELECT partition_key_index, partition_value, NULL, NULL
+             FROM ducklake_file_partition_value ORDER BY data_file_id, partition_key_index",
+        )
+        .await;
+        let values: Vec<Option<String>> = values.into_iter().map(|v| v.1).collect();
+        assert_eq!(
+            values,
+            vec![Some("7".into()), Some("2023".into()), Some("6".into())]
+        );
+        assert_eq!(rows(&url).await.len(), 5);
+        assert_eq!(
+            sql(
+                &url,
+                "SELECT id FROM lake.main.t WHERE part = 8 ORDER BY id"
+            )
+            .await,
+            vec![vec![Some("4".into())], vec![Some("5".into())]]
+        );
+
+        // Into the table that now exists, it is refused.
+        let again = import_with(&url, &manifest, &options).await;
+        assert!(
+            matches!(again, Err(DuckLakeError::InvalidConfig(_))),
+            "{again:?}"
+        );
+    }
+
+    /// A `month` value names one calendar month of one year; `day` one day; an
+    /// `hour` key on a date and a value of a file spanning two Junes are refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn temporal_partition_values_are_held_to_the_file() {
+        use crate::partition::PartitionTransform::{Day, Hour, Month};
+        let dir = tempfile::tempdir().unwrap();
+        // 2023-06-01 = 19509, 2024-06-01 = 19875.
+        let cases = [
+            ("two_junes", vec![19_509, 19_875], Month, "6", false),
+            ("one_june", vec![19_509, 19_510], Month, "6", true),
+            ("wrong_month", vec![19_509, 19_510], Month, "7", false),
+            ("one_day", vec![19_509, 19_509], Day, "1", true),
+            ("two_days", vec![19_509, 19_510], Day, "1", false),
+            ("hour_of_a_date", vec![19_509, 19_509], Hour, "0", false),
+        ];
+        for (name, days, transform, value, ok) in cases {
+            let sub = dir.path().join(name);
+            std::fs::create_dir_all(&sub).unwrap();
+            let url = target(&sub).await;
+            let file = partitioned_file(&sub, "f.parquet", vec![1, 2], 0, days)
+                .with_partition(Some(1), vec![(0, Some(value.into()))]);
+            let manifest = TableManifest::new(
+                1,
+                1,
+                partitioned_fields(),
+                Some(spec_of(1, &[(3, transform)])),
+                vec![file],
+            );
+            let result = import_with(
+                &url,
+                &manifest,
+                &ImportOptions::default().with_create_partitioned(true),
+            )
+            .await;
+            if ok {
+                result.unwrap();
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(DuckLakeError::Import(
+                            ImportError::UnverifiedPartitionValue { .. }
+                        ))
+                    ),
+                    "{name}: {result:?}"
+                );
+            }
+        }
+    }
+
+    /// A `bucket` value is checked against every row's hash; a live bucket spec
+    /// over a file of no spec is refused, as official DuckLake would prune it away.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bucket_values_are_hashed_and_a_bucket_spec_needs_every_file() {
+        use crate::partition::PartitionTransform::Bucket;
+        use crate::partition::bucket_of;
+        use datafusion::common::ScalarValue;
+        let dir = tempfile::tempdir().unwrap();
+        // Ids of one bucket of 4, and one of another.
+        let of = |id: i32| bucket_of(&ScalarValue::Int32(Some(id)), 4).unwrap();
+        let first = (0..100).find(|id| of(*id) == of(0) && *id != 0).unwrap();
+        let other = (0..100).find(|id| of(*id) != of(0)).unwrap();
+        let cases = [
+            ("same", vec![0, first], of(0), true, true),
+            ("mixed", vec![0, other], of(0), true, false),
+            ("wrong", vec![0, first], (of(0) + 1) % 4, true, false),
+            ("unpartitioned_file", vec![0, first], of(0), false, false),
+        ];
+        for (name, ids, value, all_bucketed, ok) in cases {
+            let sub = dir.path().join(name);
+            std::fs::create_dir_all(&sub).unwrap();
+            let url = target(&sub).await;
+            let mut files = vec![
+                partitioned_file(&sub, "f.parquet", ids, 0, vec![1, 1])
+                    .with_partition(Some(1), vec![(0, Some(value.to_string()))]),
+            ];
+            let extra = partitioned_file(&sub, "g.parquet", vec![other], 0, vec![1]);
+            files.push(if all_bucketed {
+                extra.with_partition(Some(1), vec![(0, Some(of(other).to_string()))])
+            } else {
+                extra
+            });
+            let manifest = TableManifest::new(
+                1,
+                1,
+                partitioned_fields(),
+                Some(spec_of(1, &[(1, Bucket(4))])),
+                files,
+            );
+            let result = import_with(
+                &url,
+                &manifest,
+                &ImportOptions::default().with_create_partitioned(true),
+            )
+            .await;
+            match (ok, &result) {
+                (true, Ok(_)) => {
+                    assert_eq!(rows(&url).await.len(), 3);
+                },
+                (
+                    false,
+                    Err(DuckLakeError::Import(ImportError::UnverifiedPartitionValue {
+                        ..
+                    })),
+                ) if all_bucketed => {},
+                (
+                    false,
+                    Err(DuckLakeError::Import(ImportError::UnsupportedPartitioning {
+                        ..
+                    })),
+                ) if !all_bucketed => {},
+                _ => panic!("{name}: {result:?}"),
+            }
+        }
     }
 
     // ---- Review round 2 ---------------------------------------------------------------------

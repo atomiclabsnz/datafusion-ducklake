@@ -24,13 +24,14 @@ use crate::maintenance::{
 use crate::metadata_provider::{InlinedSystemColumns, TagObjectType, TagTarget};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
-    ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, ImportedFile, InlinedRowRef,
-    MetadataWriter, MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite,
-    WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
-    catalog_column_type_requires_migration, catalog_columns_differ, encode_inlined_index_columns,
-    inlined_delete_groups, live_inlined_index_columns, parse_inlined_index_columns,
-    snapshot_has_change, staged_table_write_changes, table_storage_changes, table_write_changes,
-    top_level_column_ids, validate_delete_entries, validate_inlined_index_columns, validate_name,
+    ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, ImportedFile, ImportedPartitioning,
+    InlinedRowRef, MetadataWriter, MultiTableCommit, SnapshotCommitMetadata, StagedTableData,
+    StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs,
+    catalog_column_type_equal, catalog_column_type_requires_migration, catalog_columns_differ,
+    encode_inlined_index_columns, inlined_delete_groups, live_inlined_index_columns,
+    parse_inlined_index_columns, snapshot_has_change, staged_table_write_changes,
+    table_storage_changes, table_write_changes, top_level_column_ids, validate_delete_entries,
+    validate_inlined_index_columns, validate_name,
 };
 use crate::metadata_writer::{
     DroppedDataFile, InlinedFileDelete, InlinedFlushFileDelete, SQL_GLOBAL_INLINING_COLUMNS,
@@ -6241,6 +6242,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         columns: &[ColumnDef],
         column_ids: &[i64],
         retired: &[crate::metadata_provider::DuckLakeTableField],
+        partitioning: Option<&ImportedPartitioning>,
     ) -> Result<CommitIds> {
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
@@ -6358,6 +6360,90 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
             }
+            // The table's partition specs, set in this commit: only on a table it
+            // creates, so no other writer's spec or file can be in it.
+            let mut remapped: Option<Vec<ImportedFile>> = None;
+            if let Some(partitioning) = partitioning {
+                let created: Option<i64> = sqlx::query_scalar(
+                    "SELECT begin_snapshot FROM ducklake_table
+                     WHERE table_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(table_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if created != Some(snapshot_id) {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "table {schema_name}.{table_name} was created by another writer while \
+                         this import, which creates it partitioned, was planned; retry"
+                    )));
+                }
+                let mut ids: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+                let specs = partitioning
+                    .retired
+                    .iter()
+                    .map(|spec| (spec, Some(snapshot_id)))
+                    .chain(partitioning.live.iter().map(|spec| (spec, None)));
+                for (spec, end_snapshot) in specs {
+                    let partition_id = match next_catalog_id(&mut tx).await? {
+                        Some(id) => id,
+                        None => reserve_ids(&mut tx, "next_partition_id", 1).await?,
+                    };
+                    if ids.insert(spec.partition_id, partition_id).is_some() {
+                        return Err(crate::DuckLakeError::InvalidConfig(format!(
+                            "partition spec {} is listed twice",
+                            spec.partition_id
+                        )));
+                    }
+                    sqlx::query(
+                        "INSERT INTO ducklake_partition_info
+                             (partition_id, table_id, begin_snapshot, end_snapshot)
+                         VALUES (?, ?, ?, ?)",
+                    )
+                    .bind(partition_id)
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(end_snapshot)
+                    .execute(&mut *tx)
+                    .await?;
+                    for column in &spec.columns {
+                        sqlx::query(
+                            "INSERT INTO ducklake_partition_column
+                                 (partition_id, table_id, partition_key_index, column_id,
+                                  transform)
+                             VALUES (?, ?, ?, ?, ?)",
+                        )
+                        .bind(partition_id)
+                        .bind(table_id)
+                        .bind(i64::from(column.partition_key_index))
+                        .bind(column.column_id)
+                        .bind(column.transform.to_catalog_string())
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+                let mut stamped = Vec::with_capacity(files.len());
+                for imported in files {
+                    let mut imported = imported.clone();
+                    if let Some(manifest_id) = imported.file.partition_id {
+                        let Some(id) = ids.get(&manifest_id) else {
+                            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                                "file {} is of partition spec {manifest_id}, which the import \
+                                 does not set",
+                                imported.file.path
+                            )));
+                        };
+                        imported.file.partition_id = Some(*id);
+                    } else if !imported.file.partition_values.is_empty() {
+                        return Err(crate::DuckLakeError::InvalidConfig(format!(
+                            "file {} has partition values and no partition spec",
+                            imported.file.path
+                        )));
+                    }
+                    stamped.push(imported);
+                }
+                remapped = Some(stamped);
+            }
+            let files: &[ImportedFile] = remapped.as_deref().unwrap_or(files);
             let live_partition_id: Option<i64> = sqlx::query_scalar(
                 "SELECT partition_id FROM ducklake_partition_info
                  WHERE table_id = ? AND end_snapshot IS NULL",
@@ -6366,11 +6452,15 @@ impl MetadataWriter for SqliteMetadataWriter {
             .fetch_optional(&mut *tx)
             .await?;
             for imported in files {
-                crate::metadata_writer::enforce_partition_fence(
-                    table_id,
-                    live_partition_id,
-                    &imported.file,
-                )?;
+                // Files of the generations set above may be of any of them, or of
+                // none (written before the table was partitioned).
+                if partitioning.is_none() {
+                    crate::metadata_writer::enforce_partition_fence(
+                        table_id,
+                        live_partition_id,
+                        &imported.file,
+                    )?;
+                }
                 let duplicate: bool = sqlx::query_scalar(
                     "SELECT EXISTS(
                          SELECT 1 FROM ducklake_data_file
