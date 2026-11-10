@@ -12,8 +12,14 @@
 //! manager, then into the session, laid out as the in-memory sort laid them out.
 //! A write of at most that many rows is still decided whole, as before.
 //!
-//! A partitioned table still collects the input first: the rows are split as a
-//! whole.
+//! A partitioned table holds its input as the collected path holds it, and
+//! writes it there (split as a whole) wherever the pool takes it. Past the pool,
+//! where the runtime can spill, the rows go through the same spilling sort keyed
+//! first by their partition (in the order the input first shows the partitions,
+//! as the split orders them), then by the writer's sort keys if it sorts, then by
+//! arrival: each partition's rows come together, so the session writes one
+//! partition's file at a time (`max_open_partitions` 1) and holds one open file
+//! however many partitions the write has.
 //!
 //! Single partition only (partition 0).
 
@@ -336,6 +342,15 @@ impl ExecutionPlan for DuckLakeInsertExec {
             },
             _ => None,
         };
+        // A partitioned table whose rows' order is known (as for `streams`) or
+        // the writer's to sort: past the pool, sorted by partition first.
+        let partitioned = match (&partition, &self.planned_writer_sort) {
+            (Some(spec), _) if unsorted => Some((spec.clone(), None)),
+            (Some(spec), Some(WriterSort::Sorted(sort))) => {
+                Some((spec.clone(), Some(sort.clone())))
+            },
+            _ => None,
+        };
         let sorts = self.sorts.clone();
         // What the collected path holds: the input, and for a split or a sort
         // a second copy of it.
@@ -350,17 +365,23 @@ impl ExecutionPlan for DuckLakeInsertExec {
             // An encrypted catalog takes no Parquet this crate writes, so its
             // insert is decided on the whole input (inlined, or refused): a
             // session would refuse it at its start, rows it could inline too.
-            let encrypted = (streams || streamed_sort.is_some())
+            let encrypted = (streams || streamed_sort.is_some() || partitioned.is_some())
                 && writer
                     .catalog_encrypted()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
             let streams = streams && !encrypted;
             let streamed_sort = streamed_sort.filter(|_| !encrypted);
+            let partitioned = partitioned.filter(|_| !encrypted);
             let mut input_stream = input.execute(0, Arc::clone(&context))?;
             let mut collected =
                 datafusion::execution::memory_pool::MemoryConsumer::new("DuckLakeInsertExec")
                     .register(context.memory_pool());
-            let batches: Vec<RecordBatch> = if let Some(spec) = streamed_sort {
+            let by_writer = match (streamed_sort, partitioned) {
+                (Some(spec), _) => Some((None, Some(spec))),
+                (None, Some((partition, spec))) => Some((Some(partition), spec)),
+                (None, None) => None,
+            };
+            let batches: Vec<RecordBatch> = if let Some((partition, spec)) = by_writer {
                 let target = StreamedInsert {
                     writer: Arc::clone(&writer),
                     object_store: context
@@ -372,11 +393,13 @@ impl ExecutionPlan for DuckLakeInsertExec {
                     table_name: &table_name,
                     arrow_schema: &arrow_schema,
                     write_mode,
+                    partition: partition.clone(),
+                    plan_sorted: sort_plan.sorted,
                 };
                 // Boxed, as the streamed path's future is.
                 match Box::pin(insert_sorted(
                     target,
-                    &spec,
+                    spec.as_ref(),
                     input_stream,
                     &mut collected,
                     copies,
@@ -438,6 +461,8 @@ impl ExecutionPlan for DuckLakeInsertExec {
                                 table_name: &table_name,
                                 arrow_schema: &arrow_schema,
                                 write_mode,
+                                partition: None,
+                                plan_sorted: sort_plan.sorted,
                             },
                             first,
                             input_stream,
@@ -596,6 +621,14 @@ struct StreamedInsert<'a> {
     table_name: &'a str,
     arrow_schema: &'a SchemaRef,
     write_mode: WriteMode,
+    /// The partition spec the write was planned against: its rows are split by
+    /// it, one partition's file open at a time (they come grouped by
+    /// partition), and a spec changed since is refused. `None` for a table
+    /// planned unpartitioned, which refuses one gone live since.
+    partition: Option<PartitionWriteSpec>,
+    /// Whether the rows come from the plan's sort, whose batches each draw
+    /// their strings from all of its input's buffers.
+    plan_sorted: bool,
 }
 
 /// What [`insert_sorted`] did with an insert's rows.
@@ -607,7 +640,8 @@ enum Sorted {
     Held(Vec<RecordBatch>),
 }
 
-/// An insert whose rows the writer sorts by `spec`. Its input is held and
+/// An insert whose rows the writer sorts by `spec`, or (with `target.partition`)
+/// groups by partition and then sorts by `spec` if given. Its input is held and
 /// charged to `held` (`copies` times its size) exactly as the collected path
 /// holds it, and a write whose input that pool takes is returned
 /// [`Sorted::Held`], for the collected path to write: in memory, inlined or
@@ -625,12 +659,16 @@ enum Sorted {
 /// row ([`reserve_headroom`]). With nothing to spill to the refusal stands, as
 /// before.
 ///
+/// A partitioned insert goes past the collected path only once more rows are
+/// held than the table inlines: a write the collected path could inline is
+/// decided whole by it, so one it cannot hold is refused, as before.
+///
 /// A failure of the sort (the pool, the spill budget, the input) before its
 /// first row leaves no session; after it, the session is aborted
 /// ([`stream_into`]): no catalog row either way, and its uploads removed.
 async fn insert_sorted(
     target: StreamedInsert<'_>,
-    spec: &crate::sort::SortSpec,
+    spec: Option<&crate::sort::SortSpec>,
     mut input: SendableRecordBatchStream,
     held: &mut datafusion::execution::memory_pool::MemoryReservation,
     copies: usize,
@@ -648,7 +686,7 @@ async fn insert_sorted(
     );
     let mut batches = Vec::new();
     let mut rows = 0usize;
-    loop {
+    let refusal = loop {
         let Some(batch) = input.next().await else {
             return Ok(Sorted::Held(batches));
         };
@@ -660,9 +698,21 @@ async fn insert_sorted(
             if !context.runtime_env().disk_manager.tmp_files_enabled() {
                 return Err(refusal);
             }
-            break;
+            break refusal;
+        }
+    };
+    if target.partition.is_some() {
+        let limit =
+            DuckLakeTableWriter::new(Arc::clone(&target.writer), Arc::clone(&target.object_store))
+                .map_err(external)?
+                .with_options(target.write_options)
+                .table_data_inlining_row_limit(target.schema_name, target.table_name)
+                .map_err(external)?;
+        if rows <= limit {
+            return Err(refusal);
         }
     }
+    drop(refusal);
     // Past what the collected path holds, with a disk manager: the spilling
     // sort. Room for the session beside it ([`session_headroom`]), held until
     // its first row: without it the sort's spill merge takes what the pool
@@ -680,8 +730,35 @@ async fn insert_sorted(
             stream::iter(batches.into_iter().map(Ok)).chain(input),
         ),
     );
-    let keys = crate::sort::sort_exprs(spec, &schema_without_metadata).map_err(external)?;
-    let mut sorted = crate::insert_sort::sort_stream(rest, keys, Arc::clone(context), sorts)?;
+    // A second sort over the plan's charges each batch it holds what the
+    // batch's views reach (all of the first sort's buffers): copied out, each
+    // is charged its own rows (`write_encoding::compact_views`).
+    let rest: SendableRecordBatchStream = if target.plan_sorted {
+        Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                rest.map(|batch| {
+                    batch.and_then(|batch| {
+                        crate::write_encoding::compact_views(&batch)
+                            .map_err(|e| DataFusionError::External(Box::new(e)))
+                    })
+                }),
+            ),
+        )
+    } else {
+        rest
+    };
+    let keys = match spec {
+        Some(spec) => crate::sort::sort_exprs(spec, &schema_without_metadata).map_err(external)?,
+        None => Vec::new(),
+    };
+    let mut sorted = crate::insert_sort::sort_stream_partitioned(
+        rest,
+        target.partition.clone(),
+        keys,
+        Arc::clone(context),
+        sorts,
+    )?;
     let mut first = None;
     while let Some(batch) = sorted.next().await {
         let batch = batch?;
@@ -850,6 +927,11 @@ async fn insert_streamed(
     if let Some(snapshot_id) = target.planned_snapshot {
         table_writer = table_writer.with_planned_base_snapshot(snapshot_id);
     }
+    if target.partition.is_some() {
+        // The rows come grouped by partition: a partition's file is finished
+        // when the next partition's rows begin, so one is open at a time.
+        table_writer = table_writer.with_max_open_partitions(1);
+    }
     let schema_without_metadata = Schema::new(
         target
             .arrow_schema
@@ -858,14 +940,22 @@ async fn insert_streamed(
             .cloned()
             .collect::<Vec<_>>(),
     );
-    let session = table_writer
-        .begin_write_unpartitioned_as_planned(
+    let session = match &target.partition {
+        Some(spec) => table_writer.begin_write_partitioned_as_planned(
             target.schema_name,
             target.table_name,
             &schema_without_metadata,
             target.write_mode,
-        )
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            spec.partition_id,
+        ),
+        None => table_writer.begin_write_unpartitioned_as_planned(
+            target.schema_name,
+            target.table_name,
+            &schema_without_metadata,
+            target.write_mode,
+        ),
+    }
+    .map_err(|e| DataFusionError::External(Box::new(e)))?;
     Box::pin(stream_into(session, first, rest, pool)).await
 }
 

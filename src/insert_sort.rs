@@ -83,6 +83,85 @@ fn key_column(index: usize) -> String {
 /// The name of the appended column holding each row's arrival position.
 const POSITION_COLUMN: &str = "__ducklake_insert_sort_position";
 
+/// The name of the appended column holding the rank of each row's partition.
+const RANK_COLUMN: &str = "__ducklake_insert_sort_partition";
+
+/// The partitions an insert's rows fall in, ranked in the order the input
+/// first shows them, as [`crate::partition::split_batches_by_partition`]
+/// orders its groups; what they hold is charged to the pool.
+struct PartitionRanks {
+    spec: crate::partition::PartitionWriteSpec,
+    ranks: std::collections::HashMap<Vec<Option<String>>, u64>,
+    reservation: datafusion::execution::memory_pool::MemoryReservation,
+    /// Bytes of `reservation` not yet used by `ranks`.
+    held: usize,
+}
+
+/// What [`PartitionRanks`] reserves at a time: room for hundreds of
+/// partitions.
+const RANK_CHUNK_BYTES: usize = 64 * 1024;
+
+impl PartitionRanks {
+    fn new(spec: crate::partition::PartitionWriteSpec, context: &Arc<TaskContext>) -> Self {
+        Self {
+            spec,
+            ranks: std::collections::HashMap::new(),
+            reservation: datafusion::execution::memory_pool::MemoryConsumer::new(
+                "DuckLakeInsertExec partitions",
+            )
+            .register(context.memory_pool()),
+            held: 0,
+        }
+    }
+
+    /// The rank of each row of `batch`'s partition, a new partition ranked
+    /// after every one seen before it.
+    fn of(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
+        let values = crate::partition::row_partition_values(batch, &self.spec)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let mut ranks = Vec::with_capacity(values.len());
+        for values in values {
+            let next = self.ranks.len() as u64;
+            let rank = match self.ranks.get(&values) {
+                Some(rank) => *rank,
+                None => {
+                    // The tuple, its strings and the map's entry.
+                    let bytes = std::mem::size_of::<(Vec<Option<String>>, u64)>()
+                        + values
+                            .iter()
+                            .map(|value| {
+                                std::mem::size_of::<Option<String>>()
+                                    + value.as_ref().map_or(0, String::capacity)
+                            })
+                            .sum::<usize>()
+                        + 16;
+                    // Taken a chunk ahead, so a partition first seen late
+                    // in an input whose sort has filled the pool rarely
+                    // meets a full pool: the sort spills to make room only
+                    // for what it holds.
+                    self.held = match self.held.checked_sub(bytes) {
+                        Some(left) => left,
+                        None => {
+                            let chunk = bytes.max(RANK_CHUNK_BYTES);
+                            if self.reservation.try_grow(chunk).is_ok() {
+                                chunk - bytes
+                            } else {
+                                // No chunk to spare: just this partition's.
+                                self.reservation.try_grow(bytes)?;
+                                0
+                            }
+                        },
+                    };
+                    self.ranks.insert(values, next);
+                    next
+                },
+            };
+            ranks.push(rank);
+        }
+        Ok(Arc::new(UInt64Array::from(ranks)))
+    }
+}
+
 /// `input` in the order of `keys` (each evaluated over the input's rows), ties in
 /// arrival order, cut back to the input's batch lengths: what
 /// [`crate::table_writer::sort_insert_rows`] returns, as a stream that spills
@@ -91,21 +170,53 @@ const POSITION_COLUMN: &str = "__ducklake_insert_sort_position";
 /// `keys` empty, or a key whose type cannot be planned over the input, returns
 /// `input` as it is: the rows keep their arrival order, as
 /// `sort_batches_by_spec` keeps them.
+#[cfg(test)]
 pub(crate) fn sort_stream(
     input: SendableRecordBatchStream,
     keys: Vec<PhysicalSortExpr>,
     context: Arc<TaskContext>,
     slot: &SortSlot,
 ) -> Result<SendableRecordBatchStream> {
+    sort_stream_partitioned(input, None, keys, context, slot)
+}
+
+/// [`sort_stream`], the rows first grouped by `partition`, when given: by the
+/// partition each row's values fall in ([`crate::partition::row_partition_values`],
+/// the tuple a partitioned write splits by), the partitions in the order the
+/// input first shows them, then within each partition by `keys` and arrival
+/// order. So each partition's rows come together, in the order
+/// [`crate::table_writer::sort_insert_rows`] gives one partition's rows, and
+/// the partitions in the order [`crate::partition::split_batches_by_partition`]
+/// gives them: what the collected partitioned write lays out, one partition at
+/// a time.
+///
+/// The partitions seen are held until the input is read (their values and a
+/// rank each), charged to `context`'s pool: a write of more distinct
+/// partitions than the pool holds is refused. A key whose type cannot be
+/// planned leaves each partition's rows in arrival order; a key that fails
+/// over a partition's rows leaves that partition's in arrival order, the
+/// others sorted, as the collected write sorts each partition on its own. A
+/// partition value that cannot be computed fails the write, as it fails the
+/// split.
+pub(crate) fn sort_stream_partitioned(
+    input: SendableRecordBatchStream,
+    partition: Option<crate::partition::PartitionWriteSpec>,
+    keys: Vec<PhysicalSortExpr>,
+    context: Arc<TaskContext>,
+    slot: &SortSlot,
+) -> Result<SendableRecordBatchStream> {
     let input_schema = input.schema();
-    let Ok(key_types) = keys
+    let (keys, key_types) = match keys
         .iter()
         .map(|key| key.expr.data_type(&input_schema))
         .collect::<Result<Vec<DataType>>>()
-    else {
-        return Ok(input);
+    {
+        Ok(key_types) => (keys, key_types),
+        Err(_) if partition.is_none() => return Ok(input),
+        // Unplanned: each partition's rows in arrival order.
+        Err(_) => (Vec::new(), Vec::new()),
     };
-    if keys.is_empty() {
+    if keys.is_empty() && partition.is_none() {
         return Ok(input);
     }
     let width = input_schema.fields().len();
@@ -117,14 +228,22 @@ pub(crate) fn sort_stream(
     for (index, data_type) in key_types.iter().enumerate() {
         fields.push(Field::new(key_column(index), data_type.clone(), true));
     }
+    if partition.is_some() {
+        fields.push(Field::new(RANK_COLUMN, DataType::UInt64, false));
+    }
     fields.push(Field::new(POSITION_COLUMN, DataType::UInt64, false));
     let augmented: SchemaRef = Arc::new(Schema::new_with_metadata(
         fields,
         input_schema.metadata().clone(),
     ));
-    let position = width + keys.len();
+    let rank = partition.as_ref().map(|_| width + keys.len());
+    let position = width + keys.len() + usize::from(rank.is_some());
+    // The partition's rank first, where the rows are grouped by partition.
+    let by_rank = move || {
+        rank.map(|rank| PhysicalSortExpr::new_default(Arc::new(Column::new(RANK_COLUMN, rank))))
+    };
 
-    let mut ordering: Vec<PhysicalSortExpr> = keys
+    let key_order: Vec<PhysicalSortExpr> = keys
         .iter()
         .enumerate()
         .map(|(index, key)| {
@@ -134,17 +253,27 @@ pub(crate) fn sort_stream(
             )
         })
         .collect();
+    let key_count = keys.len();
+    let second_keys = key_order.clone();
+    let mut ordering: Vec<PhysicalSortExpr> = by_rank().into_iter().collect();
+    ordering.extend(key_order);
 
     let failed = Arc::new(AtomicBool::new(false));
+    // The partitions whose key failed, when the rows are grouped by partition.
+    let failed_ranks: Arc<Mutex<std::collections::HashSet<u64>>> = Arc::default();
     let lengths = Arc::new(Mutex::new(VecDeque::new()));
+    let mut ranks = partition.map(|spec| PartitionRanks::new(spec, &context));
     let evaluated = {
         let augmented = Arc::clone(&augmented);
         let input_schema = Arc::clone(&input_schema);
         let failed = Arc::clone(&failed);
+        let failed_ranks = Arc::clone(&failed_ranks);
         let lengths = Arc::clone(&lengths);
         let mut next_position = 0u64;
         input.map(move |batch| {
             let batch = batch?;
+            // Of the rows as they arrived, before any key is evaluated.
+            let rank = ranks.as_mut().map(|ranks| ranks.of(&batch)).transpose()?;
             let rows = batch.num_rows();
             lengths
                 .lock()
@@ -158,39 +287,46 @@ pub(crate) fn sort_stream(
                 .zip(input_schema.fields())
                 .map(|(column, field)| as_planned(Arc::clone(column), field.data_type()))
                 .collect::<Result<Vec<_>>>()?;
-            let mut values: Vec<ArrayRef> = Vec::with_capacity(keys.len());
-            if !failed.load(Ordering::Relaxed) {
-                for (key, data_type) in keys.iter().zip(&key_types) {
-                    match key.expr.evaluate(&batch).and_then(|v| v.into_array(rows)) {
-                        // Its type up to nested field names and metadata: a
-                        // list or struct key named otherwise than the planned
-                        // schema names it (a batch's own schema may) is the
-                        // same key, and `sort_batches_by_spec` sorts by it.
-                        Ok(array) if array.data_type().equals_datatype(data_type) => {
-                            match as_planned(array, data_type) {
-                                Ok(array) => values.push(array),
-                                Err(_) => {
-                                    failed.store(true, Ordering::Relaxed);
-                                    break;
-                                },
-                            }
-                        },
-                        // The key's failure, not the write's: every row keeps its
-                        // arrival order (below), as `sort_batches_by_spec` keeps it.
-                        _ => {
+            let values = match &rank {
+                // A key's failure is its partition's, as the collected write
+                // sorts each partition on its own (`sort_insert_rows` per
+                // group): the batch's rows are evaluated a partition at a
+                // time once the whole batch fails, a failing partition's keys
+                // left null and the partition marked (below).
+                Some(rank) => match evaluate_keys(&keys, &key_types, &batch) {
+                    Some(values) => values,
+                    None => {
+                        let (values, failing) =
+                            evaluate_keys_by_rank(&keys, &key_types, &batch, rank)?;
+                        if !failing.is_empty() {
                             failed.store(true, Ordering::Relaxed);
-                            break;
-                        },
-                    }
-                }
-            }
-            if values.len() != keys.len() {
-                values = key_types
-                    .iter()
-                    .map(|data_type| new_null_array(data_type, rows))
-                    .collect();
-            }
+                            failed_ranks
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .extend(failing);
+                        }
+                        values
+                    },
+                },
+                None => {
+                    let values = if failed.load(Ordering::Relaxed) {
+                        None
+                    } else {
+                        evaluate_keys(&keys, &key_types, &batch)
+                    };
+                    values.unwrap_or_else(|| {
+                        // The key's failure, not the write's: every row keeps
+                        // its arrival order (below), as `sort_batches_by_spec`
+                        // keeps it.
+                        failed.store(true, Ordering::Relaxed);
+                        null_keys(&key_types, rows)
+                    })
+                },
+            };
             columns.extend(values);
+            if let Some(rank) = rank {
+                columns.push(rank);
+            }
             columns.push(Arc::new(UInt64Array::from_iter_values(
                 next_position..next_position + rows as u64,
             )));
@@ -228,16 +364,32 @@ pub(crate) fn sort_stream(
             if !failed.load(Ordering::Relaxed) {
                 return Ok(head as SendableRecordBatchStream);
             }
-            let by_position = vec![PhysicalSortExpr::new_default(Arc::new(Column::new(
+            // Every row in arrival order; grouped by partition, each failing
+            // partition's rows in arrival order (its keys made null, all
+            // alike) and every other's by its keys, as before.
+            let mut by_position: Vec<PhysicalSortExpr> = by_rank().into_iter().collect();
+            if rank.is_some() {
+                by_position.extend(second_keys);
+            }
+            by_position.push(PhysicalSortExpr::new_default(Arc::new(Column::new(
                 POSITION_COLUMN,
                 position,
-            )))];
+            ))));
+            let failing: std::collections::HashSet<u64> =
+                std::mem::take(&mut *failed_ranks.lock().unwrap_or_else(|p| p.into_inner()));
+            let key_columns = width..width + key_count;
             // Each batch the first sort yields draws its strings from all of
             // its input's buffers; copied out, the second sort is charged
             // each batch's own rows, not the whole first sort's buffers a
             // batch (`write_encoding::compact_views`).
-            let compacted = head.map(|batch| {
+            let compacted = head.map(move |batch| {
                 batch.and_then(|batch| {
+                    let batch = match rank {
+                        Some(rank) => {
+                            null_failing_keys(&batch, rank, key_columns.clone(), &failing)?
+                        },
+                        None => batch,
+                    };
                     crate::write_encoding::compact_views(&batch)
                         .map_err(|e| DataFusionError::External(Box::new(e)))
                 })
@@ -275,6 +427,114 @@ pub(crate) fn sort_stream(
             lengths,
         ),
     )))
+}
+
+/// `keys` evaluated over `batch`, typed as planned (`key_types`); `None` when
+/// any of them fails, or is not of its planned type.
+fn evaluate_keys(
+    keys: &[PhysicalSortExpr],
+    key_types: &[DataType],
+    batch: &RecordBatch,
+) -> Option<Vec<ArrayRef>> {
+    keys.iter()
+        .zip(key_types)
+        .map(|(key, data_type)| {
+            let array = key
+                .expr
+                .evaluate(batch)
+                .and_then(|v| v.into_array(batch.num_rows()))
+                .ok()?;
+            // Its type up to nested field names and metadata: a list or
+            // struct key named otherwise than the planned schema names it (a
+            // batch's own schema may) is the same key, and
+            // `sort_batches_by_spec` sorts by it.
+            if !array.data_type().equals_datatype(data_type) {
+                return None;
+            }
+            as_planned(array, data_type).ok()
+        })
+        .collect()
+}
+
+/// Null `rows` values of each key's type.
+fn null_keys(key_types: &[DataType], rows: usize) -> Vec<ArrayRef> {
+    key_types
+        .iter()
+        .map(|data_type| new_null_array(data_type, rows))
+        .collect()
+}
+
+/// `keys` evaluated over `batch` one partition (`rank`) at a time, a failing
+/// partition's left null: the keys, in `batch`'s row order, and the failing
+/// partitions.
+fn evaluate_keys_by_rank(
+    keys: &[PhysicalSortExpr],
+    key_types: &[DataType],
+    batch: &RecordBatch,
+    rank: &ArrayRef,
+) -> Result<(Vec<ArrayRef>, Vec<u64>)> {
+    use arrow::array::{Array, AsArray, UInt32Array};
+    let ranks = rank.as_primitive::<arrow::datatypes::UInt64Type>();
+    // Each partition's rows, in the order the batch first shows them.
+    let mut order: Vec<u64> = Vec::new();
+    let mut rows_of: std::collections::HashMap<u64, Vec<u32>> = std::collections::HashMap::new();
+    for row in 0..ranks.len() {
+        let rank = ranks.value(row);
+        rows_of
+            .entry(rank)
+            .or_insert_with(|| {
+                order.push(rank);
+                Vec::new()
+            })
+            .push(row as u32);
+    }
+    let mut pieces: Vec<Vec<ArrayRef>> = Vec::with_capacity(order.len());
+    let mut failing = Vec::new();
+    // Where each row's key is among the pieces: (piece, row in it).
+    let mut at = vec![(0usize, 0usize); ranks.len()];
+    for (piece, rank) in order.iter().enumerate() {
+        let rows = &rows_of[rank];
+        let indices = UInt32Array::from(rows.clone());
+        let part = arrow::compute::take_record_batch(batch, &indices)?;
+        let values = evaluate_keys(keys, key_types, &part).unwrap_or_else(|| {
+            failing.push(*rank);
+            null_keys(key_types, rows.len())
+        });
+        for (offset, row) in rows.iter().enumerate() {
+            at[*row as usize] = (piece, offset);
+        }
+        pieces.push(values);
+    }
+    let values = (0..keys.len())
+        .map(|key| {
+            let arrays: Vec<&dyn Array> = pieces.iter().map(|piece| piece[key].as_ref()).collect();
+            Ok(arrow::compute::interleave(&arrays, &at)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((values, failing))
+}
+
+/// `batch` with its key columns (`keys`) made null on every row whose
+/// partition (its rank, column `rank`) is `failing`.
+fn null_failing_keys(
+    batch: &RecordBatch,
+    rank: usize,
+    keys: std::ops::Range<usize>,
+    failing: &std::collections::HashSet<u64>,
+) -> Result<RecordBatch> {
+    use arrow::array::{AsArray, BooleanArray};
+    let ranks = batch
+        .column(rank)
+        .as_primitive::<arrow::datatypes::UInt64Type>();
+    let mask: BooleanArray = ranks
+        .iter()
+        .map(|r| r.map(|r| failing.contains(&r)))
+        .collect();
+    let mut columns = batch.columns().to_vec();
+    for key in keys {
+        columns[key] = arrow::compute::nullif(&columns[key], &mask)?;
+    }
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
 /// `array` typed as `planned`, where the two are the same type up to nested
