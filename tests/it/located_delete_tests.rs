@@ -493,3 +493,47 @@ async fn a_delete_file_of_many_batches_deletes_every_position() {
     assert_eq!(head.len(), 200_002);
     assert_eq!(head, read(&by_key, None).await);
 }
+
+/// A set of positions naming rows the snapshot already deleted (here every
+/// physical row of both data files, ids 3 and 41 deleted by their delete files
+/// among them) deletes and counts only the live ones, as a list of positions
+/// does: a file whose every live row is named is dropped, not given a delete
+/// file that names its deleted rows twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_set_naming_deleted_rows_deletes_only_the_live_ones() {
+    let temp = lake().await;
+    let ctx = writable(&temp).await;
+    let provider = table(&ctx).await;
+    let lake_table = as_ducklake(&provider);
+    let all: BTreeSet<i32> = (0..80).collect();
+    let (located, _, _) = locate(&ctx, lake_table, &all).await;
+    assert_eq!(located.len(), 2, "the fixture's two data files");
+    let every: BTreeMap<i64, RoaringTreemap> = located
+        .keys()
+        .map(|file| (*file, (0u64..40).collect()))
+        .collect();
+    let result = lake_table
+        .replace_located_rows(
+            &ctx.state(),
+            every,
+            HashSet::new(),
+            stream(delta(&[1000].into())),
+        )
+        .await
+        .unwrap();
+    // 40 rows in each file, one of each deleted already.
+    assert_eq!(result.rows_deleted, 78);
+    assert_eq!(result.rows_inserted, 3);
+    let ids: Vec<String> = read(&temp, None)
+        .await
+        .into_iter()
+        .map(|row| row.split(',').skip(1).collect::<Vec<_>>().join(","))
+        .collect();
+    let mut ids = ids;
+    ids.sort();
+    assert_eq!(
+        ids,
+        ["100,s100", "1000,new1000", "NULL,n", "NULL,newnull", "NULL,newnull"],
+        "only the inlined rows and the delta are left"
+    );
+}
