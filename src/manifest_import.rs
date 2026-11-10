@@ -1416,19 +1416,25 @@ async fn verify_bucket_value(
         ObjectPath::from(checked.key.trim_start_matches('/')),
     )
     .with_file_size(size);
+    // A failure to read the column is a value the import cannot verify, not a failed import:
+    // a caller may then import the files unpartitioned.
+    let unreadable = |e: &dyn std::fmt::Display| refuse(format!("reading the column: {e}"));
     let metadata =
-        ArrowReaderMetadata::try_new(Arc::clone(&checked.metadata), ArrowReaderOptions::new())?;
+        ArrowReaderMetadata::try_new(Arc::clone(&checked.metadata), ArrowReaderOptions::new())
+            .map_err(|e| unreadable(&e))?;
     let mask = ProjectionMask::roots(
         checked.metadata.file_metadata().schema_descr(),
         [check.root],
     );
     let mut batches = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata)
         .with_projection(mask)
-        .build()?;
-    while let Some(batch) = batches.try_next().await? {
+        .build()
+        .map_err(|e| unreadable(&e))?;
+    while let Some(batch) = batches.try_next().await.map_err(|e| unreadable(&e))? {
         let column = batch.column(0);
         for row in 0..column.len() {
-            let value = ScalarValue::try_from_array(column.as_ref(), row)?;
+            let value =
+                ScalarValue::try_from_array(column.as_ref(), row).map_err(|e| unreadable(&e))?;
             match crate::partition::bucket_of(&value, check.buckets) {
                 Some(bucket) if bucket == check.value => {},
                 Some(bucket) => {

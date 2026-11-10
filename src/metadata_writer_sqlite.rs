@@ -6373,7 +6373,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?;
                 if created != Some(snapshot_id) {
                     return Err(crate::DuckLakeError::Conflict(format!(
-                        "table {schema_name}.{table_name} was created by another writer while                          this import, which creates it partitioned, was planned; retry"
+                        "table {schema_name}.{table_name} was created by another writer while \
+                         this import, which creates it partitioned, was planned; retry"
                     )));
                 }
                 let mut ids: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
