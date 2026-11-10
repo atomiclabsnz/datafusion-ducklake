@@ -270,8 +270,11 @@ impl DuckLakeTable {
     /// What is held: the locations as the caller gave them, sets of
     /// positions (a compressed bitmap, a fraction of a byte a matched row
     /// where the matched rows of a file are dense), each moved into its
-    /// file's delete file and never copied to a list; the inlining limit's
-    /// rows while the statement could still be inlined; and the write
+    /// file's delete file and, for a file with no delete file yet, never
+    /// copied to a list. A file that has one gets a rewritten delete file,
+    /// whose positions, the old with the new, are still listed until the
+    /// commit, as every rewrite lists them. Also held: the inlining limit's
+    /// rows while the statement could still be inlined, and the write
     /// session's open file, which is charged to `state`'s memory pool.
     pub async fn replace_located_rows(
         &self,

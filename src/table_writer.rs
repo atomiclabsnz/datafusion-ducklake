@@ -649,6 +649,10 @@ pub(crate) struct RewrittenDeleteSource {
     pub(crate) existing: Vec<(i64, i64)>,
     /// The statement's positions.
     pub(crate) positions: Vec<i64>,
+    /// Whether the file keeps its positions in memory until the commit
+    /// ([`DeleteFileInfo::with_deleted_positions`]): only a commit that
+    /// inserts nothing reads them.
+    pub(crate) record_positions: bool,
 }
 
 /// A delete file a statement rewrote, with what it holds.
@@ -1921,8 +1925,8 @@ impl DuckLakeTableWriter {
         let recorded: Option<&[i64]> = match positions {
             _ if !record => None,
             crate::delete_exec::Positions::Sorted(positions) => Some(positions),
-            crate::delete_exec::Positions::Set(_) => {
-                listed = positions.clone().into_vec();
+            crate::delete_exec::Positions::Set(set) => {
+                listed = set.iter().map(|p| p as i64).collect::<Vec<_>>();
                 Some(&listed)
             },
         };
@@ -1974,12 +1978,13 @@ impl DuckLakeTableWriter {
         let partial_max = deletions.iter().map(|(_, s)| *s).max().unwrap_or(date);
         let mut written = Vec::new();
         let delete = self
-            .write_delete_file_with_snapshots(
+            .write_delete_file_dated(
                 schema_name,
                 table_name,
                 &source.data_file_path,
                 &deletions,
                 &mut written,
+                source.record_positions,
             )
             .await?;
         Ok((delete, begin_snapshot, partial_max))
@@ -2001,6 +2006,28 @@ impl DuckLakeTableWriter {
         deletions: &[(i64, i64)],
         written: &mut Vec<ObjectPath>,
     ) -> Result<DeleteFileInfo> {
+        self.write_delete_file_dated(
+            schema_name,
+            table_name,
+            data_file_path,
+            deletions,
+            written,
+            true,
+        )
+        .await
+    }
+
+    /// [`Self::write_delete_file_with_snapshots`], the file keeping its
+    /// positions only when `record`.
+    async fn write_delete_file_dated(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        data_file_path: &str,
+        deletions: &[(i64, i64)],
+        written: &mut Vec<ObjectPath>,
+        record: bool,
+    ) -> Result<DeleteFileInfo> {
         let positions = deletions.iter().map(|(pos, _)| *pos).collect::<Vec<_>>();
         let snapshots = deletions
             .iter()
@@ -2013,7 +2040,7 @@ impl DuckLakeTableWriter {
             &mut positions.iter().copied(),
             positions.len(),
             Some((&snapshots, written)),
-            Some(&positions),
+            record.then_some(positions.as_slice()),
         )
         .await
     }

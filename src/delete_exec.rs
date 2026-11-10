@@ -708,6 +708,7 @@ impl FileDeletions {
                 })
                 .collect(),
             positions: positions.into_vec(),
+            record_positions: !self.inserting,
         };
         let (delete, begin_snapshot, partial_max) = table_writer
             .write_rewritten_delete_file(schema_name, table_name, &source, commit_snapshot)
