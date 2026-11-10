@@ -603,16 +603,20 @@ async fn a_partitioned_insert_it_could_inline_is_refused_past_the_pool() {
     let lake = sqlite()(None).await;
     partitioned_table(&lake, "b", Order::None).await;
     let before = committed(&lake, "b");
+    let factory = CountingFactory::new(None);
     let ctx = session(
         &lake,
         &options(10),
-        runtime(4 * MIB, Some(CountingFactory::new(None))),
+        runtime(4 * MIB, Some(Arc::clone(&factory))),
         &batches,
     );
     let error = run(&ctx, "INSERT INTO lake.main.b SELECT id, p, k, v FROM src")
         .await
         .expect_err("refused at the pool");
     assert!(error.contains("Resources exhausted"), "{error}");
+    // Refused where the collected path holds the input: no sort began.
+    assert!(!error.contains("ExternalSorter"), "{error}");
+    assert_eq!(factory.created(), 0, "nothing spilled");
     assert_eq!(committed(&lake, "b"), before, "nothing committed");
     assert_eq!(on_disk(&lake, "b"), Vec::<PathBuf>::new(), "no file left");
 }
@@ -649,4 +653,56 @@ async fn a_partitioned_insert_past_the_pool_refuses_a_spec_changed_since_plannin
     assert!(error.contains("retry the write"), "{error}");
     assert_eq!(committed(&lake, "b"), before, "nothing committed");
     assert_eq!(on_disk(&lake, "b"), Vec::<PathBuf>::new(), "no file left");
+}
+
+/// A sort key that fails over one partition's rows only (`k / (p - 5)`, a
+/// division by zero where `p` is 5) leaves that partition's rows in arrival
+/// order and every other partition sorted, past the pool as under it: the
+/// collected write sorts each partition on its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_failing_in_one_partition_leaves_only_that_one_unsorted() {
+    let batches = input(120_000, 997);
+    let order = Order::Sorted("(k / (p - 5))", true);
+    let lake = sqlite()(None).await;
+    for table in ["b", "c"] {
+        partitioned_table(&lake, table, order).await;
+    }
+    let ctx = session(&lake, &options(0), RuntimeEnvBuilder::new(), &batches);
+    run(&ctx, "INSERT INTO lake.main.c SELECT id, p, k, v FROM src")
+        .await
+        .unwrap();
+    let expected = runs(files(&lake, "c"));
+    let factory = CountingFactory::new(None);
+    let ctx = session(
+        &lake,
+        &options(0),
+        runtime(SMALL_POOL, Some(Arc::clone(&factory))),
+        &batches,
+    );
+    let plan = run(&ctx, "INSERT INTO lake.main.b SELECT id, p, k, v FROM src")
+        .await
+        .unwrap();
+    assert!(spills(&plan).0 > 0, "the insert's sort spilled");
+    let got = runs(files(&lake, "b"));
+    assert!(got == expected, "laid out as the collected write");
+    // The reference itself: partition 5 in arrival order, another sorted.
+    let ids = |value: &str| -> Vec<i64> {
+        got.iter()
+            .find(|(v, _)| v.as_deref() == Some(value))
+            .unwrap()
+            .1
+            .iter()
+            .map(|r| r.0)
+            .collect()
+    };
+    let five = ids("5");
+    assert!(
+        five.windows(2).all(|w| w[0] < w[1]),
+        "p = 5 in arrival order"
+    );
+    let six = ids("6");
+    assert!(
+        !six.windows(2).all(|w| w[0] < w[1]),
+        "p = 6 sorted by its key, not in arrival order"
+    );
 }
