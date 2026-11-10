@@ -208,6 +208,68 @@ fn year_bounds(year: i64, data_type: &DataType) -> Option<(ScalarValue, ScalarVa
     Some((min, max))
 }
 
+/// Murmur3 x86 32-bit with seed 0, as the Iceberg spec (Appendix B) and official
+/// DuckLake's `murmur3_32` compute it.
+pub(crate) fn murmur3_32(data: &[u8]) -> i32 {
+    const C1: u32 = 0xcc9e_2d51;
+    const C2: u32 = 0x1b87_3593;
+    let mut h1: u32 = 0;
+    let mut blocks = data.chunks_exact(4);
+    for block in &mut blocks {
+        let mut k1 = u32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+        k1 = k1.wrapping_mul(C1).rotate_left(15).wrapping_mul(C2);
+        h1 ^= k1;
+        h1 = h1.rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64);
+    }
+    let tail = blocks.remainder();
+    if !tail.is_empty() {
+        let mut k1: u32 = 0;
+        for (i, byte) in tail.iter().enumerate() {
+            k1 ^= u32::from(*byte) << (8 * i);
+        }
+        k1 = k1.wrapping_mul(C1).rotate_left(15).wrapping_mul(C2);
+        h1 ^= k1;
+    }
+    h1 ^= data.len() as u32;
+    h1 ^= h1 >> 16;
+    h1 = h1.wrapping_mul(0x85eb_ca6b);
+    h1 ^= h1 >> 13;
+    h1 = h1.wrapping_mul(0xc2b2_ae35);
+    h1 ^= h1 >> 16;
+    h1 as i32
+}
+
+/// The `bucket(N)` partition value of `value`, for the types whose hash official
+/// DuckLake (`DuckLakePartitionUtils::ApplyBucketTransform`, DuckDB 1.5.6) and the
+/// Iceberg spec compute alike: integers and dates (as their 8-byte little-endian
+/// long), microsecond times and timestamps (their microseconds, as a long), and
+/// text and binary (their bytes). `None` for NULL and for any other type: official
+/// hashes a decimal as its storage integer and a UUID by its text, neither of which
+/// is Iceberg's hash, and Iceberg does not bucket floats or booleans.
+pub fn bucket_of(value: &ScalarValue, buckets: u32) -> Option<i64> {
+    let long = |v: i64| murmur3_32(&v.to_le_bytes());
+    let hash = match value {
+        ScalarValue::Int8(Some(v)) => long(i64::from(*v)),
+        ScalarValue::Int16(Some(v)) => long(i64::from(*v)),
+        ScalarValue::Int32(Some(v)) => long(i64::from(*v)),
+        ScalarValue::Int64(Some(v)) => long(*v),
+        ScalarValue::Date32(Some(v)) => long(i64::from(*v)),
+        ScalarValue::Time64Microsecond(Some(v)) => long(*v),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => long(*v),
+        ScalarValue::Utf8(Some(v))
+        | ScalarValue::LargeUtf8(Some(v))
+        | ScalarValue::Utf8View(Some(v)) => murmur3_32(v.as_bytes()),
+        ScalarValue::Binary(Some(v))
+        | ScalarValue::LargeBinary(Some(v))
+        | ScalarValue::BinaryView(Some(v)) => murmur3_32(v),
+        _ => return None,
+    };
+    if buckets == 0 {
+        return None;
+    }
+    Some(i64::from(hash & i32::MAX) % i64::from(buckets))
+}
+
 /// A partition spec resolved against a concrete write schema: how a write path
 /// splits incoming rows into per-partition files.
 ///
@@ -754,6 +816,30 @@ impl PartitionSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Iceberg spec's own test vectors (Appendix B), which official DuckLake's
+    /// `murmur3_32` reproduces.
+    #[test]
+    fn murmur3_matches_the_iceberg_spec_vectors() {
+        assert_eq!(murmur3_32(&34i64.to_le_bytes()), 2_017_239_379);
+        assert_eq!(murmur3_32("iceberg".as_bytes()), 1_210_000_089);
+        assert_eq!(murmur3_32(&[0, 1, 2, 3]), -188_683_207);
+        // date 2017-11-16 = 17486 days
+        assert_eq!(murmur3_32(&17_486i64.to_le_bytes()), -653_330_422);
+        // timestamp 2017-11-16T22:31:08 in microseconds
+        assert_eq!(
+            murmur3_32(&1_510_871_468_000_000i64.to_le_bytes()),
+            -2_047_944_441
+        );
+        // time 22:31:08 in microseconds
+        assert_eq!(murmur3_32(&81_068_000_000i64.to_le_bytes()), -662_762_989);
+        assert_eq!(
+            bucket_of(&ScalarValue::Int32(Some(34)), 16),
+            Some(2_017_239_379 % 16)
+        );
+        assert_eq!(bucket_of(&ScalarValue::Utf8(None), 16), None);
+        assert_eq!(bucket_of(&ScalarValue::Float64(Some(1.0)), 16), None);
+    }
     // Only the `write`-gated split tests below build record batches.
     #[cfg(feature = "write")]
     use arrow::array::{ArrayRef, RecordBatch, StringArray};
