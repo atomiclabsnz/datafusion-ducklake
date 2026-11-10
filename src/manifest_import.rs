@@ -1401,7 +1401,7 @@ async fn verify_bucket_value(
 ) -> Result<()> {
     use futures::TryStreamExt as _;
     use parquet::arrow::ProjectionMask;
-    use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+    use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
     let refuse = |reason: String| -> DuckLakeError {
         ImportError::UnverifiedPartitionValue {
             path: file.path.clone(),
@@ -1411,11 +1411,12 @@ async fn verify_bucket_value(
         .into()
     };
     let size = u64::try_from(file.file_size_bytes).map_err(|_| refuse("a negative size".into()))?;
-    let reader = ParquetObjectReader::new(
-        Arc::clone(store),
-        ObjectPath::from(checked.key.trim_start_matches('/')),
-    )
-    .with_file_size(size);
+    let reader = FooterKnownReader {
+        store: Arc::clone(store),
+        path: ObjectPath::from(checked.key.trim_start_matches('/')),
+        size,
+        metadata: Arc::clone(&checked.metadata),
+    };
     // A failure to read the column is a value the import cannot verify, not a failed import:
     // a caller may then import the files unpartitioned.
     let unreadable = |e: &dyn std::fmt::Display| refuse(format!("reading the column: {e}"));
@@ -1454,6 +1455,46 @@ async fn verify_bucket_value(
         }
     }
     Ok(())
+}
+
+/// A Parquet object whose footer has been read: ranges come from the store, the
+/// metadata from the footer already decoded.
+struct FooterKnownReader {
+    store: Arc<dyn ObjectStore>,
+    path: ObjectPath,
+    size: u64,
+    metadata: Arc<ParquetMetaData>,
+}
+
+impl parquet::arrow::async_reader::AsyncFileReader for FooterKnownReader {
+    fn get_bytes(
+        &mut self,
+        range: std::ops::Range<u64>,
+    ) -> futures::future::BoxFuture<'_, parquet::errors::Result<bytes::Bytes>> {
+        use futures::FutureExt as _;
+        async move {
+            if range.end > self.size {
+                return Err(parquet::errors::ParquetError::EOF(format!(
+                    "range {range:?} past the object's {} bytes",
+                    self.size
+                )));
+            }
+            self.store
+                .get_range(&self.path, range)
+                .await
+                .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))
+        }
+        .boxed()
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        _options: Option<&'a ArrowReaderOptions>,
+    ) -> futures::future::BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+        use futures::FutureExt as _;
+        let metadata = Arc::clone(&self.metadata);
+        async move { Ok(metadata) }.boxed()
+    }
 }
 
 /// The specs an import with [`ImportOptions::create_partitioned`] gives the
