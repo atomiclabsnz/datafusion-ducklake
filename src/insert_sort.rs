@@ -83,6 +83,62 @@ fn key_column(index: usize) -> String {
 /// The name of the appended column holding each row's arrival position.
 const POSITION_COLUMN: &str = "__ducklake_insert_sort_position";
 
+/// The name of the appended column holding the rank of each row's partition.
+const RANK_COLUMN: &str = "__ducklake_insert_sort_partition";
+
+/// The partitions an insert's rows fall in, ranked in the order the input
+/// first shows them, as [`crate::partition::split_batches_by_partition`]
+/// orders its groups; what they hold is charged to the pool.
+struct PartitionRanks {
+    spec: crate::partition::PartitionWriteSpec,
+    ranks: std::collections::HashMap<Vec<Option<String>>, u64>,
+    reservation: datafusion::execution::memory_pool::MemoryReservation,
+}
+
+impl PartitionRanks {
+    fn new(spec: crate::partition::PartitionWriteSpec, context: &Arc<TaskContext>) -> Self {
+        Self {
+            spec,
+            ranks: std::collections::HashMap::new(),
+            reservation: datafusion::execution::memory_pool::MemoryConsumer::new(
+                "DuckLakeInsertExec partitions",
+            )
+            .register(context.memory_pool()),
+        }
+    }
+
+    /// The rank of each row of `batch`'s partition, a new partition ranked
+    /// after every one seen before it.
+    fn of(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
+        let values = crate::partition::row_partition_values(batch, &self.spec)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let mut ranks = Vec::with_capacity(values.len());
+        for values in values {
+            let next = self.ranks.len() as u64;
+            let rank = match self.ranks.get(&values) {
+                Some(rank) => *rank,
+                None => {
+                    // The tuple, its strings and the map's entry.
+                    let bytes = std::mem::size_of::<(Vec<Option<String>>, u64)>()
+                        + values
+                            .iter()
+                            .map(|value| {
+                                std::mem::size_of::<Option<String>>()
+                                    + value.as_ref().map_or(0, String::capacity)
+                            })
+                            .sum::<usize>()
+                        + 16;
+                    self.reservation.try_grow(bytes)?;
+                    self.ranks.insert(values, next);
+                    next
+                },
+            };
+            ranks.push(rank);
+        }
+        Ok(Arc::new(UInt64Array::from(ranks)))
+    }
+}
+
 /// `input` in the order of `keys` (each evaluated over the input's rows), ties in
 /// arrival order, cut back to the input's batch lengths: what
 /// [`crate::table_writer::sort_insert_rows`] returns, as a stream that spills
@@ -91,21 +147,51 @@ const POSITION_COLUMN: &str = "__ducklake_insert_sort_position";
 /// `keys` empty, or a key whose type cannot be planned over the input, returns
 /// `input` as it is: the rows keep their arrival order, as
 /// `sort_batches_by_spec` keeps them.
+#[cfg(test)]
 pub(crate) fn sort_stream(
     input: SendableRecordBatchStream,
     keys: Vec<PhysicalSortExpr>,
     context: Arc<TaskContext>,
     slot: &SortSlot,
 ) -> Result<SendableRecordBatchStream> {
+    sort_stream_partitioned(input, None, keys, context, slot)
+}
+
+/// [`sort_stream`], the rows first grouped by `partition`, when given: by the
+/// partition each row's values fall in ([`crate::partition::row_partition_values`],
+/// the tuple a partitioned write splits by), the partitions in the order the
+/// input first shows them, then within each partition by `keys` and arrival
+/// order. So each partition's rows come together, in the order
+/// [`crate::table_writer::sort_insert_rows`] gives one partition's rows, and
+/// the partitions in the order [`crate::partition::split_batches_by_partition`]
+/// gives them: what the collected partitioned write lays out, one partition at
+/// a time.
+///
+/// The partitions seen are held until the input is read (their values and a
+/// rank each), charged to `context`'s pool: a write of more distinct
+/// partitions than the pool holds is refused. A key that fails, or whose type
+/// cannot be planned, leaves each partition's rows in arrival order. A
+/// partition value that cannot be computed fails the write, as it fails the
+/// split.
+pub(crate) fn sort_stream_partitioned(
+    input: SendableRecordBatchStream,
+    partition: Option<crate::partition::PartitionWriteSpec>,
+    keys: Vec<PhysicalSortExpr>,
+    context: Arc<TaskContext>,
+    slot: &SortSlot,
+) -> Result<SendableRecordBatchStream> {
     let input_schema = input.schema();
-    let Ok(key_types) = keys
+    let (keys, key_types) = match keys
         .iter()
         .map(|key| key.expr.data_type(&input_schema))
         .collect::<Result<Vec<DataType>>>()
-    else {
-        return Ok(input);
+    {
+        Ok(key_types) => (keys, key_types),
+        Err(_) if partition.is_none() => return Ok(input),
+        // Unplanned: each partition's rows in arrival order.
+        Err(_) => (Vec::new(), Vec::new()),
     };
-    if keys.is_empty() {
+    if keys.is_empty() && partition.is_none() {
         return Ok(input);
     }
     let width = input_schema.fields().len();
@@ -117,26 +203,31 @@ pub(crate) fn sort_stream(
     for (index, data_type) in key_types.iter().enumerate() {
         fields.push(Field::new(key_column(index), data_type.clone(), true));
     }
+    if partition.is_some() {
+        fields.push(Field::new(RANK_COLUMN, DataType::UInt64, false));
+    }
     fields.push(Field::new(POSITION_COLUMN, DataType::UInt64, false));
     let augmented: SchemaRef = Arc::new(Schema::new_with_metadata(
         fields,
         input_schema.metadata().clone(),
     ));
-    let position = width + keys.len();
+    let rank = partition.as_ref().map(|_| width + keys.len());
+    let position = width + keys.len() + usize::from(rank.is_some());
+    // The partition's rank first, where the rows are grouped by partition.
+    let by_rank =
+        move || rank.map(|rank| PhysicalSortExpr::new_default(Arc::new(Column::new(RANK_COLUMN, rank))));
 
-    let mut ordering: Vec<PhysicalSortExpr> = keys
-        .iter()
-        .enumerate()
-        .map(|(index, key)| {
-            PhysicalSortExpr::new(
-                Arc::new(Column::new(&key_column(index), width + index)),
-                key.options,
-            )
-        })
-        .collect();
+    let mut ordering: Vec<PhysicalSortExpr> = by_rank().into_iter().collect();
+    ordering.extend(keys.iter().enumerate().map(|(index, key)| {
+        PhysicalSortExpr::new(
+            Arc::new(Column::new(&key_column(index), width + index)),
+            key.options,
+        )
+    }));
 
     let failed = Arc::new(AtomicBool::new(false));
     let lengths = Arc::new(Mutex::new(VecDeque::new()));
+    let mut ranks = partition.map(|spec| PartitionRanks::new(spec, &context));
     let evaluated = {
         let augmented = Arc::clone(&augmented);
         let input_schema = Arc::clone(&input_schema);
@@ -145,6 +236,8 @@ pub(crate) fn sort_stream(
         let mut next_position = 0u64;
         input.map(move |batch| {
             let batch = batch?;
+            // Of the rows as they arrived, before any key is evaluated.
+            let rank = ranks.as_mut().map(|ranks| ranks.of(&batch)).transpose()?;
             let rows = batch.num_rows();
             lengths
                 .lock()
@@ -191,6 +284,9 @@ pub(crate) fn sort_stream(
                     .collect();
             }
             columns.extend(values);
+            if let Some(rank) = rank {
+                columns.push(rank);
+            }
             columns.push(Arc::new(UInt64Array::from_iter_values(
                 next_position..next_position + rows as u64,
             )));
@@ -228,10 +324,12 @@ pub(crate) fn sort_stream(
             if !failed.load(Ordering::Relaxed) {
                 return Ok(head as SendableRecordBatchStream);
             }
-            let by_position = vec![PhysicalSortExpr::new_default(Arc::new(Column::new(
+            // Each partition's rows in arrival order.
+            let mut by_position: Vec<PhysicalSortExpr> = by_rank().into_iter().collect();
+            by_position.push(PhysicalSortExpr::new_default(Arc::new(Column::new(
                 POSITION_COLUMN,
                 position,
-            )))];
+            ))));
             // Each batch the first sort yields draws its strings from all of
             // its input's buffers; copied out, the second sort is charged
             // each batch's own rows, not the whole first sort's buffers a

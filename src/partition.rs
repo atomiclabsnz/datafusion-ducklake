@@ -563,6 +563,63 @@ fn calendar_parts(
     Some(std::sync::Arc::new(parts))
 }
 
+/// Each row's tuple of transformed, DuckDB-canonical partition values under
+/// `spec`, in row order: what [`split_batches_by_partition`] groups the rows
+/// by (`values[i]` the encoded value of key `i`, `None` for SQL NULL).
+#[cfg(feature = "write")]
+pub(crate) fn row_partition_values(
+    batch: &arrow::record_batch::RecordBatch,
+    spec: &PartitionWriteSpec,
+) -> crate::Result<Vec<Vec<Option<String>>>> {
+    // Transform each partition-key column once per batch.
+    let mut transformed: Vec<arrow::array::ArrayRef> = Vec::with_capacity(spec.keys.len());
+    for key in &spec.keys {
+        transformed.push(transform_array(
+            &key.transform,
+            batch.column(key.input_index),
+        )?);
+    }
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let mut values: Vec<Option<String>> = Vec::with_capacity(spec.keys.len());
+        for array in &transformed {
+            let scalar = ScalarValue::try_from_array(array, row)?;
+            // `encode_scalar` returns `None` for BOTH a genuine SQL NULL and a
+            // non-null value of a type it cannot encode. Those must not be
+            // conflated: silently mapping an unencodable non-null value to `None`
+            // would group every distinct such value into one file with a NULL
+            // partition value (data corruption). A NULL is a legitimate partition
+            // value; an unencodable non-null value is a hard error.
+            let encoded = if scalar.is_null() {
+                None
+            } else {
+                // A partition value keeps the whole string, as official
+                // stores it; the statistics rules that drop a long or
+                // NUL-holding bound do not apply.
+                let text = match &scalar {
+                    ScalarValue::Utf8(Some(text))
+                    | ScalarValue::LargeUtf8(Some(text))
+                    | ScalarValue::Utf8View(Some(text)) => Some(text.clone()),
+                    scalar => crate::stats_encode::encode_scalar(scalar),
+                };
+                match text {
+                    Some(encoded) => Some(encoded),
+                    None => {
+                        return Err(crate::DuckLakeError::Unsupported(format!(
+                            "partitioned write: partition-key value of type {} cannot be \
+                         encoded; partitioning by this column type is not supported",
+                            array.data_type()
+                        )));
+                    },
+                }
+            };
+            values.push(encoded);
+        }
+        rows.push(values);
+    }
+    Ok(rows)
+}
+
 /// Split rows into groups keyed by the tuple of transformed, DuckDB-canonical
 /// partition values — one group per distinct key. Returns `(values, batches)` per
 /// group, where `values[i]` is the encoded value for partition key `i` (`None` for
@@ -587,7 +644,7 @@ pub(crate) fn split_batches_by_partition(
     batches: &[arrow::record_batch::RecordBatch],
     spec: &PartitionWriteSpec,
 ) -> crate::Result<Vec<PartitionGroup>> {
-    use arrow::array::{ArrayRef, RecordBatch, UInt32Array};
+    use arrow::array::{RecordBatch, UInt32Array};
     use arrow::compute::take;
     use std::collections::HashMap;
 
@@ -601,54 +658,11 @@ pub(crate) fn split_batches_by_partition(
         if num_rows == 0 {
             continue;
         }
-        // Transform each partition-key column once per batch.
-        let mut transformed: Vec<ArrayRef> = Vec::with_capacity(spec.keys.len());
-        for key in &spec.keys {
-            transformed.push(transform_array(
-                &key.transform,
-                batch.column(key.input_index),
-            )?);
-        }
-
         // Row indices of this batch, bucketed by encoded partition-value tuple.
         // Ascending within a bucket, so relative order is preserved.
         let mut per_batch: HashMap<Vec<Option<String>>, Vec<u32>> = HashMap::new();
         let mut per_batch_order: Vec<Vec<Option<String>>> = Vec::new();
-        for row in 0..num_rows {
-            let mut values: Vec<Option<String>> = Vec::with_capacity(spec.keys.len());
-            for array in &transformed {
-                let scalar = ScalarValue::try_from_array(array, row)?;
-                // `encode_scalar` returns `None` for BOTH a genuine SQL NULL and a
-                // non-null value of a type it cannot encode. Those must not be
-                // conflated: silently mapping an unencodable non-null value to `None`
-                // would group every distinct such value into one file with a NULL
-                // partition value (data corruption). A NULL is a legitimate partition
-                // value; an unencodable non-null value is a hard error.
-                let encoded = if scalar.is_null() {
-                    None
-                } else {
-                    // A partition value keeps the whole string, as official
-                    // stores it; the statistics rules that drop a long or
-                    // NUL-holding bound do not apply.
-                    let text = match &scalar {
-                        ScalarValue::Utf8(Some(text))
-                        | ScalarValue::LargeUtf8(Some(text))
-                        | ScalarValue::Utf8View(Some(text)) => Some(text.clone()),
-                        scalar => crate::stats_encode::encode_scalar(scalar),
-                    };
-                    match text {
-                        Some(encoded) => Some(encoded),
-                        None => {
-                            return Err(crate::DuckLakeError::Unsupported(format!(
-                                "partitioned write: partition-key value of type {} cannot be \
-                                 encoded; partitioning by this column type is not supported",
-                                array.data_type()
-                            )));
-                        },
-                    }
-                };
-                values.push(encoded);
-            }
+        for (row, values) in row_partition_values(batch, spec)?.into_iter().enumerate() {
             if !per_batch.contains_key(&values) {
                 per_batch_order.push(values.clone());
             }

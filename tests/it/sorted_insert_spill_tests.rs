@@ -167,7 +167,7 @@ fn session(
 
 /// A runtime whose pool is `pool` bytes, spilling to the OS temp directory
 /// through `factory` when given, or not at all.
-fn runtime(pool: usize, factory: Option<Arc<CountingFactory>>) -> RuntimeEnvBuilder {
+pub(crate) fn runtime(pool: usize, factory: Option<Arc<CountingFactory>>) -> RuntimeEnvBuilder {
     let disk = match factory {
         Some(factory) => DiskManagerBuilder::default().with_mode(DiskManagerMode::Custom(factory)),
         None => DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
@@ -180,13 +180,13 @@ fn runtime(pool: usize, factory: Option<Arc<CountingFactory>>) -> RuntimeEnvBuil
 /// Spill files through a disk manager on the OS temp directory, counted, and
 /// refused past `limit` bytes of them at once (a spill budget).
 #[derive(Debug)]
-struct CountingFactory {
+pub(crate) struct CountingFactory {
     inner: Arc<DiskManager>,
     created: AtomicUsize,
 }
 
 impl CountingFactory {
-    fn new(limit: Option<u64>) -> Arc<Self> {
+    pub(crate) fn new(limit: Option<u64>) -> Arc<Self> {
         let mut builder = DiskManagerBuilder::default().with_mode(DiskManagerMode::OsTmpDirectory);
         if let Some(limit) = limit {
             builder = builder.with_max_temp_directory_size(limit);
@@ -197,7 +197,7 @@ impl CountingFactory {
         })
     }
 
-    fn created(&self) -> usize {
+    pub(crate) fn created(&self) -> usize {
         self.created.load(Ordering::SeqCst)
     }
 }
@@ -210,7 +210,7 @@ impl TempFileFactory for CountingFactory {
 }
 
 /// Run `sql` in `ctx`: the plan it executed, or its error.
-async fn run(ctx: &SessionContext, sql: &str) -> Result<Arc<dyn ExecutionPlan>, String> {
+pub(crate) async fn run(ctx: &SessionContext, sql: &str) -> Result<Arc<dyn ExecutionPlan>, String> {
     let plan = ctx
         .sql(sql)
         .await
@@ -225,7 +225,7 @@ async fn run(ctx: &SessionContext, sql: &str) -> Result<Arc<dyn ExecutionPlan>, 
 }
 
 /// Spills `plan` recorded: `(the insert's own, every other node's)`.
-fn spills(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize) {
+pub(crate) fn spills(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize) {
     let own = |plan: &Arc<dyn ExecutionPlan>| {
         plan.metrics()
             .and_then(|metrics| metrics.spill_count())
@@ -298,7 +298,7 @@ fn layout(lake: &Lake, table: &str) -> Vec<File> {
 }
 
 /// Every file under `main.<table>`'s directory.
-fn on_disk(lake: &Lake, table: &str) -> Vec<PathBuf> {
+pub(crate) fn on_disk(lake: &Lake, table: &str) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -487,7 +487,7 @@ async fn a_failing_key_writes_the_rows_in_arrival_order() {
 }
 
 /// The catalog's snapshots, data files and inlined rows of `main.<table>`.
-fn committed(lake: &Lake, table: &str) -> (i64, usize, usize) {
+pub(crate) fn committed(lake: &Lake, table: &str) -> (i64, usize, usize) {
     (
         lake.head(),
         lake.data_files(table),
@@ -546,10 +546,10 @@ async fn a_sorted_insert_refused_mid_sort_leaves_nothing() {
 
 /// A local store whose uploads fail once `allowed` have started.
 #[derive(Debug)]
-struct FailingStore {
-    inner: LocalFileSystem,
-    allowed: usize,
-    started: AtomicUsize,
+pub(crate) struct FailingStore {
+    pub(crate) inner: LocalFileSystem,
+    pub(crate) allowed: usize,
+    pub(crate) started: AtomicUsize,
 }
 
 impl std::fmt::Display for FailingStore {

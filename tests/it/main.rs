@@ -96,6 +96,7 @@ mod open_time_field_id_tests;
 mod partition_tests;
 mod partition_write_duckdb_tests;
 mod partition_write_tests;
+mod partitioned_insert_spill_tests;
 mod parts_staging_tests;
 mod pending_rows_tests;
 mod positional_delete_oracle_postgres_tests;

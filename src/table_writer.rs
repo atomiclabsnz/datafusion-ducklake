@@ -1263,6 +1263,39 @@ impl DuckLakeTableWriter {
         )
     }
 
+    /// [`Self::begin_write`] for a write planned against the partition spec
+    /// `partition_id` (the SQL `INSERT` past its pool, `DuckLakeInsertExec`):
+    /// its rows are split by that spec, and a spec changed or reset since is
+    /// refused as a [`Conflict`](crate::DuckLakeError::Conflict), as
+    /// [`Self::write_partitioned_with_options`] refuses it, rather than
+    /// splitting the rows under a spec the plan never saw.
+    pub(crate) fn begin_write_partitioned_as_planned(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+        partition_id: i64,
+    ) -> Result<TableWriteSession> {
+        let file_name = format!("{}.parquet", Uuid::new_v4());
+        self.begin_write_internal(
+            schema_name,
+            table_name,
+            arrow_schema,
+            None,
+            file_name.clone(),
+            file_name,
+            true,
+            false,
+            mode,
+            StreamPartitionMode::SplitAsPlanned {
+                partition_id,
+            },
+            true,
+            true,
+        )
+    }
+
     /// Begin a streaming write session with a custom file path (registered as absolute).
     ///
     /// It never inlines: the caller chose the file the rows must land in.
@@ -1390,8 +1423,22 @@ impl DuckLakeTableWriter {
         // prior generation.
         let partition_sink =
             match self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)? {
+                None if matches!(partition_mode, StreamPartitionMode::SplitAsPlanned { .. }) => {
+                    return Err(crate::DuckLakeError::Conflict(
+                        "partition spec changed before write; retry the write".to_string(),
+                    ));
+                },
                 None => None,
                 Some(spec) => match partition_mode {
+                    StreamPartitionMode::SplitAsPlanned {
+                        partition_id,
+                    } if spec.partition_id != partition_id => {
+                        return Err(crate::DuckLakeError::Conflict(format!(
+                            "the write was planned under partition spec {partition_id} but the \
+                             table's live generation is {}; retry the write",
+                            spec.partition_id
+                        )));
+                    },
                     StreamPartitionMode::Reject {
                         entry_point,
                     } => {
@@ -1407,7 +1454,10 @@ impl DuckLakeTableWriter {
                                 .to_string(),
                         ));
                     },
-                    StreamPartitionMode::Split => Some(PartitionSink {
+                    StreamPartitionMode::Split
+                    | StreamPartitionMode::SplitAsPlanned {
+                        ..
+                    } => Some(PartitionSink {
                         key_names: spec.key_names(),
                         spec,
                         table_key: table_key.clone(),
@@ -4952,6 +5002,13 @@ enum StreamPartitionMode {
     /// conflict, which the caller retries against the new spec, as
     /// `write_rows_unpartitioned_as_planned` refuses it.
     AsPlanned,
+    /// Split, as [`Self::Split`], but only under the spec `partition_id` the
+    /// caller planned the write against (the SQL `INSERT`): no spec, or
+    /// another generation, is the partition fence's conflict, as
+    /// `write_partitioned_with_options` refuses it.
+    SplitAsPlanned {
+        partition_id: i64,
+    },
 }
 
 /// Routes a streaming write's rows into one parquet file per partition.

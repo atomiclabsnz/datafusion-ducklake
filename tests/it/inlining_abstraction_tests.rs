@@ -117,6 +117,45 @@ pub(crate) fn sqlite() -> MakeLake {
     })
 }
 
+/// [`sqlite`], over a catalog DuckDB made (so DuckDB can attach it again
+/// and write into it beside the crate).
+pub(crate) fn sqlite_made_by_duckdb() -> MakeLake {
+    Arc::new(|limit| {
+        Box::pin(async move {
+            let (dir, data) = scratch();
+            let path = dir.path().join("lake.db");
+            crate::common::ensure_ducklake_installed();
+            crate::common::ensure_extension_installed("sqlite");
+            duckdb::Connection::open_in_memory()
+                .unwrap()
+                .execute_batch(&format!(
+                    "LOAD ducklake; LOAD sqlite; \
+                     ATTACH 'ducklake:sqlite:{}' AS lake (DATA_PATH '{}/'); DETACH lake;",
+                    path.display(),
+                    data.display()
+                ))
+                .unwrap();
+            let conn = format!("sqlite:{}?mode=rwc", path.display());
+            let mut writer = datafusion_ducklake::SqliteMetadataWriter::new_with_init(&conn)
+                .await
+                .unwrap();
+            if let Some(limit) = limit {
+                writer = writer.with_data_inlining_row_limit(limit);
+            }
+            let provider = datafusion_ducklake::SqliteMetadataProvider::new(&conn)
+                .await
+                .unwrap();
+            Lake {
+                writer: Arc::new(writer),
+                provider: Arc::new(provider),
+                data,
+                inlines: true,
+                _dir: dir,
+            }
+        })
+    })
+}
+
 #[cfg(feature = "write-duckdb")]
 pub(crate) fn duckdb() -> MakeLake {
     Arc::new(|limit| {
