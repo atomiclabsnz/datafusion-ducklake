@@ -138,17 +138,39 @@ impl Drop for PartsSink {
 /// clears them. The awaited forms (`TableWriteSession::abort`, and every error
 /// path of a write that can await) abort explicitly and do not rely on this.
 fn abort_in_background(mut upload: Box<dyn MultipartUpload>) {
-    match tokio::runtime::Handle::try_current() {
-        Ok(runtime) => {
+    match spawn_runtime() {
+        Some(runtime) => {
             runtime.spawn(async move {
                 if let Err(error) = upload.abort().await {
                     tracing::warn!(error = %error, "failed to abort a dropped data file's multipart upload");
                 }
             });
         },
-        Err(_) => tracing::debug!(
+        None => tracing::debug!(
             "a data file's multipart upload was dropped with no runtime to abort it on"
         ),
+    }
+}
+
+/// The tokio runtime a write may spawn its background work on, if any: an upload, or the
+/// abort of a dropped one.
+///
+/// **None on `wasm32`**, whatever `Handle::try_current` says (ferrion#809). There the host
+/// drives the write's futures itself, on its one thread, and a runtime that happens to be
+/// current is not one that will poll a task spawned onto it. In a browser tab, a
+/// statement that dbt sends ferrion runs while dbt's own tokio task is suspended under
+/// JSPI, mid-poll. Its runtime is current on the thread but runs nothing until that
+/// statement answers, so a write that spawned its upload there waited for it forever.
+/// Uploading inline costs nothing there: there is one thread either way. This is the
+/// rule the delete-set prefetch (`lazy_delete_filter`) already follows.
+pub(crate) fn spawn_runtime() -> Option<tokio::runtime::Handle> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        tokio::runtime::Handle::try_current().ok()
     }
 }
 

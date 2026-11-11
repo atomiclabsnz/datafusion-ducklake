@@ -5438,7 +5438,7 @@ impl StagedUploads {
             return;
         }
         if self.runtime.is_none() {
-            self.runtime = tokio::runtime::Handle::try_current().ok();
+            self.runtime = crate::staging::spawn_runtime();
         }
         let Some(runtime) = &self.runtime else {
             return;

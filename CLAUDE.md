@@ -305,7 +305,9 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
 - `wasm32-unknown-unknown` builds the write path with no catalog backend
   (`ci/wasm-check`); the host supplies one. There, Parquet is staged in memory
   (`Staging::Memory`), uploads run inline, deletes are not prefetched and a commit retry does
-  not wait: nothing may spawn a tokio task or touch the filesystem.
+  not wait: nothing may spawn a tokio task or touch the filesystem — even where a tokio runtime
+  is current, which under a JSPI host is one that runs nothing until the write answers
+  (`staging::spawn_runtime`, ferrion#809).
 - Catalog and schema lookups are dynamic. Only a table's scan-time reads can be kept, through the
   opt-in `CatalogReadMemo` wrapper, which is not DuckLake behavior (see `COMPATIBILITY.md`)
 
