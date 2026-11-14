@@ -237,6 +237,25 @@ impl CatalogReadMemo {
         self: &Arc<Self>,
         provider: Arc<dyn MetadataProvider>,
     ) -> Result<MemoizedMetadataProvider> {
+        self.bind_reading(provider, false)
+    }
+
+    /// [`Self::bind`], for a [`ReadPin`](crate::ReadPin): the bound provider answers
+    /// `get_current_snapshot` with the head its bind read, so a scan that asks whether it
+    /// reads the current snapshot is answered for the pinned statement, without a catalog
+    /// call. Its tables have no writer, which is the one reader that needs the live head.
+    pub(crate) fn bind_pinned(
+        self: &Arc<Self>,
+        provider: Arc<dyn MetadataProvider>,
+    ) -> Result<MemoizedMetadataProvider> {
+        self.bind_reading(provider, true)
+    }
+
+    fn bind_reading(
+        self: &Arc<Self>,
+        provider: Arc<dyn MetadataProvider>,
+        answers_head: bool,
+    ) -> Result<MemoizedMetadataProvider> {
         let head = provider.get_current_snapshot()?;
         {
             let mut state = self.lock();
@@ -252,6 +271,7 @@ impl CatalogReadMemo {
             inner: provider,
             head,
             picked: Mutex::default(),
+            answers_head,
         })
     }
 
@@ -285,6 +305,9 @@ pub struct MemoizedMetadataProvider {
     /// The reads this query uses for each table, or `None` where it reads the
     /// catalog for that table.
     picked: Mutex<HashMap<TableKey, Option<Arc<TableReads>>>>,
+    /// Whether `get_current_snapshot` answers `head` ([`CatalogReadMemo::bind_pinned`])
+    /// rather than reading the catalog.
+    answers_head: bool,
 }
 
 impl fmt::Debug for MemoizedMetadataProvider {
@@ -298,6 +321,12 @@ impl fmt::Debug for MemoizedMetadataProvider {
 }
 
 impl MemoizedMetadataProvider {
+    /// The catalog head the bind read: the snapshot this query's reads show.
+    #[must_use]
+    pub fn head(&self) -> i64 {
+        self.head
+    }
+
     /// The reads this query uses for `table_id` at `snapshot_id`, or `None`
     /// when the query reads the catalog for that table. The first call of the
     /// query for the table picks them, and later calls get the same answer.
@@ -572,6 +601,9 @@ fn file_data_heap_bytes(file: &DuckLakeFileData) -> usize {
 
 impl MetadataProvider for MemoizedMetadataProvider {
     fn get_current_snapshot(&self) -> Result<i64> {
+        if self.answers_head {
+            return Ok(self.head);
+        }
         self.inner.get_current_snapshot()
     }
 

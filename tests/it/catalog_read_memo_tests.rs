@@ -1719,3 +1719,228 @@ mod postgres {
         row_inlined_after_a_fill_is_read_at_the_new_head(lake).await
     }
 }
+
+/// `DuckLakeCatalog::with_read_pins` (ferrion#846): a statement under a pin reads the catalog
+/// head once, and a warm one nothing else; the head moving is the only thing that makes the
+/// next pinned statement read again, and it does.
+mod read_pins {
+    use super::*;
+
+    /// Two tables, `t` with Parquet files and a delete file, and `u`.
+    const TWO_TABLES: &[&str] = &[
+        "CREATE TABLE lake.t (id INT, name VARCHAR)",
+        "INSERT INTO lake.t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
+        "DELETE FROM lake.t WHERE id IN (2, 4)",
+        "CREATE TABLE lake.u (id INT, score INT)",
+        "INSERT INTO lake.u VALUES (1, 10), (3, 30), (5, 50)",
+    ];
+
+    const JOIN: &str = "SELECT t.id, t.name, u.score FROM lake.main.t JOIN lake.main.u \
+                        ON t.id = u.id ORDER BY t.id";
+
+    /// A session with `lake` attached as `lake`, through a counting provider, with pins on or
+    /// off.
+    async fn session(
+        lake: &Lake,
+        pins: bool,
+    ) -> anyhow::Result<(SessionContext, CountingProvider, Arc<DuckLakeCatalog>)> {
+        let counting = lake.provider().await?;
+        let catalog = DuckLakeCatalog::new(counting.clone())?;
+        let catalog = Arc::new(if pins {
+            catalog.with_read_pins(CatalogReadMemo::DEFAULT_MAX_BYTES)
+        } else {
+            catalog
+        });
+        let ctx = SessionContext::new();
+        ctx.register_catalog("lake", Arc::clone(&catalog) as Arc<dyn CatalogProvider>);
+        counting.take();
+        Ok((ctx, counting, catalog))
+    }
+
+    /// `sql` run under one pin of `catalog`, held from before planning to the last batch.
+    async fn pinned(
+        ctx: &SessionContext,
+        catalog: &DuckLakeCatalog,
+        sql: &str,
+    ) -> anyhow::Result<String> {
+        let pin = catalog.pin_reads()?.expect("the catalog has read pins");
+        let out = query(ctx, sql).await;
+        drop(pin);
+        out
+    }
+
+    fn head_only() -> BTreeMap<&'static str, usize> {
+        BTreeMap::from([("get_current_snapshot", 1)])
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_warm_pinned_statement_reads_the_head_and_nothing_else() -> anyhow::Result<()> {
+        let lake = Lake::new(0, TWO_TABLES)?;
+        let (plain_ctx, _, _) = session(&lake, false).await?;
+        let (ctx, counting, catalog) = session(&lake, true).await?;
+        let queries = [
+            JOIN,
+            "SELECT count(*) FROM lake.main.t",
+            "SELECT name FROM lake.main.t WHERE id > 2 ORDER BY id",
+            "SELECT a.id FROM lake.main.t a JOIN lake.main.t b ON a.id = b.id ORDER BY a.id",
+        ];
+        for sql in queries {
+            let expected = query(&plain_ctx, sql).await?;
+            // The first statement fills; every one after reads the head, once.
+            assert_eq!(pinned(&ctx, &catalog, sql).await?, expected, "{sql}");
+            counting.take();
+            for run in 0..2 {
+                assert_eq!(pinned(&ctx, &catalog, sql).await?, expected, "{sql}");
+                assert_eq!(counting.take(), head_only(), "run {run} of {sql}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_pin_the_catalog_reads_as_one_without_pins() -> anyhow::Result<()> {
+        let lake = Lake::new(0, TWO_TABLES)?;
+        let (plain_ctx, plain, _) = session(&lake, false).await?;
+        let (ctx, counting, catalog) = session(&lake, true).await?;
+        // A pinned statement first, so there is something kept that an unpinned one must not
+        // use.
+        pinned(&ctx, &catalog, JOIN).await?;
+        counting.take();
+        for run in 0..2 {
+            assert_eq!(query(&ctx, JOIN).await?, query(&plain_ctx, JOIN).await?);
+            assert_eq!(counting.take(), plain.take(), "run {run}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_commit_between_pinned_statements_is_read_by_the_next() -> anyhow::Result<()> {
+        let lake = Lake::new(0, TWO_TABLES)?;
+        let (ctx, counting, catalog) = session(&lake, true).await?;
+        let count = "SELECT count(*) AS n, sum(score) AS s FROM lake.main.u";
+        pinned(&ctx, &catalog, count).await?;
+        pinned(&ctx, &catalog, count).await?;
+        counting.take();
+
+        // Rows another writer adds (DuckDB, the reference writer).
+        lake.run(0, &["INSERT INTO lake.u VALUES (7, 70)"])?;
+        let after = pinned(&ctx, &catalog, count).await?;
+        assert!(after.contains("| 4 | 160 |"), "{after}");
+        assert_ne!(
+            counting.take(),
+            head_only(),
+            "a moved head reads the catalog again"
+        );
+
+        // ...a delete...
+        lake.run(0, &["DELETE FROM lake.u WHERE id = 1"])?;
+        let after = pinned(&ctx, &catalog, count).await?;
+        assert!(after.contains("| 3 | 150 |"), "{after}");
+
+        // ...a column added, which a kept table would not have...
+        lake.run(
+            0,
+            &[
+                "ALTER TABLE lake.u ADD COLUMN note VARCHAR",
+                "UPDATE lake.u SET note = 'x' WHERE id = 7",
+            ],
+        )?;
+        let after = pinned(
+            &ctx,
+            &catalog,
+            "SELECT id, note FROM lake.main.u WHERE note IS NOT NULL",
+        )
+        .await?;
+        assert!(after.contains("| 7  | x    |"), "{after}");
+
+        // ...and a table dropped and made again under its name, with other columns.
+        lake.run(
+            0,
+            &[
+                "DROP TABLE lake.u",
+                "CREATE TABLE lake.u (id INT, other VARCHAR)",
+                "INSERT INTO lake.u VALUES (9, 'nine')",
+            ],
+        )?;
+        let after = pinned(&ctx, &catalog, "SELECT * FROM lake.main.u").await?;
+        assert!(after.contains("| 9  | nine  |"), "{after}");
+        let gone = pinned(&ctx, &catalog, count).await;
+        assert!(gone.is_err(), "u has no score column now: {gone:?}");
+
+        // A table dropped is not served from what was kept.
+        lake.run(0, &["DROP TABLE lake.t"])?;
+        let gone = pinned(&ctx, &catalog, "SELECT * FROM lake.main.t").await;
+        assert!(gone.is_err(), "t is dropped: {gone:?}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pin_taken_while_one_is_held_reads_nothing() -> anyhow::Result<()> {
+        let lake = Lake::new(0, TWO_TABLES)?;
+        let (ctx, counting, catalog) = session(&lake, true).await?;
+        pinned(&ctx, &catalog, JOIN).await?;
+        counting.take();
+        let outer = catalog.pin_reads()?.expect("pins");
+        let inner = catalog.pin_reads()?.expect("pins");
+        assert_eq!(inner.head(), outer.head());
+        query(&ctx, JOIN).await?;
+        drop(inner);
+        query(&ctx, JOIN).await?;
+        assert_eq!(
+            counting.take(),
+            head_only(),
+            "one head read, by the outer pin"
+        );
+        drop(outer);
+        assert_eq!(
+            catalog.pin_reads()?.expect("pins").head(),
+            Some(table_at_head(&counting)?.1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_catalog_bound_to_a_snapshot_has_no_pins() -> anyhow::Result<()> {
+        let lake = Lake::new(0, TWO_TABLES)?;
+        let counting = lake.provider().await?;
+        let head = counting.get_current_snapshot()?;
+        let catalog = DuckLakeCatalog::with_snapshot(Arc::new(counting), head)?
+            .with_read_pins(CatalogReadMemo::DEFAULT_MAX_BYTES);
+        assert!(catalog.pin_reads()?.is_none());
+        Ok(())
+    }
+
+    /// A write planned under a pin is refused, never written against kept reads: a table a
+    /// pin serves has no writer.
+    #[cfg(feature = "write-sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_planned_under_a_pin_is_refused_and_one_after_it_commits() -> anyhow::Result<()>
+    {
+        let lake = Lake::new(0, TWO_TABLES)?;
+        let counting = lake.provider().await?;
+        let url = format!("sqlite:{}", lake.catalog_path().display());
+        let writer = datafusion_ducklake::SqliteMetadataWriter::new_with_init(&url).await?;
+        let catalog = Arc::new(
+            DuckLakeCatalog::with_writer(Arc::new(counting), Arc::new(writer))?
+                .with_read_pins(CatalogReadMemo::DEFAULT_MAX_BYTES),
+        );
+        let ctx = SessionContext::new();
+        ctx.register_catalog("lake", Arc::clone(&catalog) as Arc<dyn CatalogProvider>);
+        let count = "SELECT count(*) AS n FROM lake.main.u";
+        assert!(pinned(&ctx, &catalog, count).await?.contains("| 3 |"));
+
+        let refused = pinned(&ctx, &catalog, "INSERT INTO lake.main.u VALUES (8, 80)").await;
+        let refused = refused
+            .expect_err("a write under a pin is refused")
+            .to_string();
+        assert!(refused.contains("Table is read-only"), "{refused}");
+        assert!(
+            pinned(&ctx, &catalog, count).await?.contains("| 3 |"),
+            "nothing was written"
+        );
+
+        query(&ctx, "INSERT INTO lake.main.u VALUES (8, 80)").await?;
+        assert!(pinned(&ctx, &catalog, count).await?.contains("| 4 |"));
+        Ok(())
+    }
+}
