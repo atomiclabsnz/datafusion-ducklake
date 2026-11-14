@@ -265,23 +265,21 @@ impl DuckLakeCatalog {
     #[must_use]
     pub fn with_read_pins(mut self, memo_bytes: usize) -> Self {
         if matches!(self.snapshot, SnapshotSelection::Latest) {
-            self.read_pins = Some(ReadPins::new(memo_bytes));
+            self.read_pins = Some(ReadPins::new(memo_bytes, Arc::clone(&self.provider)));
         }
         self
     }
 
-    /// Pin the catalog's head for one statement that reads: read the head once, and until the
-    /// pin is dropped, look schemas and tables up at it, from what an earlier pin at the same
-    /// head kept where it can. `None` for a catalog without [`Self::with_read_pins`]. A pin
-    /// taken while one is held shares it and reads nothing.
+    /// Pin the catalog's head for one statement that reads: the statement's first lookup reads
+    /// the head, and until the pin is dropped every lookup is at it, from what an earlier pin
+    /// at the same head kept where it can. Taking the pin reads nothing, so a statement that
+    /// reaches no table of this catalog costs it nothing. `None` for a catalog without
+    /// [`Self::with_read_pins`]. A pin taken while one is held shares it.
     ///
     /// For a statement that only reads: a table served under a pin has no writer. See
     /// [`ReadPin`].
-    pub fn pin_reads(&self) -> Result<Option<ReadPin>> {
-        self.read_pins
-            .as_ref()
-            .map(|pins| pins.pin(&self.provider))
-            .transpose()
+    pub fn pin_reads(&self) -> Option<ReadPin> {
+        self.read_pins.as_ref().map(|pins| pins.pin())
     }
 
     /// Get the metadata provider for this catalog
@@ -343,7 +341,15 @@ impl CatalogProvider for DuckLakeCatalog {
             ))));
         }
 
-        let pinned = self.read_pins.as_ref().and_then(|pins| pins.pinned());
+        let pinned = match self.read_pins.as_ref().map(|pins| pins.pinned()) {
+            Some(Ok(pinned)) => pinned,
+            // Read unpinned, which reads the head itself and reports what it meets.
+            Some(Err(e)) => {
+                tracing::error!(error = %e, schema_name = %name, "Failed to read the pinned head");
+                None
+            },
+            None => None,
+        };
         let snapshot_id = match &pinned {
             Some(pinned) => pinned.head,
             None => match self.snapshot.resolve(self.provider.as_ref()) {

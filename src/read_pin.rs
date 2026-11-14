@@ -14,7 +14,8 @@
 //! opt-in path. While a [`ReadPin`] from
 //! [`DuckLakeCatalog::pin_reads`](crate::DuckLakeCatalog::pin_reads) is held:
 //!
-//! - every lookup reads the head the pin read, so the statement makes **one** head read;
+//! - the first lookup reads the head, and every later one reads that head, so the statement
+//!   makes **one** head read (and a statement that looks nothing up in the catalog, none);
 //! - a schema and a table found at that head are kept, keyed by the head, and served to the
 //!   next lookup at the same head without reading the catalog;
 //! - each table served goes through the pin's provider, bound to a [`CatalogReadMemo`], so its
@@ -55,6 +56,8 @@ use crate::table::DuckLakeTable;
 /// newest head a pin read.
 pub(crate) struct ReadPins {
     memo: Arc<CatalogReadMemo>,
+    /// The catalog's provider, which a pin's first lookup binds to the memo.
+    provider: Arc<dyn MetadataProvider>,
     state: Mutex<PinState>,
 }
 
@@ -62,7 +65,8 @@ pub(crate) struct ReadPins {
 struct PinState {
     /// Pins held. Lookups use the pin while this is above zero.
     held: usize,
-    /// The pin's head and its provider, bound to the memo, while one is held.
+    /// The pin's head and its provider, bound to the memo: from the first lookup under a held
+    /// pin until the last pin is dropped.
     pinned: Option<Pinned>,
     /// The head what is kept below was found at.
     kept_head: Option<i64>,
@@ -80,9 +84,10 @@ pub(crate) struct Pinned {
 }
 
 impl ReadPins {
-    pub(crate) fn new(memo_bytes: usize) -> Arc<Self> {
+    pub(crate) fn new(memo_bytes: usize, provider: Arc<dyn MetadataProvider>) -> Arc<Self> {
         Arc::new(Self {
             memo: CatalogReadMemo::new(memo_bytes),
+            provider,
             state: Mutex::default(),
         })
     }
@@ -94,44 +99,51 @@ impl ReadPins {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Pin `provider`'s head: read it once (the memo's bind), and drop what is kept when the
-    /// head is not the one it was kept at. A pin taken while one is held shares it.
-    pub(crate) fn pin(self: &Arc<Self>, provider: &Arc<dyn MetadataProvider>) -> Result<ReadPin> {
-        {
-            let mut state = self.lock();
-            if state.held > 0 {
-                state.held += 1;
-                return Ok(ReadPin {
-                    pins: Arc::clone(self),
-                });
-            }
-        }
-        let bound = self.memo.bind_pinned(Arc::clone(provider))?;
-        let head = bound.head();
-        let mut state = self.lock();
-        state.held += 1;
-        // Another pin can have been taken while this one read the head (another thread): the
-        // first one's head stands for both, as it would have for a pin taken after it, and
-        // what is kept is left at its head.
-        if state.pinned.is_none() {
-            if state.kept_head != Some(head) {
-                state.kept_head = Some(head);
-                state.schemas.clear();
-                state.tables.clear();
-            }
-            state.pinned = Some(Pinned {
-                head,
-                provider: Arc::new(bound),
-            });
-        }
-        Ok(ReadPin {
+    /// Hold a pin. Nothing is read until a lookup asks for the pin's head ([`Self::pinned`]),
+    /// so a statement that reaches no table of the catalog costs it nothing.
+    pub(crate) fn pin(self: &Arc<Self>) -> ReadPin {
+        self.lock().held += 1;
+        ReadPin {
             pins: Arc::clone(self),
-        })
+        }
     }
 
-    /// The held pin, if there is one.
-    pub(crate) fn pinned(&self) -> Option<Pinned> {
-        self.lock().pinned.clone()
+    /// The held pin's head and provider, if a pin is held: read on the first call of the pin
+    /// (the memo's bind, one head read), and then the same for every lookup until the last pin
+    /// is dropped. A head other than the one what is kept was found at drops what is kept.
+    pub(crate) fn pinned(&self) -> Result<Option<Pinned>> {
+        {
+            let state = self.lock();
+            if state.held == 0 {
+                return Ok(None);
+            }
+            if let Some(pinned) = &state.pinned {
+                return Ok(Some(pinned.clone()));
+            }
+        }
+        let bound = self.memo.bind_pinned(Arc::clone(&self.provider))?;
+        let head = bound.head();
+        let mut state = self.lock();
+        if state.held == 0 {
+            // Dropped while the head was read (another thread): the lookup reads unpinned.
+            return Ok(None);
+        }
+        // Another lookup can have read the head meanwhile (another thread): the first one's
+        // head stands for the whole pin, and what is kept is left at its head.
+        if let Some(pinned) = &state.pinned {
+            return Ok(Some(pinned.clone()));
+        }
+        if state.kept_head != Some(head) {
+            state.kept_head = Some(head);
+            state.schemas.clear();
+            state.tables.clear();
+        }
+        let pinned = Pinned {
+            head,
+            provider: Arc::new(bound),
+        };
+        state.pinned = Some(pinned.clone());
+        Ok(Some(pinned))
     }
 
     /// The schema named `name` at the pin's head, from what is kept or else by `read`, which
@@ -231,9 +243,10 @@ pub struct ReadPin {
 }
 
 impl ReadPin {
-    /// The head this pin's lookups read.
+    /// The head this pin's lookups read: `None` until the first lookup under it, which reads
+    /// it.
     pub fn head(&self) -> Option<i64> {
-        self.pins.pinned().map(|pinned| pinned.head)
+        self.pins.lock().pinned.as_ref().map(|pinned| pinned.head)
     }
 }
 

@@ -144,14 +144,17 @@ impl DuckLakeSchema {
         self
     }
 
-    /// The catalog's held read pin, if there is one.
-    fn pinned(&self) -> Option<Pinned> {
-        self.read_pins.as_ref().and_then(|pins| pins.pinned())
+    /// The catalog's held read pin, if there is one (its first lookup reads the head).
+    fn pinned(&self) -> crate::Result<Option<Pinned>> {
+        match &self.read_pins {
+            Some(pins) => pins.pinned(),
+            None => Ok(None),
+        }
     }
 
     /// The snapshot a lookup reads: a held pin's head, else as the selection says.
     fn lookup_snapshot(&self) -> crate::Result<i64> {
-        match self.pinned() {
+        match self.pinned()? {
             Some(pinned) => Ok(pinned.head),
             None => self.snapshot.resolve(self.provider.as_ref()),
         }
@@ -394,7 +397,10 @@ impl SchemaProvider for DuckLakeSchema {
     }
 
     async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
-        if let (Some(pins), Some(pinned)) = (&self.read_pins, self.pinned())
+        let pinned = self
+            .pinned()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        if let (Some(pins), Some(pinned)) = (&self.read_pins, pinned)
             && let Some(table) = self.pinned_table(pins, &pinned, name)?
         {
             return Ok(Some(Arc::new(table)));

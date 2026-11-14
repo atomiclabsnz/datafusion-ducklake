@@ -1763,7 +1763,7 @@ mod read_pins {
         catalog: &DuckLakeCatalog,
         sql: &str,
     ) -> anyhow::Result<String> {
-        let pin = catalog.pin_reads()?.expect("the catalog has read pins");
+        let pin = catalog.pin_reads().expect("the catalog has read pins");
         let out = query(ctx, sql).await;
         drop(pin);
         out
@@ -1880,22 +1880,33 @@ mod read_pins {
         let (ctx, counting, catalog) = session(&lake, true).await?;
         pinned(&ctx, &catalog, JOIN).await?;
         counting.take();
-        let outer = catalog.pin_reads()?.expect("pins");
-        let inner = catalog.pin_reads()?.expect("pins");
-        assert_eq!(inner.head(), outer.head());
+        let outer = catalog.pin_reads().expect("pins");
+        let inner = catalog.pin_reads().expect("pins");
+        assert_eq!(outer.head(), None, "taking a pin reads nothing");
+        assert_eq!(counting.take(), BTreeMap::new());
         query(&ctx, JOIN).await?;
+        assert_eq!(inner.head(), outer.head());
         drop(inner);
         query(&ctx, JOIN).await?;
         assert_eq!(
             counting.take(),
             head_only(),
-            "one head read, by the outer pin"
+            "one head read, by the pin's first lookup"
         );
+        let head = outer.head();
         drop(outer);
-        assert_eq!(
-            catalog.pin_reads()?.expect("pins").head(),
-            Some(table_at_head(&counting)?.1)
-        );
+        assert_eq!(head, Some(table_at_head(&counting)?.1));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_statement_that_reaches_no_table_reads_nothing() -> anyhow::Result<()> {
+        let lake = Lake::new(0, TWO_TABLES)?;
+        let (ctx, counting, catalog) = session(&lake, true).await?;
+        pinned(&ctx, &catalog, JOIN).await?;
+        counting.take();
+        pinned(&ctx, &catalog, "SELECT 1 AS one").await?;
+        assert_eq!(counting.take(), BTreeMap::new());
         Ok(())
     }
 
@@ -1906,7 +1917,7 @@ mod read_pins {
         let head = counting.get_current_snapshot()?;
         let catalog = DuckLakeCatalog::with_snapshot(Arc::new(counting), head)?
             .with_read_pins(CatalogReadMemo::DEFAULT_MAX_BYTES);
-        assert!(catalog.pin_reads()?.is_none());
+        assert!(catalog.pin_reads().is_none());
         Ok(())
     }
 
