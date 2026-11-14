@@ -92,6 +92,7 @@ mod nested_inline;
 pub(crate) mod open_time_filter_barrier;
 pub mod partition;
 pub mod path_resolver;
+mod read_pin;
 pub mod row_id;
 pub(crate) mod row_lineage;
 pub mod rowid_lookup;
@@ -200,6 +201,7 @@ pub use metadata_provider::{
     TagObjectType, TagTarget,
 };
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
+pub use read_pin::ReadPin;
 /// The set type [`DuckLakeTable::replace_located_rows`] takes a data file's positions in, so a
 /// caller names the very version this crate links.
 pub use roaring;

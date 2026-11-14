@@ -12,6 +12,7 @@ use crate::catalog::SnapshotSelection;
 use crate::delete_memo::DuckLakeReadOptions;
 use crate::metadata_provider::{MetadataProvider, TableMetadata, ViewMetadata};
 use crate::path_resolver::resolve_path;
+use crate::read_pin::{Pinned, ReadPins};
 use crate::snapshot_consistency::{SnapshotRebind, ViewGuard};
 use crate::table::DuckLakeTable;
 use crate::view::{UnplannableViewTable, plan_view, resolve_view_definition};
@@ -69,6 +70,9 @@ pub struct DuckLakeSchema {
     row_lineage: bool,
     /// Propagated from the catalog: how each table reuses its scans' reads.
     read_options: DuckLakeReadOptions,
+    /// Propagated from the catalog: its read pins, when it has them
+    /// ([`DuckLakeCatalog::with_read_pins`](crate::DuckLakeCatalog::with_read_pins)).
+    read_pins: Option<Arc<ReadPins>>,
     /// Metadata writer for write operations (when write feature is enabled)
     #[cfg(feature = "write")]
     writer: Option<Arc<dyn MetadataWriter>>,
@@ -97,6 +101,7 @@ impl DuckLakeSchema {
             schema_path,
             row_lineage: false,
             read_options: DuckLakeReadOptions::default(),
+            read_pins: None,
             #[cfg(feature = "write")]
             writer: None,
             #[cfg(feature = "write")]
@@ -130,6 +135,57 @@ impl DuckLakeSchema {
     pub fn with_read_options(mut self, options: DuckLakeReadOptions) -> Self {
         self.read_options = options;
         self
+    }
+
+    /// Look tables up under the catalog's read pins: at a held pin's head, from what is kept
+    /// at it. Set by the parent catalog.
+    pub(crate) fn with_read_pins(mut self, read_pins: Option<Arc<ReadPins>>) -> Self {
+        self.read_pins = read_pins;
+        self
+    }
+
+    /// The catalog's held read pin, if there is one (its first lookup reads the head).
+    fn pinned(&self) -> crate::Result<Option<Pinned>> {
+        match &self.read_pins {
+            Some(pins) => pins.pinned(),
+            None => Ok(None),
+        }
+    }
+
+    /// The snapshot a lookup reads: a held pin's head, else as the selection says.
+    fn lookup_snapshot(&self) -> crate::Result<i64> {
+        match self.pinned()? {
+            Some(pinned) => Ok(pinned.head),
+            None => self.snapshot.resolve(self.provider.as_ref()),
+        }
+    }
+
+    /// The table `name` at a held pin's head, through the pin's provider: kept, or built
+    /// without a writer and kept. `None` where no table has the name, for the view lookup.
+    fn pinned_table(
+        &self,
+        pins: &ReadPins,
+        pinned: &Pinned,
+        name: &str,
+    ) -> DataFusionResult<Option<DuckLakeTable>> {
+        let table = match pins.table(pinned, self.schema_id, name) {
+            Some(kept) => kept,
+            None => {
+                let Some(meta) = self
+                    .provider
+                    .get_table_by_name(self.schema_id, name, pinned.head)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
+                else {
+                    return Ok(None);
+                };
+                let table = self.build_read_table(&meta, pinned.head)?;
+                pins.keep_table(pinned, self.schema_id, name, &table);
+                table
+            },
+        };
+        Ok(Some(
+            table.with_metadata_provider(Arc::clone(&pinned.provider)),
+        ))
     }
 
     /// Configure this schema for write operations.
@@ -213,12 +269,31 @@ impl DuckLakeSchema {
     }
 
     fn resolve_snapshot(&self) -> DataFusionResult<i64> {
-        self.snapshot
-            .resolve(self.provider.as_ref())
+        self.lookup_snapshot()
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
     fn build_table(
+        &self,
+        meta: &TableMetadata,
+        snapshot_id: i64,
+    ) -> DataFusionResult<DuckLakeTable> {
+        let table = self.build_read_table(meta, snapshot_id)?;
+        // Configure writer if this schema is writable
+        #[cfg(feature = "write")]
+        let table = if let Some(writer) = self.writer.as_ref() {
+            let options = self.table_write_options(Some(meta.table_id))?;
+            table
+                .with_writer(self.schema_name.clone(), Arc::clone(writer))
+                .with_write_options(options)
+        } else {
+            table
+        };
+        Ok(table)
+    }
+
+    /// [`Self::build_table`] without a writer: the table a read pin keeps.
+    fn build_read_table(
         &self,
         meta: &TableMetadata,
         snapshot_id: i64,
@@ -239,17 +314,6 @@ impl DuckLakeSchema {
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
         .with_row_lineage(self.row_lineage)
         .with_read_options(self.read_options.clone());
-
-        // Configure writer if this schema is writable
-        #[cfg(feature = "write")]
-        let table = if let Some(writer) = self.writer.as_ref() {
-            let options = self.table_write_options(Some(meta.table_id))?;
-            table
-                .with_writer(self.schema_name.clone(), Arc::clone(writer))
-                .with_write_options(options)
-        } else {
-            table
-        };
 
         Ok(match &self.view_guards {
             Some(guards) => table.with_snapshot_rebind(SnapshotRebind::new(
@@ -288,7 +352,7 @@ impl DuckLakeSchema {
 #[async_trait]
 impl SchemaProvider for DuckLakeSchema {
     fn table_names(&self) -> Vec<String> {
-        let snapshot_id = match self.snapshot.resolve(self.provider.as_ref()) {
+        let snapshot_id = match self.lookup_snapshot() {
             Ok(snapshot_id) => snapshot_id,
             Err(e) => {
                 tracing::error!(error = %e, schema_name = %self.schema_name, "Failed to resolve snapshot");
@@ -333,6 +397,14 @@ impl SchemaProvider for DuckLakeSchema {
     }
 
     async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
+        let pinned = self
+            .pinned()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        if let (Some(pins), Some(pinned)) = (&self.read_pins, pinned)
+            && let Some(table) = self.pinned_table(pins, &pinned, name)?
+        {
+            return Ok(Some(Arc::new(table)));
+        }
         let snapshot_id = self.resolve_snapshot()?;
         match self
             .provider
@@ -401,7 +473,7 @@ impl SchemaProvider for DuckLakeSchema {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        let Ok(snapshot_id) = self.snapshot.resolve(self.provider.as_ref()) else {
+        let Ok(snapshot_id) = self.lookup_snapshot() else {
             return false;
         };
         self.provider

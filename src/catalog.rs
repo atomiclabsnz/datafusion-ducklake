@@ -7,6 +7,7 @@ use crate::delete_memo::DuckLakeReadOptions;
 use crate::information_schema::InformationSchemaProvider;
 use crate::metadata_provider::{MetadataProvider, resolve_snapshot_at_or_before};
 use crate::path_resolver::{parse_object_store_url, resolve_path};
+use crate::read_pin::{ReadPin, ReadPins};
 use crate::schema::DuckLakeSchema;
 use crate::snapshot_consistency::{ViewGuard, register_snapshot_consistency};
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
@@ -71,6 +72,9 @@ pub struct DuckLakeCatalog {
     row_lineage: bool,
     /// How each table reuses its scans' reads. Off by default.
     read_options: DuckLakeReadOptions,
+    /// Set by [`Self::with_read_pins`]: what [`Self::pin_reads`] pins, and the lookups it
+    /// keeps. Off by default.
+    read_pins: Option<Arc<ReadPins>>,
     /// Write configuration (when write feature is enabled)
     #[cfg(feature = "write")]
     write_config: Option<WriteConfig>,
@@ -94,6 +98,7 @@ impl DuckLakeCatalog {
             catalog_path,
             row_lineage: false,
             read_options: DuckLakeReadOptions::default(),
+            read_pins: None,
             #[cfg(feature = "write")]
             write_config: None,
         })
@@ -116,6 +121,7 @@ impl DuckLakeCatalog {
             catalog_path,
             row_lineage: false,
             read_options: DuckLakeReadOptions::default(),
+            read_pins: None,
             #[cfg(feature = "write")]
             write_config: None,
         })
@@ -176,6 +182,7 @@ impl DuckLakeCatalog {
             catalog_path,
             row_lineage: false,
             read_options: DuckLakeReadOptions::default(),
+            read_pins: None,
             write_config: Some(WriteConfig {
                 writer,
                 options: crate::table_writer::DuckLakeWriteOptions::default(),
@@ -246,6 +253,35 @@ impl DuckLakeCatalog {
         self
     }
 
+    /// Let a read-only statement read this catalog's head once, and keep what its lookups find
+    /// for the next statement at the same head: see [`Self::pin_reads`] and [`ReadPin`].
+    /// `memo_bytes` is the budget of the [`crate::CatalogReadMemo`] the pins bind, which keeps
+    /// the tables' scan reads (the schemas and tables kept are not counted: one of each per
+    /// name looked up).
+    ///
+    /// Off by default, and only for a catalog that reads the latest snapshot
+    /// ([`Self::new`], [`Self::with_writer`]): a catalog bound to a snapshot reads no head, and
+    /// this leaves it as it is.
+    #[must_use]
+    pub fn with_read_pins(mut self, memo_bytes: usize) -> Self {
+        if matches!(self.snapshot, SnapshotSelection::Latest) {
+            self.read_pins = Some(ReadPins::new(memo_bytes, Arc::clone(&self.provider)));
+        }
+        self
+    }
+
+    /// Pin the catalog's head for one statement that reads: the statement's first lookup reads
+    /// the head, and until the pin is dropped every lookup is at it, from what an earlier pin
+    /// at the same head kept where it can. Taking the pin reads nothing, so a statement that
+    /// reaches no table of this catalog costs it nothing. `None` for a catalog without
+    /// [`Self::with_read_pins`]. A pin taken while one is held shares it.
+    ///
+    /// For a statement that only reads: a table served under a pin has no writer. See
+    /// [`ReadPin`].
+    pub fn pin_reads(&self) -> Option<ReadPin> {
+        self.read_pins.as_ref().map(|pins| pins.pin())
+    }
+
     /// Get the metadata provider for this catalog
     ///
     /// This is useful when you need to register table functions separately.
@@ -305,14 +341,32 @@ impl CatalogProvider for DuckLakeCatalog {
             ))));
         }
 
-        let snapshot_id = match self.snapshot.resolve(self.provider.as_ref()) {
-            Ok(snapshot_id) => snapshot_id,
-            Err(e) => {
-                tracing::error!(error = %e, schema_name = %name, "Failed to resolve snapshot");
-                return None;
+        let pinned = match self.read_pins.as_ref().map(|pins| pins.pinned()) {
+            Some(Ok(pinned)) => pinned,
+            // Read unpinned, which reads the head itself and reports what it meets.
+            Some(Err(e)) => {
+                tracing::error!(error = %e, schema_name = %name, "Failed to read the pinned head");
+                None
+            },
+            None => None,
+        };
+        let snapshot_id = match &pinned {
+            Some(pinned) => pinned.head,
+            None => match self.snapshot.resolve(self.provider.as_ref()) {
+                Ok(snapshot_id) => snapshot_id,
+                Err(e) => {
+                    tracing::error!(error = %e, schema_name = %name, "Failed to resolve snapshot");
+                    return None;
+                },
             },
         };
-        match self.provider.get_schema_by_name(name, snapshot_id) {
+        let found = match (&self.read_pins, &pinned) {
+            (Some(pins), Some(pinned)) => pins.schema(pinned, name, || {
+                self.provider.get_schema_by_name(name, snapshot_id)
+            }),
+            _ => self.provider.get_schema_by_name(name, snapshot_id),
+        };
+        match found {
             Ok(Some(meta)) => {
                 // Resolve schema path hierarchically using path_resolver utility
                 let schema_path =
@@ -338,7 +392,8 @@ impl CatalogProvider for DuckLakeCatalog {
                 )
                 .with_snapshot_selection(self.snapshot, self.view_guards.clone())
                 .with_row_lineage(self.row_lineage)
-                .with_read_options(self.read_options.clone());
+                .with_read_options(self.read_options.clone())
+                .with_read_pins(self.read_pins.clone());
 
                 // Configure writer if this catalog is writable
                 #[cfg(feature = "write")]

@@ -50,7 +50,8 @@ The codebase follows a layered architecture with clear separation of concerns:
    - `DuckLakeSchema`: Implements `SchemaProvider`, uses dynamic metadata lookup (queries on every call to `table()` and `table_names()`)
    - `DuckLakeTable`: Implements `TableProvider`, caches table structure at creation time and reads the
      file list at each scan
-   - **No HashMaps**: Catalog and schema providers query metadata on-demand rather than caching
+   - **No HashMaps**: Catalog and schema providers query metadata on-demand rather than caching,
+     unless the caller opts in to read pins (`read_pin.rs`, below)
 
 3. **Write Layer** (feature-gated, `write` / `write-sqlite` / `write-postgres`)
    - `MetadataWriter` trait (`metadata_writer.rs`) defines catalog mutations; implemented by `SqliteMetadataWriter` (`metadata_writer_sqlite.rs`), `PostgresSingleCatalogMetadataWriter` (`metadata_writer_postgres_single.rs`, standard spec layout), and `PostgresMetadataWriter` (`metadata_writer_postgres.rs`, multi-catalog layout)
@@ -135,6 +136,15 @@ The catalog uses a **pure dynamic lookup** approach with no caching at the catal
 - **DuckLakeTable** (`table.rs`):
   - Caches table structure at creation time, which query planning needs
   - Reads the file list at each scan, unless its provider is bound to a `CatalogReadMemo`
+
+**The one opt-in exception: read pins** (`read_pin.rs`, ferrion#846).
+`DuckLakeCatalog::with_read_pins(memo_bytes)` makes `pin_reads()` available. While the
+`ReadPin` it returns is held, every lookup reads the head the pin read (one
+`get_current_snapshot` per statement), schemas and tables found at that head are kept and
+served to the next pinned statement at the same head, and each table's scans go through the
+pin's `CatalogReadMemo`-bound provider. A pin that reads another head drops what is kept. The
+tables a pin serves have **no writer**: a pin is for a statement that only reads, and a write
+planned under one is refused. Without a pin the catalog reads as above, on every lookup.
 
 **Benefits**:
 - O(1) memory usage regardless of catalog size

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `DuckLakeCatalog::with_read_pins` and `DuckLakeCatalog::pin_reads` (opt-in): a statement
+  that only reads takes a `ReadPin`, which reads the catalog head once for all of the
+  statement's lookups. Schemas and tables found at a head are kept for the next pinned
+  statement at the same head, and their scans read through a `CatalogReadMemo`. So a warm
+  statement over an unchanged catalog makes one catalog call, where it made about 27 per table
+  (ferrion#846). The tables a pin serves have no writer, so a write planned under a pin is
+  refused. A catalog without read pins, or a lookup without a pin held, reads as before.
+- `MemoizedMetadataProvider::head`: the head its bind read.
+
 ### Changed
 
 - A new table's column ids count from 1, and a new column takes its table's next id, as DuckDB
